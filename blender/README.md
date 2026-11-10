@@ -80,10 +80,45 @@ modifier:
 - Solver reconstruction and OpenVDB conversion costs are expected to be significant and are
   explicitly exposed for measurement.
 
-## Validation boundary
+## Compiled-engine tests
 
-The standalone scheduler/layout tests and installer dry-run/application checks can run without
-Blender. They do not establish compilation of the complete Blender target, numerical equivalence to the legacy
-modifier, cache round-trip correctness, thread safety under every node evaluation schedule, or
-runtime performance. Those require building the patched pinned Blender source and running gas,
-cache-reload, and multiple-independent-zone tests.
+The reusable engine harness builds Blender's actual pinned `extern/mantaflow` library through its
+official CMake source list, then builds and tests the new node-local engine API. It requires CMake
+3.22 or newer, Git, a C++20 compiler, TBB, Python development files, and Zlib. OpenVDB is disabled
+in this engine-only harness because the dense engine boundary does not depend on it.
+
+From this repository, with a Blender checkout at the pinned commit:
+
+```sh
+cmake -S blender/tests -B build-gas-engine \
+  -DBLENDER_SOURCE_DIR=/path/to/pinned/blender \
+  -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-gas-engine
+ctest --test-dir build-gas-engine --output-on-failure
+```
+
+The seven runtime tests cover zero-time pass-through, stationary fluid interiors, heat buoyancy
+and retained pressure, CFL frame completion, atomic substep-limit failure, non-finite input
+rejection, and independent sequential states.
+
+## Validation performed
+
+- The actual pinned Mantaflow library and gas engine compile, and all seven engine tests pass in
+  both the normal Debug harness and an ASan/UBSan-instrumented harness. Strict warnings are errors
+  for the new engine and test sources.
+- The complete Geometry Nodes adapter translation unit compiles as C++20 against the actual pinned
+  Blender headers and system OpenVDB headers. This checks source/API compatibility, not final
+  Blender target linking or node execution.
+- The installer passes a no-write dry run and application to a fresh checkout at the pinned commit.
+  All five copied files match the overlay exactly, and the CMake edits pass `git diff --check`.
+- The standalone activity-mask and gas-step driver/layout suites pass in both the default build and
+  a strict ASan/UBSan build.
+
+## Remaining validation
+
+These checks do not establish a successful full Blender application build, numerical equivalence to
+the legacy modifier, in-Blender node execution, cache round-trip correctness, thread safety under
+every node evaluation schedule, or runtime performance. The sanitizer result covers the standalone
+engine tests, not the complete Blender process or Geometry Nodes adapter. Build the patched pinned
+Blender source and run gas advancement, transform-rejection, cache-reload, and
+multiple-independent-zone tests before treating the integration as usable.

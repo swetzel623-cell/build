@@ -167,11 +167,12 @@ static bool import_scalar_grid(const Volume *volume,
     return false;
   }
 
+  openvdb::FloatGrid::ConstAccessor accessor = grid.getConstAccessor();
   for (int z = 0; z < resolution.z; ++z) {
     for (int y = 0; y < resolution.y; ++y) {
       for (int x = 0; x < resolution.x; ++x) {
         const std::size_t index = manta_gas::grid_index(resolution.x, resolution.y, x, y, z);
-        output[index] = grid.getValue(openvdb::Coord(x, y, z));
+        output[index] = accessor.getValue(openvdb::Coord(x, y, z));
       }
     }
   }
@@ -209,11 +210,12 @@ static bool import_velocity_grid(const Volume *volume,
     return false;
   }
 
+  openvdb::Vec3SGrid::ConstAccessor accessor = grid.getConstAccessor();
   for (int z = 0; z < resolution.z; ++z) {
     for (int y = 0; y < resolution.y; ++y) {
       for (int x = 0; x < resolution.x; ++x) {
         const std::size_t index = manta_gas::grid_index(resolution.x, resolution.y, x, y, z);
-        const openvdb::Vec3f value = grid.getValue(openvdb::Coord(x, y, z));
+        const openvdb::Vec3f value = accessor.getValue(openvdb::Coord(x, y, z));
         output[index] = {value[0] / voxel_size, value[1] / voxel_size, value[2] / voxel_size};
       }
     }

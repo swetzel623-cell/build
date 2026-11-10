@@ -1,0 +1,70 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+#pragma once
+
+#include <cstddef>
+#include <string>
+
+namespace blender {
+
+struct MantaGasExtent3 {
+  int x = 0;
+  int y = 0;
+  int z = 0;
+};
+
+struct MantaGasVec3 {
+  float x = 0.0f;
+  float y = 0.0f;
+  float z = 0.0f;
+};
+
+/**
+ * Borrowed dense grid buffers in Mantaflow's X-fastest layout.
+ *
+ * Velocity is cell-centered and measured in grid cells per second at this API boundary. The
+ * implementation converts it to Mantaflow's internal MAC layout. Pressure is both an input and an
+ * output so the serializable state can retain the previous pressure field as an initial guess.
+ */
+struct MantaGasState {
+  MantaGasExtent3 resolution;
+  float *density = nullptr;
+  float *temperature = nullptr;
+  MantaGasVec3 *velocity = nullptr;
+  float *pressure = nullptr;
+};
+
+struct MantaGasStepSettings {
+  /* Frame time and internal substeps are measured in seconds. */
+  float delta_time = 1.0f / 30.0f;
+  float cfl = 2.0f;
+  int max_substeps = 32;
+
+  /* Grid-space acceleration in cells per second squared, used only for buoyancy. */
+  MantaGasVec3 gravity = {0.0f, 0.0f, -9.81f};
+  float density_buoyancy = 0.0f;
+  float heat_buoyancy = 1.0f;
+
+  float pressure_accuracy = 1.0e-3f;
+  float pressure_iteration_factor = 1.5f;
+};
+
+struct MantaGasStepDiagnostics {
+  int substeps = 0;
+  float simulated_time = 0.0f;
+  /* Largest MAC velocity norm sampled by the CFL scheduler, in cells per second. */
+  float max_velocity = 0.0f;
+};
+
+/**
+ * Advance one closed-domain smoke state using compiled Mantaflow kernels.
+ *
+ * The complete frame, including all internal substeps, remains in Mantaflow storage. No modifier,
+ * Python script, disk cache, global solver singleton, or retained solver pointer is used. On
+ * failure, the caller's buffers are not modified and error_message describes the failure.
+ */
+bool manta_gas_simulation_step(const MantaGasState &state,
+                               const MantaGasStepSettings &settings,
+                               MantaGasStepDiagnostics &diagnostics,
+                               std::string &error_message);
+
+}  // namespace blender

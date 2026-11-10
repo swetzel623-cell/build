@@ -15,7 +15,7 @@
 
 namespace Manta {
 
-/* Direct compiled entry points from extern/mantaflow/preprocessed/plugin/*.cpp. */
+/* Direct compiled entry points from Mantaflow's preprocessed plugins. */
 void advectSemiLagrange(const FlagGrid *flags,
                         const MACGrid *vel,
                         GridBase *grid,
@@ -137,9 +137,9 @@ float max_mac_velocity(const Manta::MACGrid &velocity)
   return static_cast<float>(std::sqrt(max_squared));
 }
 
-bool grids_are_finite(const Manta::Grid<Manta::Real> &density,
-                      const Manta::Grid<Manta::Real> &temperature,
-                      const Manta::Grid<Manta::Real> &pressure,
+bool grids_are_finite(const Manta::Grid<Real> &density,
+                      const Manta::Grid<Real> &temperature,
+                      const Manta::Grid<Real> &pressure,
                       const Manta::MACGrid &velocity)
 {
   const Manta::Vec3i extent = density.getSize();
@@ -192,19 +192,19 @@ bool manta_gas_simulation_step(const MantaGasState &state,
     Manta::FluidSolver solver(
         Manta::Vec3i(state.resolution.x, state.resolution.y, state.resolution.z));
     Manta::FlagGrid flags(&solver);
-    Manta::Grid<Manta::Real> density(&solver);
-    Manta::Grid<Manta::Real> temperature(&solver);
-    Manta::Grid<Manta::Real> pressure(&solver);
+    Manta::Grid<Real> density(&solver);
+    Manta::Grid<Real> temperature(&solver);
+    Manta::Grid<Real> pressure(&solver);
     Manta::Grid<Manta::Vec3> centered_velocity(&solver);
     Manta::MACGrid velocity(&solver);
 
     for (std::size_t i = 0; i < cell_count; ++i) {
-      density[i] = static_cast<Manta::Real>(state.density[i]);
-      temperature[i] = static_cast<Manta::Real>(state.temperature[i]);
-      pressure[i] = static_cast<Manta::Real>(state.pressure[i]);
-      centered_velocity[i] = Manta::Vec3(static_cast<Manta::Real>(state.velocity[i].x),
-                                         static_cast<Manta::Real>(state.velocity[i].y),
-                                         static_cast<Manta::Real>(state.velocity[i].z));
+      density[i] = static_cast<Real>(state.density[i]);
+      temperature[i] = static_cast<Real>(state.temperature[i]);
+      pressure[i] = static_cast<Real>(state.pressure[i]);
+      centered_velocity[i] = Manta::Vec3(static_cast<Real>(state.velocity[i].x),
+                                         static_cast<Real>(state.velocity[i].y),
+                                         static_cast<Real>(state.velocity[i].z));
     }
     Manta::resampleVec3ToMac(centered_velocity, velocity);
 
@@ -225,7 +225,7 @@ bool manta_gas_simulation_step(const MantaGasState &state,
       }
 
       /* FluidSolver::step() is intentionally not used as a physics operator. The node owns time. */
-      solver.mDt = static_cast<Manta::Real>(*next_dt);
+      solver.mDt = static_cast<Real>(*next_dt);
       local_diagnostics.max_velocity = std::max(local_diagnostics.max_velocity, max_velocity);
 
       /* Basic legacy smoke ordering, with explicit compiled operators instead of Python scripts. */
@@ -238,7 +238,7 @@ bool manta_gas_simulation_step(const MantaGasState &state,
                            temperature,
                            velocity,
                            Manta::Vec3(settings.gravity.x, settings.gravity.y, settings.gravity.z),
-                           static_cast<Manta::Real>(settings.heat_buoyancy),
+                           static_cast<Real>(settings.heat_buoyancy),
                            false);
       }
       if (settings.density_buoyancy != 0.0f) {
@@ -246,7 +246,7 @@ bool manta_gas_simulation_step(const MantaGasState &state,
                            density,
                            velocity,
                            Manta::Vec3(settings.gravity.x, settings.gravity.y, settings.gravity.z),
-                           static_cast<Manta::Real>(settings.density_buoyancy),
+                           static_cast<Real>(settings.density_buoyancy),
                            false);
       }
 
@@ -256,20 +256,20 @@ bool manta_gas_simulation_step(const MantaGasState &state,
       Manta::solvePressure(velocity,
                            pressure,
                            flags,
-                           static_cast<Manta::Real>(settings.pressure_accuracy),
+                           static_cast<Real>(settings.pressure_accuracy),
                            nullptr,
                            nullptr,
                            nullptr,
                            nullptr,
-                           static_cast<Manta::Real>(1.0e-4),
-                           static_cast<Manta::Real>(settings.pressure_iteration_factor),
+                           static_cast<Real>(1.0e-4),
+                           static_cast<Real>(settings.pressure_iteration_factor),
                            true,
                            pressure_preconditioner_mic,
                            false,
                            false,
                            true,
                            nullptr,
-                           static_cast<Manta::Real>(0.0),
+                           static_cast<Real>(0.0),
                            nullptr);
 
       if (!grids_are_finite(density, temperature, pressure, velocity)) {

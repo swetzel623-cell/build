@@ -1,6 +1,6 @@
 # Blender Geometry Nodes gas-step integration
 
-This directory contains a source overlay and patch for Blender commit
+This directory contains a source overlay and installer for Blender commit
 `377d577d520472f2702e456b26c17dffc663dc52`.
 
 ## Apply
@@ -8,17 +8,19 @@ This directory contains a source overlay and patch for Blender commit
 From a clean Blender checkout at the pinned commit:
 
 ```sh
-git apply --check /path/to/Blender-Mantaflow-Improvement/blender/patches/0001-geometry-nodes-gas-step.patch
-git apply /path/to/Blender-Mantaflow-Improvement/blender/patches/0001-geometry-nodes-gas-step.patch
+python3 /path/to/Blender-Mantaflow-Improvement/blender/apply_integration.py /path/to/blender --check
+python3 /path/to/Blender-Mantaflow-Improvement/blender/apply_integration.py /path/to/blender
 ```
 
-Build Blender with `WITH_FLUID=ON` and `WITH_OPENVDB=ON`. The patch adds the engine sources to
+The installer verifies the checked-out commit and expected source anchors before writing. Use
+`--allow-unpinned` only when intentionally porting the overlay to another revision.
+
+Build Blender with `WITH_FLUID=ON` and `WITH_OPENVDB=ON`. The installer adds the engine sources to
 `intern/mantaflow`, adds the node to Geometry Nodes node discovery, and links `bf_nodes_geometry`
 to `bf::intern::mantaflow`. The node is not built when either dependency is disabled.
 
-The files are also mirrored under `blender/intern` and `blender/source` for review. The patch is
-the authoritative apply mechanism; no upstream Blender files other than the two CMake lists are
-modified.
+The files are also mirrored under `blender/intern` and `blender/source` for review. No upstream
+Blender files other than the two CMake lists are modified.
 
 ## Node contract
 
@@ -80,8 +82,8 @@ modifier:
 
 ## Validation boundary
 
-The standalone scheduler/layout tests and patch-application check can run without Blender. They do
-not establish compilation of the complete Blender target, numerical equivalence to the legacy
+The standalone scheduler/layout tests and installer dry-run/application checks can run without
+Blender. They do not establish compilation of the complete Blender target, numerical equivalence to the legacy
 modifier, cache round-trip correctness, thread safety under every node evaluation schedule, or
 runtime performance. Those require building the patched pinned Blender source and running gas,
 cache-reload, and multiple-independent-zone tests.

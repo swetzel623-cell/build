@@ -28,7 +28,7 @@ The `blender/` overlay adds a compiled `Gas Simulation Step` node and a small no
 
 The complete frame remains in Mantaflow storage between node entry and exit. No legacy `FluidModifierData`, generated Python script, global solver singleton, or separate cache mechanism is used.
 
-See [`blender/README.md`](blender/README.md) for the pinned Blender commit, patch application, node contract, and limitations. This increment is a source-level prototype; a full patched Blender build and runtime simulation are still required.
+See [`blender/README.md`](blender/README.md) for the pinned Blender commit, installer usage, node contract, and limitations. This increment is a source-level prototype; a full integrated Blender build and runtime simulation are still required.
 
 ## Standalone build and test
 

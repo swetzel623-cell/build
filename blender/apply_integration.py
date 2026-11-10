@@ -43,22 +43,50 @@ INTERN_NEW = """  intern/manta_python_API.cpp
   intern/manta_gas_step_driver.h
 """
 
+# The engine includes Mantaflow's kernel headers directly, so it must see the same kernel
+# configuration as `extern_mantaflow`. Upstream sources in this target keep their definitions.
+INTERN_LIB_ANCHOR = """blender_add_lib(bf_intern_mantaflow "${SRC}" "${INC}" "${INC_SYS}" "${LIB}")
+"""
+INTERN_LIB_INSERT = """if(WITH_TBB)
+  set_source_files_properties(
+    intern/manta_gas_step_API.cpp
+    PROPERTIES COMPILE_DEFINITIONS "TBB=1"
+  )
+endif()
+
+"""
+
 GEOMETRY_ANCHOR = """add_node_discovery(
   bf_nodes_geometry_generated
 """
-GEOMETRY_INSERT = """if(WITH_FLUID AND WITH_OPENVDB)
-  list(APPEND SRC
-    nodes/node_geo_manta_gas_step.cc
-  )
+GEOMETRY_INSERT = """list(APPEND SRC
+  nodes/node_geo_manta_gas_step.cc
+)
+if(WITH_MOD_FLUID AND WITH_OPENVDB)
+  add_definitions(-DWITH_FLUID)
   list(APPEND INC
     ../../../../intern/mantaflow/extern
     ../../../../intern/mantaflow/intern
   )
   list(APPEND LIB
-    PRIVATE bf::intern::mantaflow
+    PRIVATE bf_intern_mantaflow
   )
 endif()
 
+"""
+
+
+# Every built-in node needs an RNA struct; registration asserts without it.
+RNA_SOURCE = "source/blender/makesrna/intern/rna_nodes_geometry.cc"
+RNA_ANCHOR = """  define("GeometryNode", "GeometryNodeMaterialSelection");
+"""
+RNA_INSERT = """  define("GeometryNode", "GeometryNodeMantaGasStep");
+"""
+
+MENU_SOURCE = "scripts/startup/bl_ui/node_add_menu_geometry.py"
+MENU_ANCHOR = """        self.node_operator(layout, "GeometryNodeXPBDSolver")
+"""
+MENU_INSERT = """        self.node_operator(layout, "GeometryNodeMantaGasStep")
 """
 
 
@@ -109,8 +137,18 @@ def main() -> int:
         intern_text = intern_path.read_text()
         geometry_text = geometry_path.read_text()
         intern_text = replace_once(intern_text, INTERN_OLD, INTERN_NEW, INTERN_CMAKE)
+        intern_text = replace_once(
+            intern_text, INTERN_LIB_ANCHOR, INTERN_LIB_INSERT + INTERN_LIB_ANCHOR, INTERN_CMAKE
+        )
         geometry_text = replace_once(
             geometry_text, GEOMETRY_ANCHOR, GEOMETRY_INSERT + GEOMETRY_ANCHOR, GEOMETRY_CMAKE
+        )
+
+        rna_path = blender_root / RNA_SOURCE
+        menu_path = blender_root / MENU_SOURCE
+        rna_text = replace_once(rna_path.read_text(), RNA_ANCHOR, RNA_INSERT + RNA_ANCHOR, RNA_SOURCE)
+        menu_text = replace_once(
+            menu_path.read_text(), MENU_ANCHOR, MENU_ANCHOR + MENU_INSERT, MENU_SOURCE
         )
 
         if args.check:
@@ -123,8 +161,10 @@ def main() -> int:
             destination.write_bytes((overlay_root / relative).read_bytes())
         intern_path.write_text(intern_text)
         geometry_path.write_text(geometry_text)
+        rna_path.write_text(rna_text)
+        menu_path.write_text(menu_text)
         print(f"Applied Geometry Nodes gas-step integration to {blender_root}")
-        print("Build with WITH_FLUID=ON and WITH_OPENVDB=ON; run runtime validation before use.")
+        print("Build with WITH_MOD_FLUID=ON and WITH_OPENVDB=ON; run runtime validation before use.")
         return 0
     except (OSError, RuntimeError) as error:
         print(f"Integration failed: {error}", file=sys.stderr)

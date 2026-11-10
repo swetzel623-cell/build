@@ -10,15 +10,17 @@
 
 #include "BLT_translation.hh"
 
-#include "manta_gas_step_API.h"
-#include "manta_gas_layout.h"
+#if defined(WITH_FLUID) && defined(WITH_OPENVDB)
+#  include "manta_gas_layout.h"
+#  include "manta_gas_step_API.h"
 
-#include "openvdb/openvdb.h"
+#  include "openvdb/openvdb.h"
 
-#include <chrono>
-#include <cmath>
-#include <string>
-#include <vector>
+#  include <chrono>
+#  include <cmath>
+#  include <string>
+#  include <vector>
+#endif
 
 namespace blender::nodes::node_geo_manta_gas_step_cc {
 
@@ -27,9 +29,12 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_input<decl::Geometry>("State"_ustr)
       .description(
           "Volume containing density, temperature, velocity, and pressure grids. Missing grids "
-          "start at zero");
+          "start at zero. A velocity grid that is not tagged as staggered is treated as "
+          "cell-centered and resampled to faces");
   b.add_output<decl::Geometry>("State"_ustr)
-      .description("Serializable next simulation state containing the four named volume grids");
+      .description(
+          "Serializable next simulation state containing the four named volume grids. Velocity "
+          "is the solver's staggered (face-centered) field");
 
   b.add_input<decl::Float>("Delta Time"_ustr)
       .default_value(1.0f / 30.0f)
@@ -95,6 +100,8 @@ static void node_declare(NodeDeclarationBuilder &b)
       .description("Dense-to-OpenVDB conversion time in milliseconds");
 }
 
+#if defined(WITH_FLUID) && defined(WITH_OPENVDB)
+
 static void set_diagnostics(GeoNodeExecParams &params,
                             const int substeps,
                             const float max_velocity,
@@ -155,9 +162,11 @@ static bool import_scalar_grid(const Volume *volume,
     return false;
   }
 
-  const bke::VolumeGrid<float> typed_grid(grid_data);
+  /* Borrow the grid. Wrapping the pointer in a #bke::VolumeGrid would release a user that this
+   * function does not own. The type was checked above. */
   bke::VolumeTreeAccessToken token;
-  const openvdb::FloatGrid &grid = typed_grid.grid(token);
+  const openvdb::FloatGrid &grid = static_cast<const openvdb::FloatGrid &>(
+      grid_data->grid(token));
   if (!(grid.transform() == expected_transform)) {
     error = std::string("Grid '") + name +
             "' does not match the requested origin and voxel-size transform.";
@@ -184,8 +193,10 @@ static bool import_velocity_grid(const Volume *volume,
                                  const int3 &resolution,
                                  const float voxel_size,
                                  MantaGasVec3 *output,
+                                 MantaGasVelocityLayout &r_layout,
                                  std::string &error)
 {
+  r_layout = MantaGasVelocityLayout::CellCentered;
   if (!volume) {
     return true;
   }
@@ -199,15 +210,21 @@ static bool import_velocity_grid(const Volume *volume,
     return false;
   }
 
-  const bke::VolumeGrid<float3> typed_grid(grid_data);
   bke::VolumeTreeAccessToken token;
-  const openvdb::Vec3SGrid &grid = typed_grid.grid(token);
+  const openvdb::Vec3SGrid &grid = static_cast<const openvdb::Vec3SGrid &>(
+      grid_data->grid(token));
   if (!(grid.transform() == expected_transform)) {
     error = "Grid 'velocity' does not match the requested origin and voxel-size transform.";
     return false;
   }
   if (!active_values_fit_domain(grid, resolution, name, error)) {
     return false;
+  }
+
+  /* The node's own output is tagged as staggered; any other vector grid is an authored
+   * cell-centered velocity. */
+  if (grid.getGridClass() == openvdb::GRID_STAGGERED) {
+    r_layout = MantaGasVelocityLayout::Staggered;
   }
 
   openvdb::Vec3SGrid::ConstAccessor accessor = grid.getConstAccessor();
@@ -252,6 +269,8 @@ static openvdb::Vec3SGrid::Ptr make_velocity_grid(const std::vector<MantaGasVec3
 {
   openvdb::Vec3SGrid::Ptr grid = openvdb::Vec3SGrid::create(openvdb::Vec3f::zero());
   grid->setTransform(transform.copy());
+  /* Face-centered solver state, the same convention as the legacy fluid cache. */
+  grid->setGridClass(openvdb::GRID_STAGGERED);
   openvdb::Vec3SGrid::Accessor accessor = grid->getAccessor();
   for (int z = 0; z < resolution.z; ++z) {
     for (int y = 0; y < resolution.y; ++y) {
@@ -325,11 +344,17 @@ static void node_geo_exec(GeoNodeExecParams params)
     const auto import_start = std::chrono::steady_clock::now();
     const Volume *input_volume = state.get_volume();
     std::string error;
+    MantaGasVelocityLayout velocity_layout = MantaGasVelocityLayout::CellCentered;
     if (!import_scalar_grid(input_volume, "density", *transform, resolution, density.data(), error) ||
         !import_scalar_grid(
             input_volume, "temperature", *transform, resolution, temperature.data(), error) ||
-        !import_velocity_grid(
-            input_volume, *transform, resolution, voxel_size, velocity.data(), error) ||
+        !import_velocity_grid(input_volume,
+                              *transform,
+                              resolution,
+                              voxel_size,
+                              velocity.data(),
+                              velocity_layout,
+                              error) ||
         !import_scalar_grid(
             input_volume, "pressure", *transform, resolution, pressure.data(), error))
     {
@@ -344,6 +369,7 @@ static void node_geo_exec(GeoNodeExecParams params)
     manta_state.temperature = temperature.data();
     manta_state.velocity = velocity.data();
     manta_state.pressure = pressure.data();
+    manta_state.velocity_layout = velocity_layout;
 
     MantaGasStepSettings settings;
     settings.delta_time = delta_time;
@@ -397,6 +423,20 @@ static void node_geo_exec(GeoNodeExecParams params)
     fail(params, state, "Gas Simulation Step failed with an unknown error.");
   }
 }
+
+#else
+
+/* The node type stays registered so files and menus remain valid in every build configuration. */
+static void node_geo_exec(GeoNodeExecParams params)
+{
+  GeometrySet state = params.extract_input<GeometrySet>("State"_ustr);
+  params.error_message_add(NodeWarningType::Error,
+                           TIP_("Disabled, Blender was compiled without Mantaflow or OpenVDB"));
+  params.set_output("State"_ustr, std::move(state));
+  params.set_default_remaining_outputs();
+}
+
+#endif
 
 static void node_register()
 {

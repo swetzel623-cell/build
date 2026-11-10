@@ -18,12 +18,25 @@ struct MantaGasVec3 {
   float z = 0.0f;
 };
 
+enum class MantaGasVelocityLayout {
+  /** One vector per cell center. Converting to and from the solver's layout averages neighbors. */
+  CellCentered,
+  /**
+   * Mantaflow's MAC layout: component `c` of cell `(i, j, k)` lives on the cell's lower face along
+   * axis `c`. This is the solver's own state, so it survives a step boundary without loss.
+   */
+  Staggered,
+};
+
 /**
  * Borrowed dense grid buffers in Mantaflow's X-fastest layout.
  *
- * Velocity is cell-centered and measured in grid cells per second at this API boundary. The
- * implementation converts it to Mantaflow's internal MAC layout. Pressure is both an input and an
- * output so the serializable state can retain the previous pressure field as an initial guess.
+ * Velocity is measured in grid cells per second. `velocity_layout` describes the input buffer. A
+ * cell-centered input is resampled to faces once, which is intended for authored initial or
+ * emitted velocities. On success the buffer always holds the staggered solver field, reported in
+ * #MantaGasStepDiagnostics::velocity_layout; feeding that back as #Staggered continues the
+ * simulation exactly where it stopped. Pressure is both an input and an output so the
+ * serializable state can retain the previous pressure field as an initial guess.
  */
 struct MantaGasState {
   MantaGasExtent3 resolution;
@@ -31,6 +44,7 @@ struct MantaGasState {
   float *temperature = nullptr;
   MantaGasVec3 *velocity = nullptr;
   float *pressure = nullptr;
+  MantaGasVelocityLayout velocity_layout = MantaGasVelocityLayout::CellCentered;
 };
 
 struct MantaGasStepSettings {
@@ -53,6 +67,8 @@ struct MantaGasStepDiagnostics {
   float simulated_time = 0.0f;
   /* Largest MAC velocity norm sampled by the CFL scheduler, in cells per second. */
   float max_velocity = 0.0f;
+  /** Layout of the caller's velocity buffer on return. Unchanged on failure or zero time. */
+  MantaGasVelocityLayout velocity_layout = MantaGasVelocityLayout::CellCentered;
 };
 
 /**

@@ -25,7 +25,7 @@ std::size_t index(Extent3 extent, int x, int y, int z)
   return static_cast<std::size_t>(x) +
          static_cast<std::size_t>(extent.x) *
              (static_cast<std::size_t>(y) + static_cast<std::size_t>(extent.y) *
-                                                  static_cast<std::size_t>(z)));
+                                                  static_cast<std::size_t>(z));
 }
 
 void test_empty_mask()

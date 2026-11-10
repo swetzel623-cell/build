@@ -173,6 +173,7 @@ bool manta_gas_simulation_step(const MantaGasState &state,
                                std::string &error_message)
 {
   diagnostics = {};
+  diagnostics.velocity_layout = state.velocity_layout;
   error_message.clear();
 
   try {
@@ -195,18 +196,24 @@ bool manta_gas_simulation_step(const MantaGasState &state,
     Manta::Grid<Real> density(&solver);
     Manta::Grid<Real> temperature(&solver);
     Manta::Grid<Real> pressure(&solver);
-    Manta::Grid<Manta::Vec3> centered_velocity(&solver);
     Manta::MACGrid velocity(&solver);
 
     for (std::size_t i = 0; i < cell_count; ++i) {
       density[i] = static_cast<Real>(state.density[i]);
       temperature[i] = static_cast<Real>(state.temperature[i]);
       pressure[i] = static_cast<Real>(state.pressure[i]);
-      centered_velocity[i] = Manta::Vec3(static_cast<Real>(state.velocity[i].x),
-                                         static_cast<Real>(state.velocity[i].y),
-                                         static_cast<Real>(state.velocity[i].z));
+      velocity[i] = Manta::Vec3(static_cast<Real>(state.velocity[i].x),
+                                static_cast<Real>(state.velocity[i].y),
+                                static_cast<Real>(state.velocity[i].z));
     }
-    Manta::resampleVec3ToMac(centered_velocity, velocity);
+    if (state.velocity_layout == MantaGasVelocityLayout::CellCentered) {
+      /* Authored input only. The solver state itself is exchanged in the staggered layout, because
+       * averaging to cell centers and back every frame low-pass filters the velocity field. */
+      Manta::Grid<Manta::Vec3> centered_velocity(&solver);
+      centered_velocity.copyFrom(velocity, false);
+      velocity.clear();
+      Manta::resampleVec3ToMac(centered_velocity, velocity);
+    }
 
     /* Match a minimal closed gas domain: boundary cells are obstacles, interior cells are fluid. */
     flags.initDomain(0);
@@ -280,22 +287,17 @@ bool manta_gas_simulation_step(const MantaGasState &state,
       }
     }
 
-    Manta::resampleMacToVec3(velocity, centered_velocity);
+    /* Every substep already verified that the grids are finite. */
     for (std::size_t i = 0; i < cell_count; ++i) {
-      if (!std::isfinite(static_cast<double>(centered_velocity[i].x)) ||
-          !std::isfinite(static_cast<double>(centered_velocity[i].y)) ||
-          !std::isfinite(static_cast<double>(centered_velocity[i].z)))
-      {
-        throw std::runtime_error("Mantaflow produced a non-finite centered velocity.");
-      }
       state.density[i] = static_cast<float>(density[i]);
       state.temperature[i] = static_cast<float>(temperature[i]);
       state.pressure[i] = static_cast<float>(pressure[i]);
-      state.velocity[i] = {static_cast<float>(centered_velocity[i].x),
-                           static_cast<float>(centered_velocity[i].y),
-                           static_cast<float>(centered_velocity[i].z)};
+      state.velocity[i] = {static_cast<float>(velocity[i].x),
+                           static_cast<float>(velocity[i].y),
+                           static_cast<float>(velocity[i].z)};
     }
 
+    local_diagnostics.velocity_layout = MantaGasVelocityLayout::Staggered;
     local_diagnostics.substeps = driver.substeps();
     local_diagnostics.simulated_time = static_cast<float>(driver.simulated_time());
     diagnostics = local_diagnostics;

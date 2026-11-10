@@ -17,6 +17,7 @@ namespace {
 using blender::MantaGasState;
 using blender::MantaGasStepDiagnostics;
 using blender::MantaGasStepSettings;
+using blender::MantaGasPreconditioner;
 using blender::MantaGasVec3;
 using blender::MantaGasVelocityLayout;
 
@@ -291,6 +292,7 @@ void test_staggered_state_resumes_exactly()
   whole.delta_time = 0.25f;
   whole.cfl = 0.5f; /* 0.5 / 4 cells per second = 0.125 s: exactly half the frame. */
   whole.gravity = {0.0f, 0.0f, -2.0f};
+  whole.heat_buoyancy = 1.0f;
   MantaGasStepSettings half = whole;
   half.delta_time = 0.125f;
 
@@ -313,15 +315,91 @@ void test_staggered_state_resumes_exactly()
           "Resuming from the staggered state differs from an uninterrupted frame by " +
               std::to_string(resumed_error));
 
-  /* The same exchange through cell centers is lossy, which is why it is not the state layout. */
-  DenseState centered = moving_state();
-  require(step(centered, half, diagnostics, error), "Centered first half failed: " + error);
+}
+
+/** Control for the test above: the layout flag must change how the buffer is interpreted. */
+void test_velocity_layout_is_respected()
+{
+  DenseState developed;
+  for (int offset = -1; offset <= 1; ++offset) {
+    developed.temperature[center_index() + static_cast<std::size_t>(offset)] = 1.0f;
+  }
+  MantaGasStepSettings step_settings = settings();
+  step_settings.gravity = {0.0f, 0.0f, -50.0f};
+  step_settings.heat_buoyancy = 1.0f;
+  MantaGasStepDiagnostics diagnostics;
+  std::string error;
+  for (int i = 0; i < 3; ++i) {
+    require(step(developed, step_settings, diagnostics, error), "Buoyant step failed: " + error);
+    developed.velocity_layout = diagnostics.velocity_layout;
+  }
+  require(velocity_energy(developed) > 0.0f, "Control state has no motion");
+
+  DenseState staggered = developed;
+  require(step(staggered, step_settings, diagnostics, error), "Staggered step failed: " + error);
+  DenseState centered = developed;
   centered.velocity_layout = MantaGasVelocityLayout::CellCentered;
-  require(step(centered, half, diagnostics, error), "Centered second half failed: " + error);
-  const float centered_error = max_difference(single, centered);
-  std::cout << "  resumed error " << resumed_error << ", centered error " << centered_error << '\n';
-  require(centered_error > 100.0f * std::max(resumed_error, 1.0e-7f),
+  require(step(centered, step_settings, diagnostics, error), "Centered step failed: " + error);
+
+  const float difference = max_difference(staggered, centered);
+  float largest = 0.0f;
+  for (const MantaGasVec3 &value : staggered.velocity) {
+    largest = std::max({largest, std::abs(value.x), std::abs(value.y), std::abs(value.z)});
+  }
+  std::cout << "  layout difference " << difference << " of peak velocity " << largest << '\n';
+  require(difference > 0.01f * largest,
           "Reinterpreting staggered output as cell-centered went unnoticed");
+}
+
+/** Both preconditioners solve the same system, so they must agree to the solver tolerance. */
+void test_preconditioners_agree_and_report_convergence()
+{
+  MantaGasStepSettings step_settings = settings();
+  step_settings.gravity = {0.0f, 0.0f, -2.0f};
+  step_settings.heat_buoyancy = 1.0f;
+  step_settings.pressure_accuracy = 1.0e-5f;
+  step_settings.pressure_iteration_factor = 20.0f;
+  std::string error;
+
+  DenseState multigrid = moving_state();
+  MantaGasStepDiagnostics multigrid_diagnostics;
+  step_settings.preconditioner = MantaGasPreconditioner::Multigrid;
+  require(step(multigrid, step_settings, multigrid_diagnostics, error),
+          "Multigrid step failed: " + error);
+
+  DenseState mic = moving_state();
+  MantaGasStepDiagnostics mic_diagnostics;
+  step_settings.preconditioner = MantaGasPreconditioner::MIC;
+  require(step(mic, step_settings, mic_diagnostics, error), "MIC step failed: " + error);
+
+  require_finite(multigrid);
+  for (const MantaGasStepDiagnostics &diagnostics : {multigrid_diagnostics, mic_diagnostics}) {
+    require(diagnostics.pressure_converged, "Pressure solve did not converge");
+    require(diagnostics.pressure_iterations >= 1, "Pressure iterations were not reported");
+    require(diagnostics.pressure_residual <= step_settings.pressure_accuracy,
+            "Reported residual exceeds the requested accuracy");
+  }
+  const float difference = max_difference(multigrid, mic);
+  std::cout << "  multigrid " << multigrid_diagnostics.pressure_iterations << " iterations, MIC "
+            << mic_diagnostics.pressure_iterations << " iterations, difference " << difference
+            << '\n';
+  require(difference <= 1.0e-3f,
+          "Preconditioners disagree by " + std::to_string(difference));
+}
+
+void test_iteration_limit_is_reported()
+{
+  DenseState dense = moving_state();
+  MantaGasStepSettings step_settings = settings();
+  step_settings.preconditioner = MantaGasPreconditioner::MIC;
+  step_settings.pressure_accuracy = 1.0e-8f;
+  step_settings.pressure_iteration_factor = 0.1f; /* One iteration at this resolution. */
+  MantaGasStepDiagnostics diagnostics;
+  std::string error;
+  require(step(dense, step_settings, diagnostics, error), "Iteration-limited step failed: " + error);
+  require(!diagnostics.pressure_converged, "Iteration-limited solve claimed convergence");
+  require(diagnostics.pressure_residual > step_settings.pressure_accuracy,
+          "Iteration-limited solve reported a converged residual");
 }
 
 void test_failure_keeps_velocity_layout()
@@ -351,6 +429,10 @@ int main()
       {"non-finite input is atomic", test_nonfinite_input_is_atomic},
       {"independent sequential states", test_independent_sequential_states},
       {"staggered state resumes exactly", test_staggered_state_resumes_exactly},
+      {"velocity layout is respected", test_velocity_layout_is_respected},
+      {"preconditioners agree and report convergence",
+       test_preconditioners_agree_and_report_convergence},
+      {"iteration limit is reported", test_iteration_limit_is_reported},
       {"failure keeps velocity layout", test_failure_keeps_velocity_layout},
   };
 

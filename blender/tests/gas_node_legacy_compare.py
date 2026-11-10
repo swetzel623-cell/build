@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 import bpy
 import numpy as np
@@ -36,7 +37,12 @@ from gas_node_testlib import Zone  # noqa: E402
 MANTA_TIME_PER_SECOND = 2.5  # Legacy script: dt = 0.1 at 25 fps.
 
 
-def run_legacy(res, frames, work):
+def run_legacy(res, frames, work, keep=None, walls=None):
+    """Run the legacy solver and return its per-frame states and a description of the setup.
+
+    `keep` limits which frames' grids are copied out. `walls`, if given, receives the wall-clock
+    milliseconds of each frame change.
+    """
     scene = lib.reset_scene()
     bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0.0, 0.0, 0.0))
     domain = bpy.context.object
@@ -72,9 +78,14 @@ def run_legacy(res, frames, work):
     states = {}
     steps = {}
     for frame in range(1, frames + 1):
+        begin = time.perf_counter()
         scene.frame_set(frame)
+        if walls is not None:
+            walls[frame] = (time.perf_counter() - begin) * 1000.0
         if frame == 1:
             count_solver_steps(steps)
+        if keep is not None and frame not in keep:
+            continue
         # The solver lives on the evaluated domain object.
         depsgraph = bpy.context.evaluated_depsgraph_get()
         ds = domain.evaluated_get(depsgraph).modifiers[0].domain_settings
@@ -97,6 +108,8 @@ def run_legacy(res, frames, work):
         "beta": float(ds.beta),
         "gravity": tuple(scene.gravity),
         "fps": scene.render.fps,
+        "cfl": float(ds.cfl_condition),
+        "legacy_steps_by_frame": {f: n for f, n in steps.items() if isinstance(f, int)},
         "legacy_steps_per_frame": sorted(set(steps.values())),
         "legacy_dt": steps.get("dt"),
         "legacy_frame_length": steps.get("frame_length"),
@@ -160,9 +173,9 @@ def centered_preimage(mac_world, res):
     return center.reshape(-1, 3).astype(np.float32)
 
 
-def run_node(start, info, frames, **overrides):
+def run_node(start, info, frames, match_step_padding=True, **overrides):
     scene = lib.reset_scene(fps=info["fps"])
-    if info.get("legacy_dt") and info.get("legacy_frame_length"):
+    if match_step_padding and info.get("legacy_dt") and info.get("legacy_frame_length"):
         # Mantaflow's adaptive scheduler pads the final step of a frame by 1e-4 time units.
         scene.render.fps_base = info["legacy_dt"] / info["legacy_frame_length"]
     res, voxel = info["res"], info["voxel"]
@@ -183,7 +196,9 @@ def run_node(start, info, frames, **overrides):
     obj = lib.build_object("node", [zone])
     out = {}
     for frame in range(1, frames + 2):
+        begin = time.perf_counter()
         (result,), _ = lib.evaluate(obj, [zone], frame)
+        result["frame_wall_ms"] = (time.perf_counter() - begin) * 1000.0
         out[frame - 1] = result
     problems = [m for kind, m in lib.warnings(obj) if kind == "ERROR"]
     if problems:

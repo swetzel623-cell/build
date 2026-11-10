@@ -13,7 +13,8 @@ import numpy as np
 
 GAS_NODE = "GeometryNodeMantaGasStep"
 GRID_NAMES = ("density", "temperature", "velocity", "pressure")
-DIAG_NAMES = ("substeps", "max_velocity", "import_ms", "solve_ms", "export_ms")
+DIAG_NAMES = ("substeps", "max_velocity", "import_ms", "solve_ms", "export_ms",
+              "pressure_iterations", "pressure_residual")
 
 
 class Zone:
@@ -192,11 +193,13 @@ def _zone(b, zone, initial):
     gas.inputs["Origin"].default_value = zone.origin
     gas.inputs["Voxel Size"].default_value = zone.voxel
     for key, value in zone.params.items():
-        gas.inputs[key].default_value = value
+        socket = gas.inputs[key]
+        socket.default_value = bool(value) if socket.type == "BOOLEAN" else value
     b.link(gas.outputs["State"], sim_out.inputs["Geometry"])
 
     diag = b.new("GeometryNodePoints").outputs[0]
-    outputs = ("Substeps", "Max Velocity", "Import Time", "Solve Time", "Export Time")
+    outputs = ("Substeps", "Max Velocity", "Import Time", "Solve Time", "Export Time",
+               "Pressure Iterations", "Pressure Residual")
     for name, socket in zip(DIAG_NAMES, outputs):
         store = b.new("GeometryNodeStoreNamedAttribute", data_type="FLOAT", domain="POINT")
         store.inputs["Name"].default_value = name

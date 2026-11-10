@@ -47,6 +47,16 @@ struct MantaGasState {
   MantaGasVelocityLayout velocity_layout = MantaGasVelocityLayout::CellCentered;
 };
 
+enum class MantaGasPreconditioner {
+  /** Modified incomplete Cholesky. Iteration count grows with resolution. */
+  MIC,
+  /**
+   * Mantaflow's geometric multigrid, constructed and destroyed inside the call. This does not use
+   * Mantaflow's `solvePressure` entry point, whose multigrid modes share a process-global cache.
+   */
+  Multigrid,
+};
+
 struct MantaGasStepSettings {
   /* Frame time and internal substeps are measured in seconds. */
   float delta_time = 1.0f / 30.0f;
@@ -59,7 +69,9 @@ struct MantaGasStepSettings {
   float heat_buoyancy = 1.0f;
 
   float pressure_accuracy = 1.0e-3f;
+  /** Scales the resolution-dependent iteration limit of the MIC preconditioner only. */
   float pressure_iteration_factor = 1.5f;
+  MantaGasPreconditioner preconditioner = MantaGasPreconditioner::Multigrid;
 };
 
 struct MantaGasStepDiagnostics {
@@ -67,6 +79,12 @@ struct MantaGasStepDiagnostics {
   float simulated_time = 0.0f;
   /* Largest MAC velocity norm sampled by the CFL scheduler, in cells per second. */
   float max_velocity = 0.0f;
+  /** Largest conjugate-gradient iteration count of any substep's pressure solve. */
+  int pressure_iterations = 0;
+  /** Largest final residual (maximum norm) of any substep's pressure solve. */
+  float pressure_residual = 0.0f;
+  /** False if any substep stopped at its iteration limit before reaching the accuracy. */
+  bool pressure_converged = true;
   /** Layout of the caller's velocity buffer on return. Unchanged on failure or zero time. */
   MantaGasVelocityLayout velocity_layout = MantaGasVelocityLayout::CellCentered;
 };

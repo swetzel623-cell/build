@@ -83,11 +83,18 @@ static void node_declare(NodeDeclarationBuilder &b)
       .min(1.0e-8f)
       .max(1.0f)
       .description("Residual accuracy requested from Mantaflow's MIC-preconditioned solver");
+  b.add_input<decl::Bool>("Multigrid"_ustr)
+      .default_value(true)
+      .description(
+          "Precondition the pressure solve with a multigrid owned by this node evaluation. "
+          "Disable to use the MIC preconditioner");
   b.add_input<decl::Float>("Pressure Iteration Factor"_ustr)
       .default_value(1.5f)
       .min(0.1f)
       .max(20.0f)
-      .description("Multiplier for Mantaflow's resolution-dependent pressure iteration limit");
+      .description(
+          "Multiplier for the resolution-dependent pressure iteration limit of the MIC "
+          "preconditioner. Unused with Multigrid");
 
   b.add_output<decl::Int>("Substeps"_ustr).description("Number of internal solver steps executed");
   b.add_output<decl::Float>("Max Velocity"_ustr)
@@ -98,6 +105,10 @@ static void node_declare(NodeDeclarationBuilder &b)
       .description("Mantaflow allocation and simulation time in milliseconds");
   b.add_output<decl::Float>("Export Time"_ustr)
       .description("Dense-to-OpenVDB conversion time in milliseconds");
+  b.add_output<decl::Int>("Pressure Iterations"_ustr)
+      .description("Largest pressure solver iteration count of any substep");
+  b.add_output<decl::Float>("Pressure Residual"_ustr)
+      .description("Largest final pressure solver residual of any substep");
 }
 
 #if defined(WITH_FLUID) && defined(WITH_OPENVDB)
@@ -107,8 +118,12 @@ static void set_diagnostics(GeoNodeExecParams &params,
                             const float max_velocity,
                             const float import_ms,
                             const float solve_ms,
-                            const float export_ms)
+                            const float export_ms,
+                            const int pressure_iterations = 0,
+                            const float pressure_residual = 0.0f)
 {
+  params.set_output("Pressure Iterations"_ustr, pressure_iterations);
+  params.set_output("Pressure Residual"_ustr, pressure_residual);
   params.set_output("Substeps"_ustr, substeps);
   params.set_output("Max Velocity"_ustr, max_velocity);
   params.set_output("Import Time"_ustr, import_ms);
@@ -381,6 +396,9 @@ static void node_geo_exec(GeoNodeExecParams params)
     settings.pressure_accuracy = params.extract_input<float>("Pressure Accuracy"_ustr);
     settings.pressure_iteration_factor = params.extract_input<float>(
         "Pressure Iteration Factor"_ustr);
+    settings.preconditioner = params.extract_input<bool>("Multigrid"_ustr) ?
+                                  MantaGasPreconditioner::Multigrid :
+                                  MantaGasPreconditioner::MIC;
 
     MantaGasStepDiagnostics diagnostics;
     const auto solve_start = std::chrono::steady_clock::now();
@@ -414,7 +432,15 @@ static void node_geo_exec(GeoNodeExecParams params)
                     diagnostics.max_velocity * voxel_size,
                     import_ms,
                     solve_ms,
-                    export_ms);
+                    export_ms,
+                    diagnostics.pressure_iterations,
+                    diagnostics.pressure_residual);
+    if (!diagnostics.pressure_converged) {
+      params.error_message_add(
+          NodeWarningType::Warning,
+          TIP_("The pressure solve stopped at its iteration limit before reaching the requested "
+               "accuracy"));
+    }
   }
   catch (const std::exception &exception) {
     fail(params, state, std::string("Gas Simulation Step failed: ") + exception.what());

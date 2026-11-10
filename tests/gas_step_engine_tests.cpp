@@ -18,6 +18,7 @@ using blender::MantaGasState;
 using blender::MantaGasStepDiagnostics;
 using blender::MantaGasStepSettings;
 using blender::MantaGasVec3;
+using blender::MantaGasVelocityLayout;
 
 constexpr int resolution = 8;
 constexpr std::size_t cell_count = resolution * resolution * resolution;
@@ -42,6 +43,7 @@ struct DenseState {
   std::vector<float> temperature = std::vector<float>(cell_count, 0.0f);
   std::vector<MantaGasVec3> velocity = std::vector<MantaGasVec3>(cell_count);
   std::vector<float> pressure = std::vector<float>(cell_count, 0.0f);
+  MantaGasVelocityLayout velocity_layout = MantaGasVelocityLayout::CellCentered;
 
   MantaGasState state()
   {
@@ -49,7 +51,8 @@ struct DenseState {
             density.data(),
             temperature.data(),
             velocity.data(),
-            pressure.data()};
+            pressure.data(),
+            velocity_layout};
   }
 };
 
@@ -256,6 +259,85 @@ void test_independent_sequential_states()
           "Second state observed data from the first solver");
 }
 
+float max_difference(const DenseState &a, const DenseState &b)
+{
+  float result = 0.0f;
+  for (std::size_t i = 0; i < cell_count; ++i) {
+    result = std::max(result, std::abs(a.density[i] - b.density[i]));
+    result = std::max(result, std::abs(a.temperature[i] - b.temperature[i]));
+    result = std::max(result, std::abs(a.velocity[i].x - b.velocity[i].x));
+    result = std::max(result, std::abs(a.velocity[i].y - b.velocity[i].y));
+    result = std::max(result, std::abs(a.velocity[i].z - b.velocity[i].z));
+  }
+  return result;
+}
+
+DenseState moving_state()
+{
+  DenseState dense;
+  dense.density[center_index()] = 1.0f;
+  dense.temperature[center_index()] = 1.0f;
+  std::fill(dense.velocity.begin(), dense.velocity.end(), MantaGasVec3{4.0f, 0.0f, 0.0f});
+  return dense;
+}
+
+/**
+ * Two calls of half a frame each must reproduce one call that takes the same two substeps
+ * internally. This only holds if the exchanged state is the solver's own state.
+ */
+void test_staggered_state_resumes_exactly()
+{
+  MantaGasStepSettings whole = settings();
+  whole.delta_time = 0.25f;
+  whole.cfl = 0.5f; /* 0.5 / 4 cells per second = 0.125 s: exactly half the frame. */
+  whole.gravity = {0.0f, 0.0f, -2.0f};
+  MantaGasStepSettings half = whole;
+  half.delta_time = 0.125f;
+
+  MantaGasStepDiagnostics diagnostics;
+  std::string error;
+  DenseState single = moving_state();
+  require(step(single, whole, diagnostics, error), "Single two-substep frame failed: " + error);
+  require(diagnostics.substeps == 2, "Reference frame did not take exactly two substeps");
+  require(diagnostics.velocity_layout == MantaGasVelocityLayout::Staggered,
+          "Successful step did not report a staggered velocity buffer");
+
+  DenseState resumed = moving_state();
+  require(step(resumed, half, diagnostics, error), "First half frame failed: " + error);
+  require(diagnostics.substeps == 1, "First half frame was subdivided");
+  resumed.velocity_layout = diagnostics.velocity_layout;
+  require(step(resumed, half, diagnostics, error), "Second half frame failed: " + error);
+  require(diagnostics.substeps == 1, "Second half frame was subdivided");
+  const float resumed_error = max_difference(single, resumed);
+  require(resumed_error <= 1.0e-5f,
+          "Resuming from the staggered state differs from an uninterrupted frame by " +
+              std::to_string(resumed_error));
+
+  /* The same exchange through cell centers is lossy, which is why it is not the state layout. */
+  DenseState centered = moving_state();
+  require(step(centered, half, diagnostics, error), "Centered first half failed: " + error);
+  centered.velocity_layout = MantaGasVelocityLayout::CellCentered;
+  require(step(centered, half, diagnostics, error), "Centered second half failed: " + error);
+  const float centered_error = max_difference(single, centered);
+  std::cout << "  resumed error " << resumed_error << ", centered error " << centered_error << '\n';
+  require(centered_error > 100.0f * std::max(resumed_error, 1.0e-7f),
+          "Reinterpreting staggered output as cell-centered went unnoticed");
+}
+
+void test_failure_keeps_velocity_layout()
+{
+  DenseState dense = moving_state();
+  MantaGasStepSettings step_settings = settings();
+  step_settings.delta_time = 0.5f;
+  step_settings.cfl = 1.0f;
+  step_settings.max_substeps = 1;
+  MantaGasStepDiagnostics diagnostics;
+  std::string error;
+  require(!step(dense, step_settings, diagnostics, error), "Capped frame incorrectly succeeded");
+  require(diagnostics.velocity_layout == MantaGasVelocityLayout::CellCentered,
+          "Failed step misreported the untouched velocity buffer layout");
+}
+
 }  // namespace
 
 int main()
@@ -268,6 +350,8 @@ int main()
       {"substep cap is atomic", test_substep_cap_is_atomic},
       {"non-finite input is atomic", test_nonfinite_input_is_atomic},
       {"independent sequential states", test_independent_sequential_states},
+      {"staggered state resumes exactly", test_staggered_state_resumes_exactly},
+      {"failure keeps velocity layout", test_failure_keeps_velocity_layout},
   };
 
   for (const auto &[name, test] : tests) {

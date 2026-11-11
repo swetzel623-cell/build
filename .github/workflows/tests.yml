@@ -31,16 +31,20 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-      - name: Install Vulkan headers, loader, and shader compiler
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
-        with:
-          vulkan-query-version: 1.4.309.0
-          vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang
-          vulkan-use-cache: true
+      - name: Install the Vulkan SDK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe" -OutFile "$env:RUNNER_TEMP\vulkan_sdk.exe"
+          $install = Start-Process -FilePath "$env:RUNNER_TEMP\vulkan_sdk.exe" -Wait -PassThru -ArgumentList "--root","C:\VulkanSDK\sdk","--accept-licenses","--default-answer","--confirm-command","install"
+          if ($install.ExitCode -ne 0) { throw "Vulkan SDK installer exited with $($install.ExitCode)" }
+          Get-ChildItem C:\VulkanSDK\sdk | Select-Object Name
+          "VULKAN_SDK=C:\VulkanSDK\sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\VulkanSDK\sdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
       - name: Build
         run: |
           cmake -S . -B build -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           cmake --build build --config Release
+          if (-not (Test-Path build/Release/sparse_gas_gpu_tests.exe)) { throw "GPU test program was not built" }
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
       - name: Upload the GPU test program

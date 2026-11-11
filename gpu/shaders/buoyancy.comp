@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: MIT
+// Buoyancy on faces between two fluid cells. P.a.xyz = -gravity * dt * coefficient.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#define FACTOR b4
+#define U b5
+#define V b6
+#define W b7
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index) || cell_type[index] != CELL_FLUID) {
+    return;
+  }
+  ivec3 c = coords_of(index);
+  ivec3 below;
+  below = c - ivec3(1, 0, 0);
+  if (type_at(below) == CELL_FLUID) {
+    U[index] += 0.5 * P.a.x * (FACTOR[index] + FACTOR[index_of(below)]);
+  }
+  below = c - ivec3(0, 1, 0);
+  if (type_at(below) == CELL_FLUID) {
+    V[index] += 0.5 * P.a.y * (FACTOR[index] + FACTOR[index_of(below)]);
+  }
+  below = c - ivec3(0, 0, 1);
+  if (type_at(below) == CELL_FLUID) {
+    W[index] += 0.5 * P.a.z * (FACTOR[index] + FACTOR[index_of(below)]);
+  }
+}

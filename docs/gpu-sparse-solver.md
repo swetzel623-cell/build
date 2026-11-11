@@ -1,0 +1,166 @@
+# GPU sparse gas solver: research and first increment
+
+This document records what was researched, what was decided and why, what exists in the
+repository now, and what has and has not been verified.
+
+## Goal
+
+A smoke solver whose cost follows the smoke instead of the bounding box, running on the GPU,
+usable from the Geometry Nodes gas node. The dense Mantaflow-based node in `blender/` stays the
+correctness reference for the physics.
+
+## Findings
+
+**Sparse layouts used for simulation on GPUs**
+
+- NanoVDB stores a VDB tree without pointers so it can be copied to a GPU unchanged. Until
+  recently it assumed static topology, which rules it out as a simulation container. Index grids,
+  introduced with fVDB, separate topology from data: the tree maps a voxel to an index into flat
+  side arrays. A 2026 NVIDIA paper adds GPU topology updates (dilation, merge, prune) and a
+  "voxel-sequential" access scheme for stencils, and links to the OpenVDB repository for code.
+  [NanoVDB](https://research.nvidia.com/labs/prl/publication/nanovdb),
+  [Dynamic GPU Sparse Grids](https://research.nvidia.com/labs/prl/publication/sifakis2026dynamic/)
+- GVDB Voxels ran FLIP fluids on a sparse brick hierarchy with a matrix-free conjugate gradient
+  pressure solve on the GPU. [Fast Fluid Simulations with Sparse Volumes on the GPU](https://diglib.eg.org/handle/10.1111/cgf13350)
+- SPGrid pairs a sparse paged grid with an adaptive multigrid-preconditioned CG solver, on the
+  CPU. DCGrid positions itself as combining GPU execution with a multigrid hierarchy.
+  [SPGrid](https://pages.cs.wisc.edu/~sifakis/papers/SPGrid.pdf),
+  [DCGrid](https://graphics.tudelft.nl/~klaus/papers/DCGrid.pdf)
+
+**How production sparse smoke solvers treat the inactive region**
+
+- Houdini's sparse pyro keeps 16³ tiles active where reference fields (density, flame) are
+  non-zero, pads that set, and rebuilds it every step. Inactive space is treated as vacuum that
+  smoke can move into, and two separate puffs do not see each other until their active regions
+  merge. Its pressure projection uses unsmoothed aggregation multigrid with internal boundaries
+  treated as open. [Sparse pyro](https://www.sidefx.com/docs/houdini/pyro/sparsity.html),
+  [Sparse Smoke Simulations in Houdini](https://history.siggraph.org/?p=41379)
+- Axiom is a commercial GPU sparse solver for Houdini with OpenCL, CUDA, and Metal backends and
+  a CPU fallback when a simulation exceeds GPU memory.
+  [Axiom](https://www.cgchannel.com/2024/09/matt-puchala-releases-axiom-3-for-houdini/)
+
+**What Blender offers**
+
+- Checked in the pinned source: Blender's GPU module has compute dispatch
+  (`GPU_compute_dispatch`), storage buffers with read-back (`GPU_storagebuf_read`), and is used
+  for compute by EEVEE, the draw manager, and GPU subdivision. Its shaders are GLSL.
+- Vulkan became an officially supported backend in Blender 4.5.
+  [Projects update](https://code.blender.org/2025/05/projects-update-q2-2025/)
+- The pinned Blender libraries bundle NanoVDB 32.9, including `PNanoVDB.h`, the portable
+  C/GLSL/HLSL accessor header, and a `cuda` directory.
+- Geometry Nodes evaluate on worker threads. Nothing found shows a geometry node using the GPU
+  module, so how a node obtains a GPU context is unresolved (see open questions).
+
+## Decisions
+
+1. **Portable compute shaders, not CUDA.** The reference implementations with GPU topology
+   updates are CUDA. Blender cannot make a core node depend on one vendor, and its own GPU module
+   is GLSL on Vulkan, Metal, and OpenGL. The kernels are therefore plain GLSL compute shaders over
+   storage buffers, which is what Blender's GPU module consumes.
+2. **Fixed-size bricks with a flat brick table, not a VDB tree, for now.** A dense table over the
+   brick grid maps a brick to a storage slot; channels are flat float arrays indexed by
+   `slot * brick_volume + local`. A lookup is one table read, there is no tree traversal in the
+   shaders, and the same arrays are uploaded unchanged. With 8³ bricks a brick is exactly an
+   OpenVDB leaf node, so import and export can become per-leaf copies. The cost is the dense
+   table: 4 bytes per brick of the bounding box, so 16 MB for a 1024³ domain. A NanoVDB index
+   grid would remove that and is the likely long-term container; the kernels only depend on
+   "coordinates to index", so the swap is contained.
+3. **Topology on the CPU.** Deciding which bricks are active is a small per-brick computation. It
+   stays on the CPU until profiling says otherwise.
+4. **Open air outside the active region.** Like Houdini, inactive space has pressure zero and
+   smoke may flow into it. The domain's outer voxel layer remains a closed wall, as in Mantaflow.
+   This is a different boundary condition from the dense closed-box solve, so the sparse and
+   dense results are not expected to be equal. Velocity alone does not keep a brick active: the
+   pressure solve induces a small velocity everywhere, so it would activate the whole domain.
+5. **A CPU reference with the same layout comes first.** Without it GPU results cannot be
+   checked, and Blender needs a CPU fallback in any case (background renders, no GPU). Every CPU
+   kernel is a gather over stored voxels and corresponds to one compute shader.
+
+## What exists
+
+| Piece | Location |
+| --- | --- |
+| Topology, state, dense conversion, CPU reference kernels and step | `include/manta_improve/sparse_gas.hpp`, `src/sparse_gas.cpp` |
+| GLSL compute kernels: advect, buoyancy, walls, divergence, jacobi, gradient | `gpu/shaders/` |
+| Minimal Vulkan compute runner (test scaffolding) | `gpu/vulkan_compute.*` |
+| Step driver that runs the kernels on a Vulkan device | `gpu/sparse_gas_gpu.*` |
+| CPU tests | `tests/sparse_gas_tests.cpp` |
+| GPU-versus-CPU test and timing | `tests/sparse_gas_gpu_tests.cpp` |
+
+**Staggered storage and the ghost layer.** A voxel stores the velocity of its three lower faces.
+A cell can only be solved for if the cells above it along each axis are stored too, or are walls.
+The remaining stored cells, a one-voxel layer on the upper sides of the active set, are classified
+as open air and hold the faces between fluid and open air. Cell types are computed once per
+topology and uploaded.
+
+**The step.** Rebuild topology from the current values, advect density, temperature, and the
+three velocity components, add heat and density buoyancy, zero wall faces, solve pressure, subtract
+its gradient. Buoyancy and the wall rule follow Mantaflow's operators.
+
+**Pressure.** The system is the 7-point Poisson matrix over fluid cells with Neumann conditions at
+walls and Dirichlet zero at open cells. The CPU reference has Jacobi-preconditioned CG and plain
+Jacobi sweeps. The GPU path has Jacobi sweeps only: they need no reductions, so the GPU result can
+be compared with the reference sweep for sweep.
+
+## Verified
+
+On Linux x86-64, GCC 13, Release.
+
+CPU reference, 7 tests in `sparse_gas_tests`:
+
+- Brick addressing, cell classification, dilation, overhanging bricks.
+- Dense round trip is exact.
+- CG projection leaves less than 1e-3 divergence, both with all bricks active and with only the
+  bricks around a blob active; no flow through closed walls.
+- With every brick active, brick sizes 4, 5, 8, and 16 give bit-identical results after 8 steps.
+- A buoyant blob rises; without forces nothing moves; an empty state stores nothing.
+- Sparse against all-bricks-active on 48×48×96 over 30 steps: peak 176 of 432 bricks (41%),
+  plume rise 17.6 against 17.2 voxels, total density within 2%, density relative L2 difference
+  0.18.
+- 3000 Jacobi sweeps agree with CG to 3e-7 on a 16³ box.
+
+GPU kernels, `sparse_gas_gpu_tests`: on **llvmpipe, a software Vulkan implementation**, every
+channel equals the CPU reference bit for bit after each of 8 steps of a rising plume (32×32×48,
+60 Jacobi sweeps per step, topology growing from 48 to 64 bricks). This verifies the shaders, the
+buffer layout, and the driver. It says nothing about speed.
+
+## Not verified, and known gaps
+
+- **No run on a real GPU.** Neither this environment nor GitHub's standard runners have one.
+  `sparse_gas_gpu_tests <resolution> <steps>` is the program to run on one; it prints the device
+  it used and per-step times.
+- **No performance claim of any kind.** On llvmpipe the device path is slower than the CPU
+  reference, which is expected and meaningless. The driver is also not written for speed: buffers
+  are host-visible, every dispatch is submitted and waited for separately, and the whole state is
+  uploaded and downloaded every step.
+- **The physics is not yet the dense node's.** Advection is first-order semi-Lagrangian, which is
+  much more diffusive than the MacCormack scheme the Mantaflow node uses, and it spreads smoke
+  into more bricks than necessary. There is no comparison against the Mantaflow engine yet.
+- **Jacobi is not a production pressure solver.** Its convergence degrades with resolution.
+- **No CFL substepping.** Smoke must not cross the padding of one brick in a step.
+- **The CPU reference is deliberately simple and slow** (single-threaded, a table lookup per
+  neighbor read).
+- **Not connected to Blender.**
+
+## Open questions
+
+- **GPU context from Geometry Nodes.** Node evaluation happens on worker threads, possibly in a
+  background render with no window. Using Blender's GPU module there needs a context that is
+  valid on that thread. Blender has a system GPU context that other background work uses; whether
+  a node may use it, and how it is locked, needs to be established in the Blender source before
+  any integration design is fixed.
+- **Where the state lives between frames.** Simulation Zone state is CPU geometry. Keeping grids
+  on the GPU across frames conflicts with that; downloading every frame costs transfer time.
+- **Sparse OpenVDB interchange.** The node currently exchanges dense-topology grids.
+
+## Next steps
+
+1. Run `sparse_gas_gpu_tests` on real GPUs and record correctness and time.
+2. Make the driver fair to the GPU: device-local buffers, one command buffer per step, state kept
+   on the device between steps.
+3. Replace Jacobi with a multigrid-preconditioned or multigrid solver over the brick hierarchy,
+   with GPU reductions.
+4. MacCormack advection and CFL substepping, then compare with the Mantaflow engine on a case
+   where the active region covers the domain.
+5. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind
+   the existing node, with the CPU reference as fallback.

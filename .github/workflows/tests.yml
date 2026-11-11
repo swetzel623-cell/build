@@ -1,0 +1,52 @@
+# Standalone suites, including the sparse solver's compute kernels on a software Vulkan device.
+# The Windows job also uploads the GPU test program so it can be run on a real GPU.
+name: Standalone tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "claude/**"]
+    paths-ignore: ["blender/**", "**.md", ".github/workflows/windows-build.yml"]
+  pull_request:
+    paths-ignore: ["blender/**", "**.md", ".github/workflows/windows-build.yml"]
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan (software device) and shader compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libvulkan-dev mesa-vulkan-drivers glslang-tools
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+          test -x build/sparse_gas_gpu_tests
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan headers, loader, and shader compiler
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: 1.4.309.0
+          vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang
+          vulkan-use-cache: true
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Upload the GPU test program
+        uses: actions/upload-artifact@v4
+        with:
+          name: sparse-gas-gpu-test-windows-x64
+          path: build/Release/sparse_gas_gpu_tests.exe
+          if-no-files-found: error
+          retention-days: 30

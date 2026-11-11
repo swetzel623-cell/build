@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: MIT
+// Runs the sparse solver's compute kernels on a Vulkan device and compares every channel with the
+// CPU reference. Exits with 77 (skipped) when no Vulkan device is available.
+#include "manta_improve/sparse_gas.hpp"
+#include "sparse_gas_gpu.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+using namespace manta_improve;
+
+sparse::DenseFields blob(const sparse::Extent extent)
+{
+  sparse::DenseFields dense;
+  dense.extent = extent;
+  const std::size_t count = static_cast<std::size_t>(extent.x) * extent.y * extent.z;
+  dense.density.assign(count, 0.0f);
+  dense.temperature.assign(count, 0.0f);
+  const float cx = extent.x / 2.0f, cy = extent.y / 2.0f, cz = extent.z / 4.0f;
+  const float radius = extent.x / 8.0f;
+  for (int z = 0; z < extent.z; ++z) {
+    for (int y = 0; y < extent.y; ++y) {
+      for (int x = 0; x < extent.x; ++x) {
+        const float dx = x + 0.5f - cx, dy = y + 0.5f - cy, dz = z + 0.5f - cz;
+        if (dx * dx + dy * dy + dz * dz <= radius * radius) {
+          const std::size_t i = x + static_cast<std::size_t>(extent.x) * (y + extent.y * z);
+          dense.density[i] = 1.0f;
+          dense.temperature[i] = 1.0f;
+        }
+      }
+    }
+  }
+  return dense;
+}
+
+float max_abs(const std::vector<float> &values)
+{
+  float result = 0.0f;
+  for (const float value : values) {
+    result = std::max(result, std::abs(value));
+  }
+  return result;
+}
+
+float max_difference(const std::vector<float> &a, const std::vector<float> &b)
+{
+  if (a.size() != b.size()) {
+    throw std::runtime_error("channel sizes differ");
+  }
+  float result = 0.0f;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    result = std::max(result, std::abs(a[i] - b[i]));
+  }
+  return result;
+}
+
+double seconds_since(const std::chrono::steady_clock::time_point start)
+{
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
+}  // namespace
+
+int main(int argc, char **argv)
+{
+  const int resolution = argc > 1 ? std::atoi(argv[1]) : 32;
+  const int steps = argc > 2 ? std::atoi(argv[2]) : 8;
+
+  std::unique_ptr<gpu::SparseGasGpu> solver;
+  try {
+    solver = std::make_unique<gpu::SparseGasGpu>();
+  }
+  catch (const std::exception &error) {
+    std::cout << "SKIP: " << error.what() << '\n';
+    return 77;
+  }
+  std::cout << "Vulkan device: " << solver->device_name()
+            << (solver->is_software_device() ? " (software)" : "") << '\n';
+
+  sparse::Settings settings;
+  settings.gravity[2] = -9.81f * resolution / 2.0f;
+  settings.heat_buoyancy = 0.5f;
+  settings.density_buoyancy = 0.5f;
+  settings.pressure_solver = sparse::PressureSolver::Jacobi;
+  settings.pressure_iterations = 60;
+
+  const sparse::Extent extent = {resolution, resolution, resolution * 3 / 2};
+  sparse::State cpu = sparse::from_dense(blob(extent), 8, settings.thresholds, settings.dilation);
+  sparse::State device = cpu;
+
+  double cpu_seconds = 0.0, device_seconds = 0.0;
+  for (int i = 0; i < steps; ++i) {
+    auto start = std::chrono::steady_clock::now();
+    sparse::step(cpu, settings);
+    cpu_seconds += seconds_since(start);
+    start = std::chrono::steady_clock::now();
+    const sparse::StepInfo info = solver->step(device, settings);
+    device_seconds += seconds_since(start);
+
+    if (cpu.topology.brick_table != device.topology.brick_table) {
+      std::cout << "FAIL: topologies diverged at step " << i << '\n';
+      return 1;
+    }
+    const float scale = std::max(1.0f, max_abs(cpu.w));
+    const float worst = std::max({max_difference(cpu.density, device.density),
+                                  max_difference(cpu.temperature, device.temperature),
+                                  max_difference(cpu.u, device.u) / scale,
+                                  max_difference(cpu.v, device.v) / scale,
+                                  max_difference(cpu.w, device.w) / scale,
+                                  max_difference(cpu.pressure, device.pressure) / scale});
+    std::cout << "step " << i << ": " << info.active_bricks << " bricks, peak |w| " << max_abs(cpu.w)
+              << ", largest CPU/device difference " << worst << '\n';
+    if (!(worst < 1.0e-4f)) {
+      std::cout << "FAIL: device result differs from the CPU reference\n";
+      return 1;
+    }
+  }
+  if (!(max_abs(cpu.w) > 0.1f)) {
+    std::cout << "FAIL: the test flow did not develop\n";
+    return 1;
+  }
+  std::cout << "CPU reference " << cpu_seconds / steps * 1000.0 << " ms/step, device "
+            << device_seconds / steps * 1000.0 << " ms/step (includes upload and download)\n";
+  std::cout << "PASS: device kernels match the CPU reference\n";
+  return 0;
+}

@@ -15,6 +15,15 @@ The intended architecture is a frontend-independent engine with explicit, serial
 
 The mask is intentionally **not** used as a pressure-projection mask. Smoke density alone does not establish which cells participate in the globally coupled velocity solve. Building the mask still scans the input grids; it does not provide active-voxel-proportional memory or a complete sparse solver.
 
+### GPU sparse solver (started)
+
+A brick-sparse gas solver whose data layout is flat arrays a GPU consumes unchanged, with a CPU
+reference implementation and GLSL compute kernels run through Vulkan. The kernels match the CPU
+reference bit for bit on a software Vulkan device. It has **not been run on a real GPU**, makes no
+performance claim, uses simpler numerics than the Mantaflow node, and is not connected to Blender.
+See [`docs/gpu-sparse-solver.md`](docs/gpu-sparse-solver.md) for the research, design decisions,
+and what is and is not verified.
+
 ### Geometry Nodes CPU gas-step prototype
 
 The `blender/` overlay adds a compiled `Gas Simulation Step` node and a small node-local Mantaflow API. It provides:
@@ -56,6 +65,13 @@ Cycles) build, interactive use, and sanitizer runs of the Blender process are st
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
+```
+
+The GPU kernels are built when the Vulkan headers and loader and `glslangValidator` are found. On
+a machine with a Vulkan-capable GPU, this runs them against the CPU reference and prints timings:
+
+```sh
+./build/sparse_gas_gpu_tests 64 20
 ```
 
 Run the activity-mask microbenchmark with defaults:

@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: MIT
+// Zero every face that touches a solid cell.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#define U b4
+#define V b5
+#define W b6
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index)) {
+    return;
+  }
+  ivec3 c = coords_of(index);
+  bool solid = cell_type[index] == CELL_SOLID;
+  if (solid || type_at(c - ivec3(1, 0, 0)) == CELL_SOLID) {
+    U[index] = 0.0;
+  }
+  if (solid || type_at(c - ivec3(0, 1, 0)) == CELL_SOLID) {
+    V[index] = 0.0;
+  }
+  if (solid || type_at(c - ivec3(0, 0, 1)) == CELL_SOLID) {
+    W[index] = 0.0;
+  }
+}

@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: MIT
+// First-order semi-Lagrangian advection. P.a = (offset of the advected channel, dt).
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#define U b4
+#define V b5
+#define W b6
+#define SOURCE b7
+#define RESULT b8
+
+#define FETCH(channel, c) (index_of(c) < 0 ? 0.0 : channel[index_of(c)])
+#define SAMPLE(name, channel) \
+  float name(vec3 p, vec3 offset) \
+  { \
+    vec3 f = p - offset; \
+    vec3 base = floor(f); \
+    ivec3 i = ivec3(base); \
+    vec3 t = f - base; \
+    float c00 = FETCH(channel, i) + (FETCH(channel, i + ivec3(1, 0, 0)) - FETCH(channel, i)) * t.x; \
+    float c10 = FETCH(channel, i + ivec3(0, 1, 0)) + \
+                (FETCH(channel, i + ivec3(1, 1, 0)) - FETCH(channel, i + ivec3(0, 1, 0))) * t.x; \
+    float c01 = FETCH(channel, i + ivec3(0, 0, 1)) + \
+                (FETCH(channel, i + ivec3(1, 0, 1)) - FETCH(channel, i + ivec3(0, 0, 1))) * t.x; \
+    float c11 = FETCH(channel, i + ivec3(0, 1, 1)) + \
+                (FETCH(channel, i + ivec3(1, 1, 1)) - FETCH(channel, i + ivec3(0, 1, 1))) * t.x; \
+    float c0 = c00 + (c10 - c00) * t.y; \
+    float c1 = c01 + (c11 - c01) * t.y; \
+    return c0 + (c1 - c0) * t.z; \
+  }
+
+SAMPLE(sample_u, U)
+SAMPLE(sample_v, V)
+SAMPLE(sample_w, W)
+SAMPLE(sample_source, SOURCE)
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index)) {
+    return;
+  }
+  if (cell_type[index] == CELL_SOLID) {
+    RESULT[index] = 0.0;
+    return;
+  }
+  vec3 p = vec3(coords_of(index)) + P.a.xyz;
+  vec3 velocity = vec3(sample_u(p, vec3(0.0, 0.5, 0.5)),
+                       sample_v(p, vec3(0.5, 0.0, 0.5)),
+                       sample_w(p, vec3(0.5, 0.5, 0.0)));
+  RESULT[index] = sample_source(p - P.a.w * velocity, P.a.xyz);
+}

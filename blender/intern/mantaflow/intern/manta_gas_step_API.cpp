@@ -6,12 +6,17 @@
 
 #include "manta.h"
 #include "fluidsolver.h"
+#include "conjugategrad.h"
 #include "grid.h"
+#include "multigrid.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <stdexcept>
+#include <vector>
 
 namespace Manta {
 
@@ -41,24 +46,51 @@ void setWallBcs(const FlagGrid &flags,
                 const Grid<Real> *phiObs,
                 int boundaryWidth);
 
-void solvePressure(MACGrid &vel,
-                   Grid<Real> &pressure,
-                   const FlagGrid &flags,
-                   Real cgAccuracy,
-                   const Grid<Real> *phi,
-                   const Grid<Real> *perCellCorr,
-                   const MACGrid *fractions,
-                   const MACGrid *obvel,
-                   Real gfClamp,
-                   Real cgMaxIterFac,
-                   bool precondition,
-                   int preconditioner,
-                   bool enforceCompatibility,
-                   bool useL2Norm,
-                   bool zeroPressureFixing,
-                   const Grid<Real> *curv,
-                   Real surfTens,
-                   Grid<Real> *retRhs);
+/* The pieces of Mantaflow's `solvePressure`, minus `solvePressureSystem`: that function keeps
+ * its multigrid in a process-global map for both multigrid modes. */
+void computePressureRhs(Grid<Real> &rhs,
+                        const MACGrid &vel,
+                        const Grid<Real> &pressure,
+                        const FlagGrid &flags,
+                        Real cgAccuracy,
+                        const Grid<Real> *phi,
+                        const Grid<Real> *perCellCorr,
+                        const MACGrid *fractions,
+                        const MACGrid *obvel,
+                        Real gfClamp,
+                        Real cgMaxIterFac,
+                        bool precondition,
+                        int preconditioner,
+                        bool enforceCompatibility,
+                        bool useL2Norm,
+                        bool zeroPressureFixing,
+                        const Grid<Real> *curv,
+                        Real surfTens);
+
+void fixPressure(int fixPidx,
+                 Real value,
+                 Grid<Real> &rhs,
+                 Grid<Real> &A0,
+                 Grid<Real> &Ai,
+                 Grid<Real> &Aj,
+                 Grid<Real> &Ak);
+
+void correctVelocity(MACGrid &vel,
+                     Grid<Real> &pressure,
+                     const FlagGrid &flags,
+                     Real cgAccuracy,
+                     const Grid<Real> *phi,
+                     const Grid<Real> *perCellCorr,
+                     const MACGrid *fractions,
+                     Real gfClamp,
+                     Real cgMaxIterFac,
+                     bool precondition,
+                     int preconditioner,
+                     bool enforceCompatibility,
+                     bool useL2Norm,
+                     bool zeroPressureFixing,
+                     const Grid<Real> *curv,
+                     Real surfTens);
 
 }  // namespace Manta
 
@@ -66,6 +98,142 @@ namespace blender {
 namespace {
 
 constexpr int pressure_preconditioner_mic = 1;  // Manta::PcMIC from plugin/pressure.cpp.
+constexpr int multigrid_max_iterations = 100;   // As in Mantaflow's solvePressureSystem.
+
+struct PressureSolveResult {
+  int iterations = 0;
+  float residual = 0.0f;
+  bool converged = false;
+};
+
+/** First fluid cell in Mantaflow's preferred order for pinning the pressure of a closed domain. */
+Manta::IndexInt pressure_pin_index(const Manta::FlagGrid &flags)
+{
+  const Manta::Vec3i top_center(flags.getSizeX() / 2, flags.getSizeY() - 1, flags.getSizeZ() / 2);
+  for (int offset = 0; offset < 3; ++offset) {
+    const Manta::Vec3i position = top_center - Manta::Vec3i(0, offset, 0);
+    if (flags.isFluid(position)) {
+      return flags.index(position);
+    }
+  }
+  for (int k = 1; k < flags.getSizeZ() - 1; ++k) {
+    for (int j = 1; j < flags.getSizeY() - 1; ++j) {
+      for (int i = 1; i < flags.getSizeX() - 1; ++i) {
+        if (flags.isFluid(i, j, k)) {
+          return flags.index(i, j, k);
+        }
+      }
+    }
+  }
+  return -1;
+}
+
+/**
+ * Closed-domain pressure projection with every solver object owned by this call.
+ *
+ * This follows Mantaflow's `solvePressure` step for step (right-hand side, Laplace matrix,
+ * pressure pinning, preconditioned CG, velocity correction) so the result matches the legacy
+ * solver. The only difference is ownership of the preconditioner.
+ */
+PressureSolveResult solve_pressure(Manta::FluidSolver &solver,
+                                   Manta::MACGrid &velocity,
+                                   Manta::Grid<Real> &pressure,
+                                   Manta::FlagGrid &flags,
+                                   const MantaGasStepSettings &settings)
+{
+  const Real accuracy = static_cast<Real>(settings.pressure_accuracy);
+  const Real iteration_factor = static_cast<Real>(settings.pressure_iteration_factor);
+  const Real ghost_fluid_clamp = static_cast<Real>(1.0e-4);
+
+  Manta::Grid<Real> rhs(&solver);
+  Manta::computePressureRhs(rhs,
+                            velocity,
+                            pressure,
+                            flags,
+                            accuracy,
+                            nullptr,
+                            nullptr,
+                            nullptr,
+                            nullptr,
+                            ghost_fluid_clamp,
+                            iteration_factor,
+                            true,
+                            pressure_preconditioner_mic,
+                            false,
+                            false,
+                            true,
+                            nullptr,
+                            static_cast<Real>(0.0));
+
+  Manta::Grid<Real> residual(&solver);
+  Manta::Grid<Real> search(&solver);
+  Manta::Grid<Real> a0(&solver);
+  Manta::Grid<Real> ai(&solver);
+  Manta::Grid<Real> aj(&solver);
+  Manta::Grid<Real> ak(&solver);
+  Manta::Grid<Real> tmp(&solver);
+  Manta::MakeLaplaceMatrix(flags, a0, ai, aj, ak, nullptr);
+
+  /* A closed domain has no empty cell, so the system is singular until one pressure is fixed. */
+  const Manta::IndexInt pin_index = pressure_pin_index(flags);
+  if (pin_index >= 0) {
+    Manta::fixPressure(static_cast<int>(pin_index), static_cast<Real>(0.0), rhs, a0, ai, aj, ak);
+  }
+
+  Manta::GridCg<Manta::ApplyMatrix> cg(
+      pressure, rhs, residual, search, flags, tmp, {&a0, &ai, &aj, &ak});
+  cg.setAccuracy(accuracy);
+  cg.setUseL2Norm(false);
+
+  /* Declared before use so they outlive every CG iteration; only one kind is allocated. */
+  std::unique_ptr<Manta::GridMg> multigrid;
+  std::vector<std::unique_ptr<Manta::Grid<Real>>> mic_grids;
+  int max_iterations = 0;
+  if (settings.preconditioner == MantaGasPreconditioner::Multigrid) {
+    multigrid = std::make_unique<Manta::GridMg>(pressure.getSize());
+    cg.setMGPreconditioner(Manta::GridCgInterface::PC_MGP, multigrid.get());
+    max_iterations = multigrid_max_iterations;
+  }
+  else {
+    for (int i = 0; i < 4; ++i) {
+      mic_grids.push_back(std::make_unique<Manta::Grid<Real>>(&solver));
+    }
+    cg.setICPreconditioner(Manta::GridCgInterface::PC_mICP,
+                           mic_grids[0].get(),
+                           mic_grids[1].get(),
+                           mic_grids[2].get(),
+                           mic_grids[3].get());
+    max_iterations = static_cast<int>(iteration_factor * static_cast<Real>(flags.getSize().max()));
+  }
+
+  PressureSolveResult result;
+  for (int iteration = 0; iteration < max_iterations; ++iteration) {
+    if (!cg.iterate()) {
+      result.converged = true;
+      break;
+    }
+  }
+  result.iterations = static_cast<int>(cg.getIterations());
+  result.residual = static_cast<float>(cg.getResNorm());
+
+  Manta::correctVelocity(velocity,
+                         pressure,
+                         flags,
+                         accuracy,
+                         nullptr,
+                         nullptr,
+                         nullptr,
+                         ghost_fluid_clamp,
+                         iteration_factor,
+                         true,
+                         pressure_preconditioner_mic,
+                         false,
+                         false,
+                         true,
+                         nullptr,
+                         static_cast<Real>(0.0));
+  return result;
+}
 
 std::size_t checked_cell_count(const MantaGasExtent3 &resolution)
 {
@@ -259,25 +427,14 @@ bool manta_gas_simulation_step(const MantaGasState &state,
 
       Manta::setWallBcs(flags, velocity, nullptr, nullptr, nullptr, 0);
 
-      /* PcMIC avoids pressure.cpp's process-global static multigrid preconditioner cache. */
-      Manta::solvePressure(velocity,
-                           pressure,
-                           flags,
-                           static_cast<Real>(settings.pressure_accuracy),
-                           nullptr,
-                           nullptr,
-                           nullptr,
-                           nullptr,
-                           static_cast<Real>(1.0e-4),
-                           static_cast<Real>(settings.pressure_iteration_factor),
-                           true,
-                           pressure_preconditioner_mic,
-                           false,
-                           false,
-                           true,
-                           nullptr,
-                           static_cast<Real>(0.0),
-                           nullptr);
+      const PressureSolveResult pressure_result = solve_pressure(
+          solver, velocity, pressure, flags, settings);
+      local_diagnostics.pressure_iterations = std::max(local_diagnostics.pressure_iterations,
+                                                       pressure_result.iterations);
+      local_diagnostics.pressure_residual = std::max(local_diagnostics.pressure_residual,
+                                                     pressure_result.residual);
+      local_diagnostics.pressure_converged = local_diagnostics.pressure_converged &&
+                                             pressure_result.converged;
 
       if (!grids_are_finite(density, temperature, pressure, velocity)) {
         throw std::runtime_error("Mantaflow produced a non-finite gas state.");

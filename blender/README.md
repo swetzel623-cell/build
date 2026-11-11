@@ -74,16 +74,23 @@ The frame-local loop uses:
 - MacCormack advection for density, temperature, and velocity.
 - Density and heat buoyancy.
 - Closed wall boundaries.
-- Pressure projection with Mantaflow's MIC preconditioner and closed-domain pressure fixing.
+- Pressure projection by multigrid-preconditioned conjugate gradients with closed-domain
+  pressure fixing. MIC preconditioning is available through the `Multigrid` input.
 - Finite-value checks and pass-through of the original state on failure.
 
-`PcMIC` is intentional. Both of Mantaflow's multigrid preconditioner modes go through
-`solvePressureSystem`, which reads and writes a process-global `std::map` keyed by solver pointer
-without synchronization. That is not an acceptable ownership model for independent Simulation
-Zone instances that may evaluate concurrently. It is also the dominant cost; see the timings.
+The engine does not call Mantaflow's `solvePressure`. Both of that function's multigrid modes go
+through `solvePressureSystem`, which reads and writes a process-global `std::map` keyed by solver
+pointer without synchronization, which is not an acceptable ownership model for independent
+Simulation Zone instances that may evaluate concurrently. Instead the engine performs the same
+steps itself (right-hand side, Laplace matrix, pressure pinning, preconditioned CG, velocity
+correction) with Mantaflow's `GridMg` and `GridCg` classes, and constructs and destroys the
+multigrid inside the call. The multigrid hierarchy is therefore rebuilt every substep.
 
-The node reports substeps, sampled maximum velocity, OpenVDB import time, engine solve time, and
-OpenVDB export time.
+The node reports substeps, sampled maximum velocity, OpenVDB import time, engine solve time,
+OpenVDB export time, and the largest pressure iteration count and final residual of any substep.
+If a substep stops at its iteration limit before reaching `Pressure Accuracy`, the state still
+advances and the node adds a warning. The limit is 100 iterations with multigrid, as in Mantaflow,
+and `Pressure Iteration Factor` times the largest resolution with MIC.
 
 ### Mapping from legacy Fluid modifier settings
 
@@ -99,8 +106,8 @@ modifier:
 
 - No emission or source operators, obstacles beyond the closed boundary, fire, colors, liquid,
   vorticity confinement, secondary particles, or effector/force-field compatibility.
-- No moving adaptive domain, multigrid preconditioner, pressure-convergence diagnostics, or
-  retained solver allocation between calls.
+- No moving adaptive domain and no solver allocation or multigrid hierarchy retained between
+  calls.
 - No activity-mask pressure culling. Pressure remains globally coupled.
 - No GPU execution or claim that NanoVDB is a mutable solver layout.
 - No custom disk cache. Simulation Zone baking owns persistence.
@@ -121,10 +128,11 @@ cmake --build build-gas-engine
 ctest --test-dir build-gas-engine --output-on-failure
 ```
 
-Nine runtime tests cover zero-time pass-through, stationary fluid interiors, heat buoyancy and
+Twelve runtime tests cover zero-time pass-through, stationary fluid interiors, heat buoyancy and
 retained pressure, CFL frame completion, atomic substep-limit failure, non-finite input rejection,
-independent sequential states, exact resumption from the staggered state, and the velocity layout
-reported after a failure.
+independent sequential states, exact resumption from the staggered state, interpretation of the
+velocity layout flag, agreement of the two preconditioners with reported convergence, reporting of
+an exhausted iteration limit, and the velocity layout reported after a failure.
 
 ### In-Blender runtime tests
 
@@ -138,7 +146,7 @@ blender -b --factory-startup --python blender/tests/gas_node_legacy_compare.py -
 blender -b --factory-startup --python blender/tests/gas_node_timings.py -- --res 32 64 96 128 --legacy
 ```
 
-`gas_node_runtime_tests.py` runs twelve tests and exits non-zero on failure:
+`gas_node_runtime_tests.py` runs thirteen tests and exits non-zero on failure:
 
 | Test | What it establishes |
 | --- | --- |
@@ -152,6 +160,7 @@ blender -b --factory-startup --python blender/tests/gas_node_timings.py -- --res
 | transform and type rejection | Wrong voxel size, wrong origin, integer density grid, and active voxels outside the domain are each rejected with pass-through. |
 | bake save reload | Packed and disk bakes: after saving and reopening, frames read in random order equal the live simulation bit for bit. |
 | two independent zones | Two zones with different resolution, transform, gravity, and CFL in one tree equal their isolated runs bit for bit. |
+| pressure preconditioners and diagnostics | Multigrid and MIC agree to 1e-3 of peak velocity and both report iterations and a converged residual; multigrid needs fewer iterations; a starved MIC solve advances the state and raises the convergence warning. |
 | reruns are reproducible | Restarting the zone reproduces the state bit for bit. |
 | matches legacy solver | See the next section; asserts relative errors below 1e-3 after 1 frame and 1e-2 after 6. |
 
@@ -166,9 +175,9 @@ commit.
   enabled, `Release`. All 4878 build steps completed, the `blender` target linked and installed,
   and the binary reports `Blender 5.4.0 Alpha`. No compiler warnings came from the overlay
   sources. This is a headless build without Cycles or a window system.
-- **In-Blender runtime tests.** 12 of 12 pass in that binary. Separately, the `.vdb` files of
+- **In-Blender runtime tests.** 13 of 13 pass in that binary. Separately, the `.vdb` files of
   the disk bake were inspected and carry the `staggered` grid class for the velocity grid.
-- **Engine tests.** 9 of 9 pass against the pinned Mantaflow library, in a Debug build with GCC
+- **Engine tests.** 12 of 12 pass against the pinned Mantaflow library, in a Debug build with GCC
   13.3 and in an ASan/UBSan build, with `-Wall -Wextra -Werror` on the engine and test sources.
 - **Standalone suites.** Activity-mask and gas-step driver suites pass.
 - **Installer.** Dry run and application to the pinned checkout succeed; a second application is
@@ -184,14 +193,16 @@ legacy steps.
 
 | Frames after handover | Density rel. L2 | Temperature rel. L2 | Velocity rel. L2 | Kinetic energy ratio |
 | --- | --- | --- | --- | --- |
-| 1 | 8.3e-07 | 7.1e-07 | 2.2e-05 | 1.000 |
-| 5 | 8.5e-06 | 7.9e-06 | 2.3e-05 | 1.000 |
-| 20 | 1.3e-04 | 7.1e-04 | 9.6e-04 | 1.000 |
-| 60 | 5.4e-02 | 4.2e-02 | 2.7e-02 | 0.998 |
+| 1 | 8.3e-07 | 7.1e-07 | 7.5e-07 | 1.000 |
+| 5 | 5.2e-06 | 4.4e-06 | 3.5e-06 | 1.000 |
+| 20 | 3.0e-05 | 2.4e-05 | 1.5e-05 | 1.000 |
+| 60 | 2.6e-02 | 2.7e-02 | 1.4e-02 | 1.000 |
 
-The remaining differences are consistent with the different pressure preconditioner and initial
-guess at a 1e-3 solver tolerance, amplified over time by the flow. This is agreement on one scene
-at one resolution for the supported feature subset, not a general equivalence proof.
+The first frames agree to single-precision round-off. The legacy solver keeps its multigrid
+hierarchy between steps and the node rebuilds it, and the flow amplifies that difference over
+time. With the MIC preconditioner the velocity error is 2e-5 after 5 frames and 1e-3 after 20.
+This is agreement on one scene at one resolution for the supported feature subset, with one
+solver step per frame; it is not a general equivalence proof.
 
 Two behaviors of the legacy solver matter when comparing:
 
@@ -204,26 +215,27 @@ Two behaviors of the legacy solver matter when comparing:
 
 ### Timings
 
-`gas_node_timings.py`, buoyant blob in a closed cube, 20 frames, 4 threads, medians in
-milliseconds per frame. These are measurements of one small scene on one machine.
+`gas_node_timings.py --legacy`, 4 threads. The legacy modifier emits once and runs 20 frames; the
+node starts from the legacy state with equivalent parameters and the same CFL number (2.0), so
+both integrate the same flow. Per-frame columns are medians; totals are over the 20 frames.
 
-| Resolution | Import | Solve | Export | Node frame (wall) | Node substeps | Legacy frame (wall) | Legacy steps |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 32³ | 0.9 | 30 | 1.3 | 34 | 1 | 42 | 1 |
-| 64³ | 5.8 | 488 | 5.2 | 502 | 2 | 304 | 2 |
-| 96³ | 19 | 3333 | 16 | 3380 | 3 | 953 | 2 |
-| 128³ | 48 | 13775 | 39 | 13878 | 3.5 | 2954 | 2.5 |
+| Resolution | Import (ms) | Solve (ms) | Export (ms) | CG iterations | Node total (s) | Node substeps | Legacy total (s) | Legacy steps | Node with MIC total (s) | MIC CG iterations |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 32³ | 0.8 | 32 | 1.2 | 5 | 0.7 | 20 | 1.0 | 20 | – | – |
+| 64³ | 4.9 | 288 | 4.7 | 6 | 5.5 | 34 | 5.6 | 33 | 9.1 | 60 |
+| 96³ | 17.5 | 976 | 14.2 | 6 | 18.5 | 36 | 17.2 | 36 | 38.8 | 48 |
+| 128³ | 38.8 | 3312 | 33.1 | 6 | 59.7 | 51 | 57.5 | 51 | 150.5 | 61 |
 
-Import and export, which were the suspected cost, are under 1% of the frame. The solve dominates,
-and at 64³ and above the node is slower than the legacy modifier: 1.7 times at 64³, 3.5 times at
-96³, and 4.7 times at 128³. Setting `Pressure Accuracy` to its loosest value (1.0), which ends the
-pressure iteration almost immediately, cut the solve time to 188 ms at 64³ and 1135 ms at 96³, so
-the pressure solve accounts for at least 60% of it. The legacy solver uses the static multigrid
-preconditioner; the node uses MIC with a CG iteration limit proportional to resolution. The node
-also schedules more substeps at the same CFL number, because it applies `CFL / max velocity`
-directly where Mantaflow's scheduler clamps and rounds the step. The legacy column includes
-emission processing and cache writes the node does not do, so it is context rather than a
-like-for-like benchmark.
+- OpenVDB import and export together are about 2% of a frame.
+- With multigrid the node takes the same number of substeps as the legacy solver and about the
+  same time: 0.7 times the legacy total at 32³ and 0.98 to 1.07 times at 64³ to 128³.
+- With MIC, the previous default, it took 1.7 to 2.7 times the legacy total on the same flow.
+
+The node is therefore at parity with the legacy solver on this scene, not faster. The two frame
+times also do not contain the same work: the legacy frame includes flow-object processing, cache
+writes, and a shadow grid; the node frame includes OpenVDB conversion and rebuilding the solver,
+its grids, and the multigrid hierarchy on every call. These are measurements of one small scene
+on one machine.
 
 ## Remaining validation
 
@@ -238,6 +250,7 @@ Not done, and not claimed:
   process-global vector that the engine's grid destructors read.
 - Evidence that two zones in one tree were actually evaluated concurrently in the test.
 - Legacy agreement at other resolutions, with multiple substeps per frame, or on non-cubic
-  domains.
+  domains. The matched timing runs take the same number of substeps as the legacy solver, but
+  their grids were not compared.
 - Platforms other than Linux x86-64, and compilers other than Clang 18 (GCC 13 for the engine
   harness).

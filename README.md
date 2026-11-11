@@ -23,7 +23,7 @@ The `blender/` overlay adds a compiled `Gas Simulation Step` node and a small no
 - Per-call solver ownership suitable for independent Simulation Zone instances.
 - Velocity exchanged in the solver's own staggered (MAC) layout, so the state survives a frame
   boundary without loss; authored cell-centered velocities are accepted and resampled once.
-- MacCormack advection, buoyancy, closed wall boundaries, and MIC-preconditioned pressure projection using compiled Mantaflow operators.
+- MacCormack advection, buoyancy, closed wall boundaries, and multigrid-preconditioned pressure projection using compiled Mantaflow operators, with the multigrid owned by each call.
 - Frame-local CFL substep scheduling, failure without partial state mutation, and finite-value checks.
 - Runtime import, solve, and export timing outputs.
 
@@ -37,18 +37,18 @@ contract, tests, measurements, and limitations.
 The patched pinned Blender source has been built and linked in full (headless, without Cycles),
 and the node has been run inside real Simulation Zones in that binary:
 
-- 12 in-Blender runtime tests pass: smoke advancement, zero time, buoyancy, CFL substepping,
-  substep-limit and invalid-grid pass-through, packed and disk bake with save and reload, and two
-  independent zones.
+- 13 in-Blender runtime tests pass: smoke advancement, zero time, buoyancy, CFL substepping,
+  substep-limit and invalid-grid pass-through, packed and disk bake with save and reload, two
+  independent zones, and both pressure preconditioners.
 - From identical state the node reproduces the legacy Fluid modifier's gas solver on the supported
-  feature subset: velocity within 2e-5 (relative L2) after 5 frames and 1e-3 after 20 on a 32³
+  feature subset: velocity within 4e-6 (relative L2) after 5 frames and 2e-5 after 20 on a 32³
   scene.
-- 9 engine tests pass against the pinned Mantaflow library, also under ASan/UBSan.
+- 12 engine tests pass against the pinned Mantaflow library, also under ASan/UBSan.
 
-It is **not yet faster** than the legacy solver. OpenVDB import and export are under 1% of a
-frame, but the solve is 1.7 to 4.7 times slower than the legacy modifier at 64³ to 128³, mostly
-in the MIC-preconditioned pressure solve. A full-feature (GUI, Cycles) build, interactive use, and
-sanitizer runs of the Blender process are still outstanding.
+It is **at parity with, not faster than,** the legacy solver. Integrating the same flow with the
+same CFL number, the node takes the same number of substeps and 0.98 to 1.07 times the legacy
+wall time at 64³ to 128³. OpenVDB import and export are about 2% of a frame. A full-feature (GUI,
+Cycles) build, interactive use, and sanitizer runs of the Blender process are still outstanding.
 
 ## Standalone build and test
 
@@ -74,14 +74,12 @@ The benchmark reports JSON and measures a local stencil kernel, not an entire Ma
 
 ## Next steps
 
-1. Give the engine a multigrid pressure solve it owns. Mantaflow's `solvePressureSystem` keeps its
-   multigrid in a process-global map for both multigrid modes, so the engine would construct
-   `GridMg` and the CG solver itself for the duration of one call.
-2. Align the substep schedule with Mantaflow's scheduler, or justify the difference, and report
-   pressure iterations and convergence as diagnostics.
-3. Repeat the legacy comparison with several substeps per frame, at higher resolution, and on
+1. Profile a node call at 128³ and remove what the legacy solver does not pay for: rebuilding the
+   multigrid hierarchy every substep, reallocating the solver and its grids every call, and the
+   serial finite-value and maximum-velocity scans.
+2. Repeat the legacy grid comparison with several substeps per frame, at higher resolution, and on
    non-cubic domains.
-4. Build with a window system and Cycles, use the node interactively, and run the Geometry Nodes
+3. Build with a window system and Cycles, use the node interactively, and run the Geometry Nodes
    adapter under ASan.
 
 ## License

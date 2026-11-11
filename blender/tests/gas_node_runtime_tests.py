@@ -339,6 +339,37 @@ def test_matches_legacy_solver(work):
               f"velocity {row['velocity_rel_l2']:.2e}")
 
 
+def test_pressure_preconditioners_and_diagnostics(_work):
+    def run(**params):
+        lib.reset_scene()
+        zone = smoke_zone(**params)
+        obj = lib.build_object("pressure", [zone])
+        (result,), _ = lib.run_frames(obj, [zone], 1, 8)
+        return result, lib.warnings(obj)
+
+    tight = {"Pressure Accuracy": 1.0e-6, "Pressure Iteration Factor": 20.0}
+    multigrid, multigrid_warnings = run(Multigrid=True, **tight)
+    mic, mic_warnings = run(Multigrid=False, **tight)
+    for result, messages in ((multigrid, multigrid_warnings), (mic, mic_warnings)):
+        check(result["pressure_iterations"] >= 1, "pressure iterations were not reported")
+        check(result["pressure_residual"] <= 1.0e-6, f"residual {result['pressure_residual']}")
+        check(not any("iteration limit" in m for _, m in messages), f"unexpected: {messages}")
+    check(multigrid["pressure_iterations"] < mic["pressure_iterations"],
+          "multigrid did not need fewer iterations than MIC")
+    scale = float(np.abs(mic["velocity"]).max())
+    difference = float(np.abs(multigrid["velocity"] - mic["velocity"]).max())
+    check(difference < 1.0e-3 * scale, f"preconditioners disagree: {difference} of {scale}")
+    print(f"    iterations: multigrid {multigrid['pressure_iterations']:.0f}, "
+          f"MIC {mic['pressure_iterations']:.0f}; velocity difference {difference / scale:.1e}")
+
+    starved, starved_warnings = run(
+        Multigrid=False, **{"Pressure Accuracy": 1.0e-8, "Pressure Iteration Factor": 0.1})
+    check(any(kind == "WARNING" and "iteration limit" in m for kind, m in starved_warnings),
+          f"missing convergence warning: {starved_warnings}")
+    check(starved["pressure_residual"] > 1.0e-8, "starved solve reported convergence")
+    check(starved["substeps"] >= 1, "an unconverged solve must still advance the state")
+
+
 def test_reruns_are_reproducible(_work):
     lib.reset_scene()
     zone = smoke_zone()
@@ -361,6 +392,7 @@ TESTS = [
     test_transform_and_type_rejection,
     test_bake_save_reload,
     test_two_independent_zones,
+    test_pressure_preconditioners_and_diagnostics,
     test_reruns_are_reproducible,
     test_matches_legacy_solver,
 ]

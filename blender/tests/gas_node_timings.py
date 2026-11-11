@@ -4,10 +4,13 @@
     blender -b --factory-startup --python gas_node_timings.py -- [--res 32 64 96] [--json FILE]
 
 The scene is a buoyant smoke blob in a closed cubic domain. For each resolution the script reports
-the node's own diagnostics per frame and the wall-clock time of the whole frame evaluation, and
-optionally the wall-clock frame time of the legacy Fluid modifier at the same resolution. The
-legacy number is context only: that solver uses a different pressure preconditioner and does work
-(emission, caching) the node does not.
+the node's own diagnostics per frame and the wall-clock time of the whole frame evaluation.
+
+With `--legacy` the legacy Fluid modifier runs first and the node starts from the legacy state
+after its first frame, with equivalent parameters and the same CFL number, so both integrate the
+same flow. The legacy frame time still includes work the node does not do (flow-object
+processing, cache writes, shadow grid), and the node frame time includes work the legacy solver
+does not do (OpenVDB conversion, solver reconstruction).
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gas_node_testlib as lib  # noqa: E402
-from gas_node_legacy_compare import count_solver_steps  # noqa: E402
+import gas_node_legacy_compare as legacy  # noqa: E402
 from gas_node_testlib import Zone  # noqa: E402
 
 
@@ -51,38 +54,23 @@ def node_run(res, frames, params):
     return rows
 
 
-def legacy_run(res, frames, work):
-    scene = lib.reset_scene()
-    bpy.ops.mesh.primitive_cube_add(size=2.0)
-    domain = bpy.context.object
-    ds = domain.modifiers.new("Fluid", "FLUID")
-    ds.fluid_type = "DOMAIN"
-    ds = ds.domain_settings
-    ds.domain_type = "GAS"
-    ds.resolution_max = res
-    ds.use_adaptive_timesteps = True
-    ds.vorticity = 0.0
-    ds.use_dissolve_smoke = False
-    ds.cache_type = "REPLAY"
-    ds.cache_directory = os.path.join(work, f"legacy_{res}")
-    bpy.ops.mesh.primitive_ico_sphere_add(radius=0.25, location=(0.0, 0.0, -0.5))
-    fs = bpy.context.object.modifiers.new("Fluid", "FLUID")
-    fs.fluid_type = "FLOW"
-    fs = fs.flow_settings
-    fs.flow_type = "SMOKE"
-    fs.flow_behavior = "GEOMETRY"
-    fs.temperature = 1.0
-    scene.frame_set(1)
-    bpy.context.evaluated_depsgraph_get()
-    steps = {}
-    count_solver_steps(steps)
-    walls = []
-    for frame in range(2, frames + 2):
-        begin = time.perf_counter()
-        scene.frame_set(frame)
-        walls.append((time.perf_counter() - begin) * 1000.0)
-    counts = [steps.get(frame, 0) for frame in range(2, frames + 2)]
-    return walls, counts
+def matched_run(res, frames, work, params):
+    """Time the legacy solver, then the node on the same flow.
+
+    The legacy solver emits once and runs `frames` frames after its first. The node starts from
+    the legacy state after that first frame with the equivalent parameters and the legacy CFL
+    number, so both integrate the same problem and their substep counts are comparable.
+    """
+    walls = {}
+    states, info = legacy.run_legacy(res, frames + 1, os.path.join(work, str(res)), keep={1},
+                                     walls=walls)
+    legacy_walls = [walls[frame] for frame in range(2, frames + 2)]
+    legacy_steps = [info["legacy_steps_by_frame"].get(frame, 0) for frame in range(2, frames + 2)]
+    overrides = {"CFL": info["cfl"], "Max Substeps": 64, "readback": False}
+    overrides.update(params)
+    node = legacy.run_node(states[1], info, frames, match_step_padding=False, **overrides)
+    rows = [node[frame] for frame in range(1, frames + 1)]
+    return rows, legacy_walls, legacy_steps
 
 
 def summarize(rows, key):
@@ -106,17 +94,25 @@ def main():
     report = {"threads": bpy.context.scene.render.threads, "frames": args.frames,
               "overrides": params, "runs": []}
     for res in args.res:
-        rows = node_run(res, args.frames, params)
-        entry = {"resolution": res, "cells": res**3}
-        for key in ("import_ms", "solve_ms", "export_ms", "frame_wall_ms", "substeps"):
-            entry[key] = summarize(rows, key)
         if args.legacy:
-            walls, counts = legacy_run(res, args.frames, work)
-            entry["legacy_frame_wall_ms"] = summarize([{"w": w} for w in walls], "w")
-            entry["legacy_substeps"] = summarize([{"n": n} for n in counts], "n")
+            rows, legacy_walls, legacy_steps = matched_run(res, args.frames, work, params)
+        else:
+            rows = node_run(res, args.frames, params)
+        entry = {"resolution": res, "cells": res**3}
+        for key in ("import_ms", "solve_ms", "export_ms", "frame_wall_ms", "substeps",
+                    "pressure_iterations"):
+            entry[key] = summarize(rows, key)
+        entry["total_frame_wall_ms"] = float(sum(row["frame_wall_ms"] for row in rows))
+        entry["total_substeps"] = float(sum(row["substeps"] for row in rows))
+        if args.legacy:
+            entry["legacy_frame_wall_ms"] = summarize([{"w": w} for w in legacy_walls], "w")
+            entry["legacy_substeps"] = summarize([{"n": n} for n in legacy_steps], "n")
+            entry["legacy_total_frame_wall_ms"] = float(sum(legacy_walls))
+            entry["legacy_total_substeps"] = float(sum(legacy_steps))
         report["runs"].append(entry)
         print(f"{res}^3: " + ", ".join(
-            f"{key} {value['median']:.1f}" for key, value in entry.items() if isinstance(value, dict)
+            f"{key} {value['median'] if isinstance(value, dict) else value:.1f}"
+            for key, value in entry.items() if key not in ("resolution", "cells")
         ), flush=True)
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:

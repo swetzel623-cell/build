@@ -78,21 +78,23 @@ jobs:
         run: |
           %DIST_DIR%\blender.exe -b --factory-startup --python overlay\blender\tests\gas_node_runtime_tests.py -- --work %RUNNER_TEMP%\gas_tests
 
-      - name: Package
-        shell: cmd
+      - name: Record what was built
+        shell: bash
         run: |
-          echo Runtime tests: ${{ steps.tests.outcome }} > %DIST_DIR%\GAS_STEP_BUILD.txt
-          echo Blender commit: %BLENDER_COMMIT% >> %DIST_DIR%\GAS_STEP_BUILD.txt
-          echo Overlay commit: ${{ github.sha }} >> %DIST_DIR%\GAS_STEP_BUILD.txt
-          cd C:\dist
-          7z a -tzip -mx=5 blender-gas-step-windows-x64.zip blender-gas-step
+          {
+            echo "Runtime tests: ${{ steps.tests.outcome }}"
+            echo "Blender commit: $BLENDER_COMMIT"
+            echo "Overlay commit: ${{ github.sha }}"
+          } > /c/dist/blender-gas-step/GAS_STEP_BUILD.txt
+          test -f /c/dist/blender-gas-step/blender.exe
 
+      # upload-artifact zips the folder itself; the download is a single zip.
       - name: Upload the build
         uses: actions/upload-artifact@v4
         with:
           name: blender-gas-step-windows-x64
-          path: C:\dist\blender-gas-step-windows-x64.zip
-          compression-level: 0
+          path: C:\dist\blender-gas-step
+          if-no-files-found: error
           retention-days: 14
 
       - name: Fail if the runtime tests failed

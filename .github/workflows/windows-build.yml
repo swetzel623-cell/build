@@ -1,0 +1,103 @@
+# Builds the pinned Blender source with the gas-step overlay on Windows and uploads a portable
+# zip. Start it from the Actions tab ("Run workflow"); it takes a few hours.
+name: Windows test build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["claude/**"]
+    paths: [".github/workflows/windows-build.yml"]
+
+env:
+  BLENDER_COMMIT: 377d577d520472f2702e456b26c17dffc663dc52
+  SOURCE_DIR: C:\bl
+  BUILD_DIR: C:\bb
+  DIST_DIR: C:\dist\blender-gas-step
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    steps:
+      - name: Check out the overlay
+        uses: actions/checkout@v4
+        with:
+          path: overlay
+
+      - name: Fetch Blender at the pinned commit
+        shell: bash
+        run: |
+          git config --global core.longpaths true
+          git config --global advice.detachedHead false
+          mkdir -p /c/bl && cd /c/bl
+          git init -q .
+          git remote add origin https://projects.blender.org/blender/blender.git
+          git fetch --depth 1 origin "$BLENDER_COMMIT"
+          git checkout -q FETCH_HEAD
+          git rev-parse HEAD
+
+      - name: Fetch Blender's precompiled Windows libraries
+        shell: bash
+        run: |
+          cd /c/bl
+          lib_commit=$(git ls-tree HEAD lib/windows_x64 | awk '{print $3}')
+          echo "lib/windows_x64 at $lib_commit"
+          mkdir -p lib/windows_x64 && cd lib/windows_x64
+          git init -q .
+          git remote add origin https://projects.blender.org/blender/lib-windows_x64.git
+          git fetch --depth 1 origin "$lib_commit"
+          git checkout -q FETCH_HEAD
+          rm -rf .git/lfs/objects
+          df -h /c
+
+      - name: Apply the gas-step overlay
+        shell: bash
+        run: |
+          python overlay/blender/apply_integration.py /c/bl --check
+          python overlay/blender/apply_integration.py /c/bl
+
+      - name: Configure and build
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSDIR=%%i
+          call "%VSDIR%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          cmake -S %SOURCE_DIR% -B %BUILD_DIR% -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_INSTALL_PREFIX=%DIST_DIR% ^
+            -DWITH_CYCLES=OFF ^
+            -DWITH_GTESTS=OFF ^
+            -DWITH_BUILDINFO=OFF ^
+            -DWITH_WINDOWS_RELEASE_PDB=OFF || exit /b 1
+          cmake --build %BUILD_DIR% --target install || exit /b 1
+          dir %DIST_DIR%
+
+      - name: Run the in-Blender runtime tests
+        id: tests
+        continue-on-error: true
+        shell: cmd
+        run: |
+          %DIST_DIR%\blender.exe -b --factory-startup --python overlay\blender\tests\gas_node_runtime_tests.py -- --work %RUNNER_TEMP%\gas_tests
+
+      - name: Package
+        shell: cmd
+        run: |
+          echo Runtime tests: ${{ steps.tests.outcome }} > %DIST_DIR%\GAS_STEP_BUILD.txt
+          echo Blender commit: %BLENDER_COMMIT% >> %DIST_DIR%\GAS_STEP_BUILD.txt
+          echo Overlay commit: ${{ github.sha }} >> %DIST_DIR%\GAS_STEP_BUILD.txt
+          cd C:\dist
+          7z a -tzip -mx=5 blender-gas-step-windows-x64.zip blender-gas-step
+
+      - name: Upload the build
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-gas-step-windows-x64
+          path: C:\dist\blender-gas-step-windows-x64.zip
+          compression-level: 0
+          retention-days: 14
+
+      - name: Fail if the runtime tests failed
+        if: steps.tests.outcome != 'success'
+        shell: bash
+        run: |
+          echo "The build was uploaded, but the in-Blender runtime tests did not pass."
+          exit 1

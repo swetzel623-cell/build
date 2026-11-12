@@ -119,18 +119,31 @@ CPU reference, 7 tests in `sparse_gas_tests`:
   0.18.
 - 3000 Jacobi sweeps agree with CG to 3e-7 on a 16³ box.
 
-GPU kernels, `sparse_gas_gpu_tests`: on **llvmpipe, a software Vulkan implementation**, every
+GPU kernels, `sparse_gas_gpu_tests`: on llvmpipe, a software Vulkan implementation, every
 channel equals the CPU reference bit for bit after each of 8 steps of a rising plume (32×32×48,
 60 Jacobi sweeps per step, topology growing from 48 to 64 bricks). This verifies the shaders, the
-buffer layout, and the driver. It says nothing about speed.
+buffer layout, and the driver.
+
+**First run on a real GPU.** `sparse_gas_gpu_tests 64 20` on an NVIDIA GeForce RTX 3070
+(Windows, the CI-built binary), 64×64×96 domain, 60 Jacobi sweeps per step:
+
+- Every channel matched the CPU reference within the test tolerance on all 20 steps; the largest
+  difference was 7.3e-6 (scaled by peak velocity), against 72 voxels per second peak velocity. The
+  results are not bit-identical as on llvmpipe; the difference stays at round-off level and does
+  not grow over the run.
+- The active set grew from 64 to 244 of the domain's 768 bricks (about 30%) as the plume rose.
+- 19.1 ms per step on the device path against 482 ms per step for the CPU reference.
+
+That timing ratio is **not** a measure of the solver's speed. The CPU reference is deliberately
+simple and single-threaded, and is not the Mantaflow engine. The 19.1 ms includes topology
+rebuilding on the CPU, uploading and downloading the whole state, a CPU divergence check, and
+about 70 separately submitted and awaited dispatches. How much of it is GPU work is unknown.
 
 ## Not verified, and known gaps
 
-- **No run on a real GPU.** Neither this environment nor GitHub's standard runners have one.
-  `sparse_gas_gpu_tests <resolution> <steps>` is the program to run on one; it prints the device
-  it used and per-step times.
-- **No performance claim of any kind.** On llvmpipe the device path is slower than the CPU
-  reference, which is expected and meaningless. The driver is also not written for speed: buffers
+- **One real GPU, one scene.** Only the RTX 3070 run above. No AMD, Intel, or Apple device.
+- **No comparison with the Mantaflow node's speed.** The solvers also differ in physics (below),
+  so a fair comparison needs matched numerics first. The driver is also not written for speed: buffers
   are host-visible, every dispatch is submitted and waited for separately, and the whole state is
   uploaded and downloaded every step.
 - **The physics is not yet the dense node's.** Advection is first-order semi-Lagrangian, which is
@@ -155,7 +168,7 @@ buffer layout, and the driver. It says nothing about speed.
 
 ## Next steps
 
-1. Run `sparse_gas_gpu_tests` on real GPUs and record correctness and time.
+1. Time the GPU work separately from the CPU-side work in the driver.
 2. Make the driver fair to the GPU: device-local buffers, one command buffer per step, state kept
    on the device between steps.
 3. Replace Jacobi with a multigrid-preconditioned or multigrid solver over the brick hierarchy,

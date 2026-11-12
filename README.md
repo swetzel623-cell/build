@@ -19,8 +19,8 @@ The mask is intentionally **not** used as a pressure-projection mask. Smoke dens
 
 A brick-sparse gas solver whose data layout is flat arrays a GPU consumes unchanged, with a CPU
 reference implementation and GLSL compute kernels run through Vulkan. The kernels match the CPU
-reference bit for bit on a software Vulkan device. It has **not been run on a real GPU**, makes no
-performance claim, uses simpler numerics than the Mantaflow node, and is not connected to Blender.
+reference on a software Vulkan device and on an NVIDIA RTX 3070. It has no meaningful performance
+measurement yet, uses simpler numerics than the Mantaflow node, and is not connected to Blender.
 See [`docs/gpu-sparse-solver.md`](docs/gpu-sparse-solver.md) for the research, design decisions,
 and what is and is not verified.
 

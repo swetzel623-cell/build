@@ -24,13 +24,14 @@ void main()
   int diagonal = 0;
   for (int n = 0; n < 6; ++n) {
     ivec3 neighbor = c + offsets[n];
-    uint type = type_at(neighbor);
-    if (type == CELL_SOLID) {
+    if (is_wall(neighbor)) {
       continue;
     }
     ++diagonal;
-    if (type == CELL_FLUID) {
-      sum += PRESSURE[index_of(neighbor)];
+    /* One brick-table lookup: unstored neighbors are open air with pressure zero. */
+    int neighbor_index = index_of(neighbor);
+    if (neighbor_index >= 0 && cell_type[neighbor_index] == CELL_FLUID) {
+      sum += PRESSURE[neighbor_index];
     }
   }
   RESULT[index] = diagonal > 0 ? (RHS[index] + sum) / float(diagonal) : 0.0;

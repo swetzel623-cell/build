@@ -81,6 +81,8 @@ comparison:
 ./build/sparse_gas_gpu_tests 128 30 --bench
 ```
 
+`--profile` does the same and also reports the GPU time of each kernel.
+
 Run the activity-mask microbenchmark with defaults:
 
 ```sh

@@ -66,12 +66,14 @@ struct Topology {
 
 /**
  * Build a topology from per-brick activity flags (X-fastest over the brick grid), after growing
- * the active set by `dilation` bricks in every direction.
+ * the active set by `dilation` bricks in every direction. With `classify_cells` false,
+ * `cell_type` is left empty for a caller that classifies cells itself, such as the GPU driver.
  */
 Topology build_topology(Extent extent,
                         int brick_size,
                         const std::vector<std::uint8_t> &brick_active,
-                        int dilation);
+                        int dilation,
+                        bool classify_cells = true);
 
 /** Staggered (MAC) gas state on a sparse topology. Velocity is in voxels per second. */
 struct State {

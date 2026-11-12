@@ -13,6 +13,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -115,6 +116,10 @@ int compare(gpu::SparseGasGpu &solver, const int resolution, const int steps)
       std::cout << "FAIL: topologies diverged at step " << i << '\n';
       return 1;
     }
+    if (cpu.topology.cell_type != device.topology.cell_type) {
+      std::cout << "FAIL: GPU cell classification differs from the CPU at step " << i << '\n';
+      return 1;
+    }
     const float scale = std::max(1.0f, max_abs(cpu.w));
     const float worst = std::max({max_difference(cpu.density, device.density),
                                   max_difference(cpu.temperature, device.temperature),
@@ -140,8 +145,10 @@ int compare(gpu::SparseGasGpu &solver, const int resolution, const int steps)
 }
 
 /** Time the device alone. The state stays on the device until the end. */
-int benchmark(gpu::SparseGasGpu &solver, const int resolution, const int steps)
+int benchmark(gpu::SparseGasGpu &solver, const int resolution, const int steps, const bool profile)
 {
+  solver.set_profiling(profile);
+  std::vector<std::pair<std::string, double>> kernel_totals;
   const sparse::Settings settings = test_settings(resolution);
   const sparse::Extent extent = {resolution, resolution, resolution * 3 / 2};
   sparse::State state = sparse::from_dense(blob(extent), 8, settings.thresholds, settings.dilation);
@@ -159,6 +166,17 @@ int benchmark(gpu::SparseGasGpu &solver, const int resolution, const int steps)
     topology.push_back(timing.topology_ms);
     peak_bricks = std::max(peak_bricks, info.active_bricks);
     changes += timing.topology_changed;
+    for (const auto &[label, ms] : timing.kernels) {
+      auto entry = std::find_if(kernel_totals.begin(),
+                                kernel_totals.end(),
+                                [&](const auto &item) { return item.first == label; });
+      if (entry == kernel_totals.end()) {
+        kernel_totals.emplace_back(label, ms);
+      }
+      else {
+        entry->second += ms;
+      }
+    }
     std::cout << "step " << i << ": " << info.active_bricks << " bricks, wall " << timing.wall_ms
               << " ms, GPU " << timing.gpu_ms << " ms\n";
   }
@@ -175,6 +193,17 @@ int benchmark(gpu::SparseGasGpu &solver, const int resolution, const int steps)
   std::cout << "Median per step: wall " << median(wall) << " ms, GPU "
             << (solver.has_timestamps() ? median(gpu_time) : -1.0) << " ms, topology (CPU) "
             << median(topology) << " ms\n";
+  if (profile) {
+    double total = 0.0;
+    for (const auto &item : kernel_totals) {
+      total += item.second;
+    }
+    std::cout << "GPU time per step by kernel (profiling adds a timestamp per command):\n";
+    for (const auto &[label, ms] : kernel_totals) {
+      std::cout << "  " << label << ": " << ms / steps << " ms ("
+                << (total > 0.0 ? 100.0 * ms / total : 0.0) << "%)\n";
+    }
+  }
   std::cout << "DONE: benchmark (no correctness check in this mode)\n";
   return 0;
 }
@@ -185,11 +214,15 @@ int main(int argc, char **argv)
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   std::cout << std::unitbuf;
 
-  bool bench = false;
+  bool bench = false, profile = false;
   std::vector<int> numbers;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--bench") {
       bench = true;
+    }
+    else if (std::string(argv[i]) == "--profile") {
+      bench = true;
+      profile = true;
     }
     else {
       numbers.push_back(std::atoi(argv[i]));
@@ -199,7 +232,7 @@ int main(int argc, char **argv)
   const int steps = numbers.size() > 1 ? numbers[1] : 8;
 
   std::cout << "Starting: resolution " << resolution << ", " << steps << " steps"
-            << (bench ? ", benchmark" : "") << '\n';
+            << (profile ? ", profile" : bench ? ", benchmark" : "") << '\n';
   std::cout << "Creating the Vulkan device...\n";
   std::unique_ptr<gpu::SparseGasGpu> solver;
   try {
@@ -214,7 +247,8 @@ int main(int argc, char **argv)
             << (solver->has_timestamps() ? "" : " (no GPU timestamps)") << '\n';
 
   try {
-    return bench ? benchmark(*solver, resolution, steps) : compare(*solver, resolution, steps);
+    return bench ? benchmark(*solver, resolution, steps, profile) :
+                   compare(*solver, resolution, steps);
   }
   catch (const std::exception &error) {
     std::cout << "FAIL: " << error.what() << '\n';

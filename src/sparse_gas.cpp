@@ -228,7 +228,8 @@ CellType Topology::type_at(const int x, const int y, const int z) const
 Topology build_topology(const Extent extent,
                         const int brick_size,
                         const std::vector<std::uint8_t> &brick_active,
-                        const int dilation)
+                        const int dilation,
+                        const bool classify_cells)
 {
   if (extent.x < 4 || extent.y < 4 || extent.z < 4 || brick_size < 2 || dilation < 0) {
     throw std::invalid_argument("Invalid sparse topology parameters");
@@ -285,6 +286,9 @@ Topology build_topology(const Extent extent,
   /* A voxel stores the velocity of its lower faces only. A cell can therefore be solved for only
    * if the cells above it along every axis are stored too, or are walls, whose faces are zero.
    * The remaining stored cells form a one-voxel layer of open air that holds those faces. */
+  if (!classify_cells) {
+    return topology;
+  }
   topology.cell_type.assign(topology.voxel_count(), CellOpen);
   const auto stored_or_wall = [&](const int x, const int y, const int z) {
     return is_wall(extent, x, y, z) || topology.index_of(x, y, z) >= 0;

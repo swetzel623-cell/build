@@ -60,7 +60,7 @@ if(MANTA_IMPROVE_BUILD_GPU)
     set(MANTA_IMPROVE_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
     file(MAKE_DIRECTORY "${MANTA_IMPROVE_SHADER_DIR}")
     set(MANTA_IMPROVE_SHADER_HEADERS)
-    foreach(KERNEL advect buoyancy walls divergence jacobi gradient activity remap)
+    foreach(KERNEL advect buoyancy walls divergence jacobi gradient activity remap classify)
       set(SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/${KERNEL}.comp")
       set(SHADER_HEADER "${MANTA_IMPROVE_SHADER_DIR}/${KERNEL}.comp.h")
       add_custom_command(

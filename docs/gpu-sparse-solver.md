@@ -82,7 +82,7 @@ correctness reference for the physics.
 | --- | --- |
 | Topology, state, dense conversion, CPU reference kernels and step | `include/manta_improve/sparse_gas.hpp`, `src/sparse_gas.cpp` |
 | GLSL compute kernels: advect, buoyancy, walls, divergence, jacobi, gradient | `gpu/shaders/` |
-| GLSL kernels for the active-region test and for moving channels onto a new topology | `gpu/shaders/activity.comp`, `gpu/shaders/remap.comp` |
+| GLSL kernels for the active-region test, cell classification, and moving channels onto a new topology | `gpu/shaders/activity.comp`, `classify.comp`, `remap.comp` |
 | Vulkan compute runner: device-memory buffers, batched recording, GPU timestamps | `gpu/vulkan_compute.*` |
 | Driver that keeps the state on the device and runs each step | `gpu/sparse_gas_gpu.*` |
 | CPU tests | `tests/sparse_gas_tests.cpp` |
@@ -100,10 +100,12 @@ its gradient. Buoyancy and the wall rule follow Mantaflow's operators.
 
 **The device driver.** The state stays in device memory between steps; `upload()` and
 `download()` are the only full transfers. A step is two submissions. The first runs the activity
-kernel and downloads one flag per brick, 4 bytes per active brick. The CPU builds the next
-topology from those flags with the same code as the reference. The second submission uploads the
-topology tables and a slot map if the topology changed, moves the six state channels onto it with
-the remap kernel, and runs the whole step. Every command is followed by a full memory barrier.
+kernel and downloads one flag per brick, 4 bytes per active brick. The CPU builds the next brick
+table from those flags with the same code as the reference, but does not classify cells. The
+second submission uploads the brick table and a slot map if the topology changed, moves the six
+state channels onto it with the remap kernel, classifies every stored voxel with the classify
+kernel, and runs the whole step. With profiling on, every command is followed by a timestamp so
+the GPU time of each kernel can be reported. Every command is followed by a full memory barrier.
 Descriptor sets are cached per combination of buffers, and parameters are push constants. Channel
 buffers are allocated with 50% headroom and replaced when the active set outgrows them. GPU time
 is measured with timestamp queries around each submission.
@@ -219,8 +221,10 @@ bricks and the channel buffers are replaced once.
 
 ## Next steps
 
-1. Classify cells on the GPU from the brick table, so the CPU only builds the brick table and
-   per-voxel cell types are no longer uploaded. Add per-kernel GPU timing.
+1. Run `--profile` on real GPUs and optimize the kernels that dominate. Cell classification has
+   moved to the GPU and duplicate brick-table lookups were removed from advect and jacobi; on
+   llvmpipe at 48×48×72 the CPU topology time fell from about 1.8 ms to 0.09 ms per step and the
+   step from 328 ms to 195 ms, with results still bit-identical. Not yet measured on a real GPU.
 2. Replace Jacobi with a multigrid-preconditioned or multigrid solver over the brick hierarchy,
    with GPU reductions.
 3. MacCormack advection and CFL substepping, then compare with the Mantaflow engine on a case

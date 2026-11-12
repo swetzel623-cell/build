@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace manta_improve::gpu {
 
@@ -42,6 +44,14 @@ class Compute {
   /** True if submit() can report GPU execution time. */
   bool has_timestamps() const;
 
+  /**
+   * Time every recorded command with its own timestamp. This adds a timestamp write after each
+   * command, so leave it off when measuring total time.
+   */
+  void set_profiling(bool enabled);
+  /** GPU milliseconds per label in the last submission, in order of first appearance. */
+  const std::vector<std::pair<std::string, double>> &last_profile() const;
+
   /** A device-memory storage buffer. Must not be called between begin() and submit(). */
   Buffer create_buffer(std::size_t bytes);
   /** Must not be called between begin() and submit(). */
@@ -62,7 +72,8 @@ class Compute {
                 const void *push_constants,
                 std::size_t push_bytes,
                 const Bindings &buffers,
-                std::uint32_t group_count);
+                std::uint32_t group_count,
+                const char *label = "dispatch");
   /**
    * Submit the recorded work, wait for it, and complete the downloads. Returns the GPU execution
    * time in milliseconds, or a negative value if the device has no usable timestamps.

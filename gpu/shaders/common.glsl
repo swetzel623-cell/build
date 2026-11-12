@@ -13,7 +13,8 @@ layout(push_constant) uniform Params
 P;
 layout(std430, binding = 1) readonly buffer BrickTable { int brick_table[]; };
 layout(std430, binding = 2) readonly buffer BrickCoords { ivec4 brick_coords[]; };
-layout(std430, binding = 3) readonly buffer CellTypes { uint cell_type[]; };
+/* Written only by the classify kernel. */
+layout(std430, binding = 3) buffer CellTypes { uint cell_type[]; };
 
 /* Float channels. Each kernel names the ones it uses. */
 layout(std430, binding = 4) buffer B4 { float b4[]; };

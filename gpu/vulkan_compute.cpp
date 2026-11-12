@@ -3,6 +3,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <stdexcept>
@@ -39,6 +40,7 @@ VkBuffer to_vk(const Compute::Buffer &buffer)
 }
 
 constexpr std::uint32_t sets_per_pool = 256;
+constexpr std::uint32_t profile_capacity = 4096;
 
 }  // namespace
 
@@ -61,6 +63,11 @@ struct Compute::Impl {
   VkQueryPool timestamps = VK_NULL_HANDLE;
   double timestamp_period_ns = 0.0;
   std::uint64_t timestamp_mask = 0;
+
+  VkQueryPool profile_pool = VK_NULL_HANDLE;
+  bool profiling = false;
+  std::vector<const char *> profile_labels;
+  std::vector<std::pair<std::string, double>> profile;
 
   Buffer dummy;
   bool recording = false;
@@ -147,6 +154,19 @@ struct Compute::Impl {
       vkFreeMemory(device, entry.memory, nullptr);
     }
     staging.clear();
+  }
+
+  /** Close the timing interval of the command just recorded. */
+  void mark(const char *label)
+  {
+    if (!profiling || profile_labels.size() + 1 >= profile_capacity) {
+      return;
+    }
+    profile_labels.push_back(label);
+    vkCmdWriteTimestamp(commands,
+                        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        profile_pool,
+                        static_cast<std::uint32_t>(profile_labels.size()));
   }
 
   /** Make every earlier write visible to every later command. */
@@ -356,6 +376,9 @@ Compute::Compute() : impl_(std::make_unique<Impl>())
     query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
     query_info.queryCount = 2;
     check(vkCreateQueryPool(v.device, &query_info, nullptr, &v.timestamps), "vkCreateQueryPool");
+    query_info.queryCount = profile_capacity;
+    check(vkCreateQueryPool(v.device, &query_info, nullptr, &v.profile_pool),
+          "vkCreateQueryPool");
   }
 
   v.dummy = create_buffer(16);
@@ -375,6 +398,7 @@ Compute::~Compute()
   }
   if (v.timestamps) {
     vkDestroyQueryPool(v.device, v.timestamps, nullptr);
+    vkDestroyQueryPool(v.device, v.profile_pool, nullptr);
   }
   for (const VkDescriptorPool pool : v.descriptor_pools) {
     vkDestroyDescriptorPool(v.device, pool, nullptr);
@@ -400,6 +424,19 @@ bool Compute::is_software_device() const
 bool Compute::has_timestamps() const
 {
   return impl_->timestamps != VK_NULL_HANDLE;
+}
+
+void Compute::set_profiling(const bool enabled)
+{
+  if (impl_->recording) {
+    throw std::logic_error("set_profiling while recording");
+  }
+  impl_->profiling = enabled && impl_->profile_pool != VK_NULL_HANDLE;
+}
+
+const std::vector<std::pair<std::string, double>> &Compute::last_profile() const
+{
+  return impl_->profile;
 }
 
 Compute::Buffer Compute::create_buffer(const std::size_t bytes)
@@ -479,6 +516,11 @@ void Compute::begin()
     vkCmdResetQueryPool(v.commands, v.timestamps, 0, 2);
     vkCmdWriteTimestamp(v.commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, v.timestamps, 0);
   }
+  v.profile_labels.clear();
+  if (v.profiling) {
+    vkCmdResetQueryPool(v.commands, v.profile_pool, 0, profile_capacity);
+    vkCmdWriteTimestamp(v.commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, v.profile_pool, 0);
+  }
   v.recording = true;
 }
 
@@ -497,6 +539,7 @@ void Compute::upload(const Buffer &target, const void *data, const std::size_t b
   region.size = bytes;
   vkCmdCopyBuffer(v.commands, staging, to_vk(target), 1, &region);
   v.barrier();
+  v.mark("upload");
 }
 
 void Compute::download(const Buffer &source, void *out, const std::size_t bytes)
@@ -514,6 +557,7 @@ void Compute::download(const Buffer &source, void *out, const std::size_t bytes)
   region.size = bytes;
   vkCmdCopyBuffer(v.commands, to_vk(source), staging, 1, &region);
   v.barrier();
+  v.mark("download");
   v.downloads.push_back({mapped, out, bytes});
 }
 
@@ -522,13 +566,15 @@ void Compute::fill(const Buffer &target, const std::uint32_t value)
   Impl &v = *impl_;
   vkCmdFillBuffer(v.commands, to_vk(target), 0, VK_WHOLE_SIZE, value);
   v.barrier();
+  v.mark("fill");
 }
 
 void Compute::dispatch(const int kernel,
                        const void *push_constants,
                        const std::size_t push_bytes,
                        const Bindings &buffers,
-                       const std::uint32_t group_count)
+                       const std::uint32_t group_count,
+                       const char *label)
 {
   Impl &v = *impl_;
   if (group_count == 0) {
@@ -555,6 +601,7 @@ void Compute::dispatch(const int kernel,
                      push.data());
   vkCmdDispatch(v.commands, group_count, 1, 1);
   v.barrier();
+  v.mark(label);
 }
 
 double Compute::submit()
@@ -582,6 +629,34 @@ double Compute::submit()
   }
   v.downloads.clear();
   v.release_staging();
+
+  v.profile.clear();
+  if (v.profiling && !v.profile_labels.empty()) {
+    std::vector<std::uint64_t> ticks(v.profile_labels.size() + 1);
+    check(vkGetQueryPoolResults(v.device,
+                                v.profile_pool,
+                                0,
+                                static_cast<std::uint32_t>(ticks.size()),
+                                ticks.size() * sizeof(std::uint64_t),
+                                ticks.data(),
+                                sizeof(std::uint64_t),
+                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+          "vkGetQueryPoolResults");
+    for (std::size_t i = 0; i < v.profile_labels.size(); ++i) {
+      const double ms = static_cast<double>((ticks[i + 1] - ticks[i]) & v.timestamp_mask) *
+                        v.timestamp_period_ns * 1.0e-6;
+      const std::string label = v.profile_labels[i];
+      auto entry = std::find_if(v.profile.begin(), v.profile.end(), [&](const auto &item) {
+        return item.first == label;
+      });
+      if (entry == v.profile.end()) {
+        v.profile.emplace_back(label, ms);
+      }
+      else {
+        entry->second += ms;
+      }
+    }
+  }
 
   if (!v.timestamps) {
     return -1.0;

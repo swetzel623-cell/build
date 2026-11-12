@@ -9,21 +9,31 @@
 #define SOURCE b7
 #define RESULT b8
 
-#define FETCH(channel, c) (index_of(c) < 0 ? 0.0 : channel[index_of(c)])
+/* One brick-table lookup per corner; missing voxels read 0, as in the CPU reference. */
 #define SAMPLE(name, channel) \
+  float name##_at(ivec3 c) \
+  { \
+    int i = index_of(c); \
+    return i < 0 ? 0.0 : channel[i]; \
+  } \
   float name(vec3 p, vec3 offset) \
   { \
     vec3 f = p - offset; \
     vec3 base = floor(f); \
     ivec3 i = ivec3(base); \
     vec3 t = f - base; \
-    float c00 = FETCH(channel, i) + (FETCH(channel, i + ivec3(1, 0, 0)) - FETCH(channel, i)) * t.x; \
-    float c10 = FETCH(channel, i + ivec3(0, 1, 0)) + \
-                (FETCH(channel, i + ivec3(1, 1, 0)) - FETCH(channel, i + ivec3(0, 1, 0))) * t.x; \
-    float c01 = FETCH(channel, i + ivec3(0, 0, 1)) + \
-                (FETCH(channel, i + ivec3(1, 0, 1)) - FETCH(channel, i + ivec3(0, 0, 1))) * t.x; \
-    float c11 = FETCH(channel, i + ivec3(0, 1, 1)) + \
-                (FETCH(channel, i + ivec3(1, 1, 1)) - FETCH(channel, i + ivec3(0, 1, 1))) * t.x; \
+    float f000 = name##_at(i); \
+    float f100 = name##_at(i + ivec3(1, 0, 0)); \
+    float f010 = name##_at(i + ivec3(0, 1, 0)); \
+    float f110 = name##_at(i + ivec3(1, 1, 0)); \
+    float f001 = name##_at(i + ivec3(0, 0, 1)); \
+    float f101 = name##_at(i + ivec3(1, 0, 1)); \
+    float f011 = name##_at(i + ivec3(0, 1, 1)); \
+    float f111 = name##_at(i + ivec3(1, 1, 1)); \
+    float c00 = f000 + (f100 - f000) * t.x; \
+    float c10 = f010 + (f110 - f010) * t.x; \
+    float c01 = f001 + (f101 - f001) * t.x; \
+    float c11 = f011 + (f111 - f011) * t.x; \
     float c0 = c00 + (c10 - c00) * t.y; \
     float c1 = c01 + (c11 - c01) * t.y; \
     return c0 + (c1 - c0) * t.z; \

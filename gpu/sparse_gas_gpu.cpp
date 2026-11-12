@@ -6,12 +6,14 @@
 #include "activity.comp.h"
 #include "advect.comp.h"
 #include "buoyancy.comp.h"
+#include "classify.comp.h"
 #include "divergence.comp.h"
 #include "gradient.comp.h"
 #include "jacobi.comp.h"
 #include "remap.comp.h"
 #include "walls.comp.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -59,7 +61,7 @@ std::uint32_t groups_for(const std::size_t count)
 
 struct SparseGasGpu::Impl {
   Compute compute;
-  int advect, buoyancy, walls, divergence, jacobi, gradient, activity, remap;
+  int advect, buoyancy, walls, divergence, jacobi, gradient, activity, remap, classify;
 
   sparse::Topology topology;
   Compute::Buffer table, coords, types, slot_map, flags;
@@ -81,6 +83,7 @@ struct SparseGasGpu::Impl {
     gradient = KERNEL(gradient);
     activity = KERNEL(activity);
     remap = KERNEL(remap);
+    classify = KERNEL(classify);
 #undef KERNEL
   }
 
@@ -121,11 +124,36 @@ struct SparseGasGpu::Impl {
     ensure(types, next.voxel_count() * sizeof(std::uint32_t));
   }
 
-  void record_topology_upload(const sparse::Topology &next)
+  /** Upload the brick tables of `topology` (the current one) and classify its cells. */
+  void record_topology_upload()
   {
-    compute.upload(table, next.brick_table.data(), next.brick_table.size() * sizeof(std::int32_t));
-    compute.upload(coords, next.brick_coords.data(), next.brick_coords.size() * sizeof(std::int32_t));
-    compute.upload(types, next.cell_type.data(), next.cell_type.size() * sizeof(std::uint32_t));
+    compute.upload(
+        table, topology.brick_table.data(), topology.brick_table.size() * sizeof(std::int32_t));
+    compute.upload(coords,
+                   topology.brick_coords.data(),
+                   topology.brick_coords.size() * sizeof(std::int32_t));
+    const Params p = params(0, 0, 0, 0);
+    compute.dispatch(classify,
+                     &p,
+                     sizeof(p),
+                     {&table, &coords, &types, nullptr, nullptr, nullptr, nullptr, nullptr},
+                     groups_for(topology.voxel_count()),
+                     "classify");
+  }
+
+  void collect_profile()
+  {
+    for (const auto &[label, ms] : compute.last_profile()) {
+      auto entry = std::find_if(timing.kernels.begin(),
+                                timing.kernels.end(),
+                                [&](const auto &item) { return item.first == label; });
+      if (entry == timing.kernels.end()) {
+        timing.kernels.emplace_back(label, ms);
+      }
+      else {
+        entry->second += ms;
+      }
+    }
   }
 
   Params params(const float a0, const float a1, const float a2, const float a3) const
@@ -140,6 +168,7 @@ struct SparseGasGpu::Impl {
 
   /** Dispatch a stencil kernel with the topology tables at bindings 1-3 and channels after. */
   void stencil(const int kernel,
+               const char *label,
                const Params &p,
                const int c4,
                const int c5 = -1,
@@ -152,7 +181,8 @@ struct SparseGasGpu::Impl {
                      &p,
                      sizeof(p),
                      {&table, &coords, &types, bind(c4), bind(c5), bind(c6), bind(c7), bind(c8)},
-                     groups_for(topology.voxel_count()));
+                     groups_for(topology.voxel_count()),
+                     label);
   }
 };
 
@@ -172,6 +202,11 @@ bool SparseGasGpu::is_software_device() const
 bool SparseGasGpu::has_timestamps() const
 {
   return impl_->compute.has_timestamps();
+}
+
+void SparseGasGpu::set_profiling(const bool enabled)
+{
+  impl_->compute.set_profiling(enabled);
 }
 
 const SparseGasGpu::Timing &SparseGasGpu::last_timing() const
@@ -198,9 +233,10 @@ void SparseGasGpu::upload(const sparse::State &state)
     g.role[static_cast<std::size_t>(i)] = i;
   }
   g.topology = state.topology;
+  g.topology.cell_type.clear();
 
   g.compute.begin();
-  g.record_topology_upload(g.topology);
+  g.record_topology_upload();
   const std::vector<float> *channels[StateChannels] = {
       &state.density, &state.temperature, &state.u, &state.v, &state.w, &state.pressure};
   for (int i = 0; i < StateChannels; ++i) {
@@ -222,7 +258,9 @@ void SparseGasGpu::download(sparse::State &state)
   if (count == 0) {
     return;
   }
+  state.topology.cell_type.assign(count, 0);
   g.compute.begin();
+  g.compute.download(g.types, state.topology.cell_type.data(), count * sizeof(std::uint32_t));
   for (int i = 0; i < StateChannels; ++i) {
     g.compute.download(g.channel(i), channels[i]->data(), count * sizeof(float));
   }
@@ -270,9 +308,11 @@ sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings)
                         &g.flags,
                         nullptr,
                         nullptr},
-                       groups_for(old_topology.voxel_count()));
+                       groups_for(old_topology.voxel_count()),
+                       "activity");
     g.compute.download(g.flags, slot_flags.data(), old_slots * sizeof(std::uint32_t));
     add_gpu_time(g.compute.submit());
+    g.collect_profile();
   }
 
   /* 2. The next topology, built on the CPU exactly as the reference does. */
@@ -284,7 +324,7 @@ sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings)
     }
   }
   sparse::Topology next = sparse::build_topology(
-      old_topology.extent, old_topology.brick_size, brick_flags, settings.dilation);
+      old_topology.extent, old_topology.brick_size, brick_flags, settings.dilation, false);
   const bool changed = next.brick_table != old_topology.brick_table;
   std::vector<std::int32_t> old_slot_of;
   if (changed) {
@@ -332,7 +372,6 @@ sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings)
   g.compute.begin();
   if (changed) {
     g.compute.upload(g.slot_map, old_slot_of.data(), old_slot_of.size() * sizeof(std::int32_t));
-    g.record_topology_upload(next);
     const RemapParams params = {static_cast<std::int32_t>(next.voxels_per_brick()),
                                 static_cast<std::int32_t>(count)};
     /* Targets: the scratch roles if the buffers were kept, the new buffers if they grew. */
@@ -350,7 +389,8 @@ sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings)
                           nullptr,
                           nullptr,
                           nullptr},
-                         groups_for(count));
+                         groups_for(count),
+                         "remap");
     }
     if (grew) {
       for (int i = 0; i < AllChannels; ++i) {
@@ -364,6 +404,7 @@ sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings)
       }
     }
     g.topology = std::move(next);
+    g.record_topology_upload();
   }
 
   if (count > 0) {
@@ -376,6 +417,7 @@ sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings)
     /* Every channel is advected by the velocity from the start of the step. */
     for (int i = 0; i < 5; ++i) {
       g.stencil(g.advect,
+                "advect",
                 g.params(offsets[i][0], offsets[i][1], offsets[i][2], dt),
                 U,
                 V,
@@ -391,6 +433,7 @@ sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings)
     const auto buoyancy = [&](const int factor, const float coefficient) {
       if (coefficient != 0.0f) {
         g.stencil(g.buoyancy,
+                "buoyancy",
                   g.params(-settings.gravity[0] * dt * coefficient,
                            -settings.gravity[1] * dt * coefficient,
                            -settings.gravity[2] * dt * coefficient,
@@ -403,17 +446,18 @@ sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings)
     };
     buoyancy(Temperature, settings.heat_buoyancy);
     buoyancy(Density, settings.density_buoyancy);
-    g.stencil(g.walls, g.params(0, 0, 0, 0), U, V, W);
+    g.stencil(g.walls, "walls", g.params(0, 0, 0, 0), U, V, W);
 
     const int rhs = StateChannels, next_pressure = StateChannels + 1;
-    g.stencil(g.divergence, g.params(-1.0f, 0, 0, 0), U, V, W, rhs);
+    g.stencil(g.divergence, "divergence", g.params(-1.0f, 0, 0, 0), U, V, W, rhs);
     for (int i = 0; i < settings.pressure_iterations; ++i) {
-      g.stencil(g.jacobi, g.params(0, 0, 0, 0), rhs, Pressure, next_pressure);
+      g.stencil(g.jacobi, "jacobi", g.params(0, 0, 0, 0), rhs, Pressure, next_pressure);
       std::swap(g.role[Pressure], g.role[static_cast<std::size_t>(next_pressure)]);
     }
-    g.stencil(g.gradient, g.params(0, 0, 0, 0), Pressure, U, V, W);
+    g.stencil(g.gradient, "gradient", g.params(0, 0, 0, 0), Pressure, U, V, W);
   }
   add_gpu_time(g.compute.submit());
+  g.collect_profile();
 
   if (!retired.empty()) {
     for (Compute::Buffer &buffer : retired) {

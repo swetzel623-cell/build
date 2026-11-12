@@ -5,6 +5,8 @@
 
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace manta_improve::gpu {
 
@@ -12,9 +14,9 @@ namespace manta_improve::gpu {
  * Runs manta_improve::sparse::step on a Vulkan device with the state kept in device memory.
  *
  * Each step is two submissions. The first marks which bricks hold content and downloads only those
- * flags. The CPU then builds the next topology, as the reference does. The second submission
- * uploads the topology tables if they changed, moves every channel onto them on the device, and
- * runs the whole step. The state is transferred only by upload() and download().
+ * flags. The CPU then builds the next brick table, as the reference does. The second submission
+ * uploads the brick table if it changed, classifies cells on the device, moves every channel onto
+ * the new bricks, and runs the whole step. The state is transferred only by upload() and download().
  *
  * Only PressureSolver::Jacobi is available, with at least one sweep.
  */
@@ -28,6 +30,8 @@ class SparseGasGpu {
     /** CPU time spent building the next topology. */
     double topology_ms = 0.0;
     bool topology_changed = false;
+    /** With profiling on: GPU milliseconds per kernel or transfer kind in this step. */
+    std::vector<std::pair<std::string, double>> kernels;
   };
 
   SparseGasGpu();
@@ -36,6 +40,8 @@ class SparseGasGpu {
   const std::string &device_name() const;
   bool is_software_device() const;
   bool has_timestamps() const;
+  /** Time each kernel separately. Adds a timestamp per command, so totals rise slightly. */
+  void set_profiling(bool enabled);
 
   /** Replace the device state with `state`. */
   void upload(const sparse::State &state);

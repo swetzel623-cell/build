@@ -312,13 +312,40 @@ The comparison run passed again (largest difference 9.1e-6). What the numbers sa
 
 Because the cost is per dispatch, it should weigh less on larger problems; that is untested.
 
+**MacCormack advection and substepping on the RTX 3070.** Two comparison runs of
+`sparse_gas_gpu_tests 64 20` (64×64×96, 20 frames of 1/30 s) passed: the default settings (1 to 2
+substeps per frame), and `--cfl 0.5` (up to 8 substeps per frame). The device took the same
+number of substeps as the CPU reference in every frame, and the largest difference in any
+channel was 1.6e-5. The CPU reference took 1094 ms per frame and the device 11.3 ms.
+
+Whole frames at 192×192×288, 40 frames, median per frame:
+
+| Variant | Wall | GPU | Substeps in 40 frames | Peak bricks | Divergence left |
+|---|---|---|---|---|---|
+| MacCormack (default) | 95.3 ms | 71.6 ms | 190 | 3246 | 1.1e-4 |
+| First-order advection (`--first-order`) | 74.2 ms | 58.4 ms | 169 | 3058 | 5.7e-5 |
+| MacCormack, `--w-depth 1` | 82.9 ms | 61.9 ms | 190 | 3246 | 2.1e-4 |
+
+- **A frame now costs 4 to 6 substeps** once the plume is moving (peak speed near 95 voxels per
+  second at resolution 64, three times that in voxels at 192), so these figures are not
+  comparable with the per-step figures above. Averaged over the run, a substep of the default
+  takes 18.3 ms wall (14.1 ms GPU).
+- **MacCormack costs about 17% more per substep than first-order advection** (18.3 against
+  15.7 ms wall) and takes 12% more substeps, because the sharper plume moves faster.
+  `--w-depth 1` brings the substep back to 15.8 ms for twice the remaining divergence.
+- **In the profile, multigrid is 72% of the GPU time and advection 23%** (forward pass 10%,
+  correction pass 13%). Smoothing on the coarse brick levels (26%) costs as much as smoothing
+  on the voxels (25%), which again points at dispatch count, not work.
+- The solver no longer fits a 30 fps frame on this scene: substepping, not any single kernel,
+  is what moved it from 15 ms to 95 ms per frame.
+
 With the resident driver, on llvmpipe, every channel still equals the CPU reference bit for bit:
 32×32×48 over 12 steps, and 48×48×72 over 14 steps, where the active set grows from 64 to 160
 bricks and the channel buffers are replaced once.
 
 ## Not verified, and known gaps
 
-- **One real GPU, one scene.** Only the RTX 3070 run above. No AMD, Intel, or Apple device.
+- **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.
 - **No comparison with the Mantaflow node's speed.** The solvers also differ in physics (below),
   so a fair comparison needs matched numerics first. The driver is also not written for speed: buffers
   are host-visible, every dispatch is submitted and waited for separately, and the whole state is

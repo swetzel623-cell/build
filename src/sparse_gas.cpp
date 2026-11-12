@@ -604,6 +604,11 @@ StepInfo project(State &state, const Settings &settings)
     info.pressure_iterations = solve_conjugate_gradient(
         topology, rhs, settings.pressure_accuracy, settings.pressure_iterations, state.pressure);
   }
+  else if (settings.pressure_solver == PressureSolver::Multigrid) {
+    multigrid_solve(topology, build_multigrid(topology), rhs, settings,
+                    settings.pressure_iterations, state.pressure);
+    info.pressure_iterations = settings.pressure_iterations;
+  }
   else {
     std::vector<float> next;
     for (int i = 0; i < settings.pressure_iterations; ++i) {

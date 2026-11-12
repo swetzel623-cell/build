@@ -120,6 +120,11 @@ enum class PressureSolver {
   ConjugateGradient,
   /** A fixed number of Jacobi sweeps. No reductions, so it runs unchanged on a GPU. */
   Jacobi,
+  /**
+   * A fixed number of multigrid V-cycles (`pressure_iterations`) with red-black Gauss-Seidel
+   * smoothing. No reductions either. Requires a power-of-two brick size.
+   */
+  Multigrid,
 };
 
 struct Settings {
@@ -132,6 +137,17 @@ struct Settings {
   PressureSolver pressure_solver = PressureSolver::ConjugateGradient;
   float pressure_accuracy = 1.0e-4f;
   int pressure_iterations = 400;
+
+  /** Multigrid: red-black sweeps before and after each coarse correction, and on the last level. */
+  int multigrid_pre_sweeps = 2;
+  int multigrid_post_sweeps = 2;
+  int multigrid_coarsest_sweeps = 8;
+  /** Multigrid: recursive cycles per coarse solve. 1 is a V-cycle, 2 a W-cycle. */
+  int multigrid_coarse_cycles = 2;
+  /** Multigrid: how many of the finest coarse levels are solved with `multigrid_coarse_cycles`. */
+  int multigrid_w_depth = 2;
+  /** Multigrid: factor applied to coarse corrections; aggregation underestimates them. */
+  float multigrid_overcorrection = 1.4f;
 
   ActivityThresholds thresholds;
   /** Bricks of padding around active content. Smoke must not cross it within one step. */
@@ -181,6 +197,49 @@ void jacobi_sweep(const Topology &topology,
                   const std::vector<float> &negative_divergence,
                   const std::vector<float> &pressure,
                   std::vector<float> &result);
+
+/**
+ * One coarse level of the pressure multigrid. Coarse cells aggregate 2x2x2 cells of the level
+ * below; the operator is the Galerkin product for piecewise-constant transfer, which stays a
+ * 7-point stencil: a diagonal and one weight per lower face.
+ *
+ * Levels with fewer than one cell per brick side left are stored densely over the (coarsened)
+ * brick grid; the others are stored per brick slot like the voxels.
+ */
+struct MultigridLevel {
+  bool dense = false;
+  /** Brick-stored levels: cells per brick side. */
+  int side = 0;
+  /** Dense levels: grid size. */
+  Extent dims;
+  std::vector<float> diagonal, weight_x, weight_y, weight_z;
+
+  std::size_t cell_count() const { return diagonal.size(); }
+};
+
+struct Multigrid {
+  /** levels[0] is one coarsening above the voxels. */
+  std::vector<MultigridLevel> levels;
+};
+
+/** Index of a coarse cell at level coordinates, or -1 if it has no storage. */
+std::int64_t multigrid_index(const Topology &topology, const MultigridLevel &level, int x, int y,
+                             int z);
+
+Multigrid build_multigrid(const Topology &topology);
+
+/** Run `cycles` V-cycles on `A pressure = rhs`, starting from the given pressure. */
+void multigrid_solve(const Topology &topology,
+                     const Multigrid &multigrid,
+                     const std::vector<float> &rhs,
+                     const Settings &settings,
+                     int cycles,
+                     std::vector<float> &pressure);
+
+/** Largest absolute residual of `A pressure = rhs` over fluid cells. */
+float poisson_residual(const Topology &topology,
+                       const std::vector<float> &rhs,
+                       const std::vector<float> &pressure);
 
 /** Subtract the pressure gradient from every face that borders a fluid cell. */
 void subtract_gradient(State &state);

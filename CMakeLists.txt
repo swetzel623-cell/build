@@ -17,7 +17,7 @@ else()
   target_compile_options(manta_improve_activity PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_library(manta_improve_sparse src/sparse_gas.cpp)
+add_library(manta_improve_sparse src/sparse_gas.cpp src/sparse_multigrid.cpp)
 target_include_directories(
   manta_improve_sparse
   PUBLIC

@@ -295,6 +295,61 @@ void test_jacobi_matches_conjugate_gradient()
   require(error < 1.0e-3, "Jacobi and CG disagree");
 }
 
+/** Multigrid must cut the residual by a steady factor per cycle and agree with CG. */
+void test_multigrid_converges()
+{
+  const DenseFields initial = blob({48, 48, 64}, 24.0f, 24.0f, 14.0f, 6.0f);
+  for (const int dilation : {1, everywhere}) {
+    State state = from_dense(initial, 8, {}, dilation);
+    const Settings settings = plume_settings();
+    add_buoyancy(state, state.temperature, 0.5f, settings.dt, settings.gravity);
+    enforce_walls(state);
+    std::vector<float> rhs;
+    divergence(state, rhs);
+    for (float &value : rhs) {
+      value = -value;
+    }
+    const Multigrid multigrid = build_multigrid(state.topology);
+    std::vector<float> pressure(state.topology.voxel_count(), 0.0f);
+    const float initial_residual = poisson_residual(state.topology, rhs, pressure);
+    float previous = initial_residual;
+    float worst_factor = 0.0f;
+    for (int cycle = 0; cycle < 6; ++cycle) {
+      multigrid_solve(state.topology, multigrid, rhs, settings, 1, pressure);
+      const float current = poisson_residual(state.topology, rhs, pressure);
+      worst_factor = std::max(worst_factor, current / previous);
+      previous = current;
+    }
+    std::cout << "  dilation " << dilation << ": " << multigrid.levels.size()
+              << " coarse levels, worst factor per cycle " << worst_factor << ", total "
+              << previous / initial_residual << '\n';
+    require(worst_factor < 0.5f, "a multigrid cycle reduced the residual too little");
+    require(previous < 2.0e-3f * initial_residual, "six multigrid cycles did not converge");
+  }
+
+  Settings exact = plume_settings();
+  exact.pressure_accuracy = 1.0e-5f;
+  exact.pressure_iterations = 2000;
+  Settings cycles = plume_settings();
+  cycles.pressure_solver = PressureSolver::Multigrid;
+  cycles.pressure_iterations = 10;
+  const DenseFields small = blob({32, 32, 48}, 16.0f, 16.0f, 10.0f, 4.0f);
+  const DenseFields a = run(small, 8, 1, 6, exact);
+  const DenseFields b = run(small, 8, 1, 6, cycles);
+  const double error = relative_l2(b.w, a.w);
+  std::cout << "  multigrid vs CG velocity rel L2 after 6 steps " << error << '\n';
+  require(error < 1.0e-3, "multigrid and CG disagree");
+
+  bool rejected = false;
+  try {
+    build_multigrid(build_topology({20, 20, 20}, 5, std::vector<std::uint8_t>(64, 1), 0));
+  }
+  catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  require(rejected, "a brick size that is not a power of two must be rejected");
+}
+
 }  // namespace
 
 int main()
@@ -307,6 +362,7 @@ int main()
       {"plume rises and rest stays at rest", test_plume_rises_and_rest_stays_at_rest},
       {"sparse follows the plume", test_sparse_follows_the_plume},
       {"Jacobi matches conjugate gradient", test_jacobi_matches_conjugate_gradient},
+      {"multigrid converges", test_multigrid_converges},
   };
   for (const auto &[name, test] : tests) {
     test();

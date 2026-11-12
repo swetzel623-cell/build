@@ -127,8 +127,25 @@ enum class PressureSolver {
   Multigrid,
 };
 
+enum class Advection {
+  /** First-order semi-Lagrangian. Stable and very diffusive. */
+  SemiLagrangian,
+  /**
+   * MacCormack: a forward and a backward semi-Lagrangian trace, with the error estimate added
+   * back and the result clamped to the values the forward trace interpolated. The scheme the
+   * Mantaflow node uses, though not operation for operation.
+   */
+  MacCormack,
+};
+
 struct Settings {
+  /** Time step of step(). advance() chooses its own steps and ignores this. */
   float dt = 1.0f / 30.0f;
+  Advection advection = Advection::MacCormack;
+  /** advance(): largest distance, in voxels, anything may travel in one step. */
+  float cfl = 2.0f;
+  /** advance(): fail instead of taking more steps than this for one frame. */
+  int max_substeps = 64;
   /** Acceleration in voxels per second squared. */
   float gravity[3] = {0.0f, 0.0f, -9.81f};
   float density_buoyancy = 0.0f;
@@ -159,6 +176,15 @@ struct StepInfo {
   /** Largest remaining divergence of any fluid cell, in 1/s. */
   float max_divergence = 0.0f;
   std::size_t active_bricks = 0;
+  /** The time step taken. */
+  float dt = 0.0f;
+};
+
+struct FrameInfo {
+  int substeps = 0;
+  /** Largest velocity component seen at the start of any substep, in voxels per second. */
+  float max_speed = 0.0f;
+  StepInfo last_step;
 };
 
 /* Reference kernels. Each reads whole channels and writes one output channel. */
@@ -181,6 +207,25 @@ void advect(const State &state,
             float offset_z,
             float dt,
             std::vector<float> &result);
+
+/**
+ * MacCormack correction of a forward-advected channel. `forward` must be advect() of `source`
+ * with the same arguments.
+ */
+void advect_maccormack(const State &state,
+                       const std::vector<float> &source,
+                       const std::vector<float> &forward,
+                       float offset_x,
+                       float offset_y,
+                       float offset_z,
+                       float dt,
+                       std::vector<float> &result);
+
+/** Largest absolute velocity component of any stored face. */
+float max_speed(const State &state);
+
+/** Time step for the next substep of a frame: the rest of the frame, limited by the CFL number. */
+float cfl_time_step(float remaining, float cfl, float speed);
 
 /** Mantaflow-style buoyancy on faces between two fluid cells. */
 void add_buoyancy(State &state, const std::vector<float> &factor, float coefficient, float dt,
@@ -254,5 +299,11 @@ StepInfo project(State &state, const Settings &settings);
 
 /** Advance one time step: retopologize, advect, add buoyancy, enforce walls, project. */
 StepInfo step(State &state, const Settings &settings);
+
+/**
+ * Advance by `frame_time` in CFL-limited substeps. Throws std::runtime_error, leaving the state
+ * partly advanced, if that takes more than `max_substeps`.
+ */
+FrameInfo advance(State &state, const Settings &settings, float frame_time);
 
 }  // namespace manta_improve::sparse

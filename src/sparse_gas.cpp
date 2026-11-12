@@ -479,6 +479,83 @@ void advect(const State &state,
   });
 }
 
+void advect_maccormack(const State &state,
+                       const std::vector<float> &source,
+                       const std::vector<float> &forward,
+                       const float offset_x,
+                       const float offset_y,
+                       const float offset_z,
+                       const float dt,
+                       std::vector<float> &result)
+{
+  const Topology &topology = state.topology;
+  result.assign(topology.voxel_count(), 0.0f);
+  /* A staggered component sits on the face shared with the cell below it along its axis. */
+  const int axis = offset_x == 0.0f ? 0 : offset_y == 0.0f ? 1 : offset_z == 0.0f ? 2 : -1;
+  for_each_voxel(topology, [&](const std::size_t index, const int x, const int y, const int z) {
+    const CellType type = static_cast<CellType>(topology.cell_type[index]);
+    if (type == CellSolid) {
+      return;
+    }
+    result[index] = forward[index];
+    /* Only correct values that lie inside the fluid, as Mantaflow does. */
+    if (type != CellFluid ||
+        (axis >= 0 &&
+         topology.type_at(x - (axis == 0), y - (axis == 1), z - (axis == 2)) != CellFluid))
+    {
+      return;
+    }
+    const float px = static_cast<float>(x) + offset_x;
+    const float py = static_cast<float>(y) + offset_y;
+    const float pz = static_cast<float>(z) + offset_z;
+    const float vx = sample(topology, state.u, px, py, pz, 0.0f, 0.5f, 0.5f);
+    const float vy = sample(topology, state.v, px, py, pz, 0.5f, 0.0f, 0.5f);
+    const float vz = sample(topology, state.w, px, py, pz, 0.5f, 0.5f, 0.0f);
+
+    /* The values the forward trace interpolated bound the result. If any of them has no
+     * storage, the trace left the active region: keep the first-order value there. */
+    const float bx = std::floor(px - dt * vx - offset_x);
+    const float by = std::floor(py - dt * vy - offset_y);
+    const float bz = std::floor(pz - dt * vz - offset_z);
+    const int ix = static_cast<int>(bx), iy = static_cast<int>(by), iz = static_cast<int>(bz);
+    float lowest = 0.0f, highest = 0.0f;
+    for (int corner = 0; corner < 8; ++corner) {
+      const std::int64_t i = topology.index_of(
+          ix + (corner & 1), iy + ((corner >> 1) & 1), iz + ((corner >> 2) & 1));
+      if (i < 0) {
+        return;
+      }
+      const float value = source[static_cast<std::size_t>(i)];
+      lowest = corner == 0 ? value : std::min(lowest, value);
+      highest = corner == 0 ? value : std::max(highest, value);
+    }
+
+    const float backward = sample(
+        topology, forward, px + dt * vx, py + dt * vy, pz + dt * vz, offset_x, offset_y, offset_z);
+    const float corrected = forward[index] + 0.5f * (source[index] - backward);
+    result[index] = std::min(std::max(corrected, lowest), highest);
+  });
+}
+
+float max_speed(const State &state)
+{
+  float result = 0.0f;
+  for (const std::vector<float> *channel : {&state.u, &state.v, &state.w}) {
+    for (const float value : *channel) {
+      result = std::max(result, std::abs(value));
+    }
+  }
+  return result;
+}
+
+float cfl_time_step(const float remaining, const float cfl, const float speed)
+{
+  if (!(speed > 0.0f) || cfl / speed >= remaining) {
+    return remaining;
+  }
+  return cfl / speed;
+}
+
 void add_buoyancy(State &state,
                   const std::vector<float> &factor,
                   const float coefficient,
@@ -632,12 +709,23 @@ StepInfo step(State &state, const Settings &settings)
     return {};
   }
 
-  std::vector<float> density, temperature, u, v, w;
-  advect(state, state.density, 0.5f, 0.5f, 0.5f, settings.dt, density);
-  advect(state, state.temperature, 0.5f, 0.5f, 0.5f, settings.dt, temperature);
-  advect(state, state.u, 0.0f, 0.5f, 0.5f, settings.dt, u);
-  advect(state, state.v, 0.5f, 0.0f, 0.5f, settings.dt, v);
-  advect(state, state.w, 0.5f, 0.5f, 0.0f, settings.dt, w);
+  /* Every channel is advected by the velocity from the start of the step. */
+  std::vector<float> density, temperature, u, v, w, forward;
+  const auto advect_channel = [&](const std::vector<float> &source, const float ox, const float oy,
+                                  const float oz, std::vector<float> &result) {
+    if (settings.advection == Advection::MacCormack) {
+      advect(state, source, ox, oy, oz, settings.dt, forward);
+      advect_maccormack(state, source, forward, ox, oy, oz, settings.dt, result);
+    }
+    else {
+      advect(state, source, ox, oy, oz, settings.dt, result);
+    }
+  };
+  advect_channel(state.density, 0.5f, 0.5f, 0.5f, density);
+  advect_channel(state.temperature, 0.5f, 0.5f, 0.5f, temperature);
+  advect_channel(state.u, 0.0f, 0.5f, 0.5f, u);
+  advect_channel(state.v, 0.5f, 0.0f, 0.5f, v);
+  advect_channel(state.w, 0.5f, 0.5f, 0.0f, w);
   state.density.swap(density);
   state.temperature.swap(temperature);
   state.u.swap(u);
@@ -651,7 +739,29 @@ StepInfo step(State &state, const Settings &settings)
     add_buoyancy(state, state.density, settings.density_buoyancy, settings.dt, settings.gravity);
   }
   enforce_walls(state);
-  return project(state, settings);
+  StepInfo info = project(state, settings);
+  info.dt = settings.dt;
+  return info;
+}
+
+FrameInfo advance(State &state, const Settings &settings, const float frame_time)
+{
+  FrameInfo frame;
+  float remaining = frame_time;
+  Settings substep = settings;
+  while (remaining > 0.0f) {
+    if (frame.substeps >= settings.max_substeps) {
+      throw std::runtime_error("The sparse solver exhausted its substep limit");
+    }
+    const float speed = max_speed(state);
+    frame.max_speed = std::max(frame.max_speed, speed);
+    substep.dt = cfl_time_step(remaining, settings.cfl, speed);
+    frame.last_step = step(state, substep);
+    frame.last_step.dt = substep.dt;
+    remaining -= substep.dt;
+    ++frame.substeps;
+  }
+  return frame;
 }
 
 }  // namespace manta_improve::sparse

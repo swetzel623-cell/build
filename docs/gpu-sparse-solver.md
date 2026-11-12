@@ -185,6 +185,37 @@ What this shows:
   different numerics (60 unconverged Jacobi sweeps against a converged multigrid solve,
   first-order against MacCormack advection), and a different scene.
 
+**After moving cell classification to the GPU and removing duplicate lookups** (RTX 3070, same
+runs):
+
+- Comparison mode still passes with the same differences (largest 7.3e-6), and the GPU's cell
+  types equal the CPU reference's on every step. 3.2 ms per step including the per-step download,
+  against 7.3 ms before.
+- `--bench`, median per step:
+
+| Domain | Wall | GPU | Topology (CPU) | Before: wall / GPU / topology |
+| --- | --- | --- | --- | --- |
+| 64×64×96 | 3.2 ms | 1.8 ms | 0.02 ms | 8.9 / 3.9 / 2.5 ms |
+| 128×128×192 | 7.3 ms | 4.9 ms | 0.05 ms | 18.3 / 8.0 / 8.1 ms |
+| 192×192×288 | 15.4 ms | 13.1 ms | 0.12 ms | 45.3 / 23.8 / 17.6 ms |
+
+  The last 192 step, with 2.3 million stored voxels, took 29.5 ms wall and 27.1 ms GPU, against
+  114 ms and 62 ms before.
+- `--profile` at 192×192×288, average GPU time per step over 40 steps: Jacobi sweeps 9.2 ms
+  (69%), advection 3.1 ms (23%), buoyancy 0.33 ms, remap 0.16 ms, gradient 0.13 ms, walls
+  0.11 ms, classify 0.09 ms, divergence 0.07 ms, activity 0.04 ms, transfers under 0.04 ms. At
+  128×128×192 the split is 74% Jacobi and 18% advection.
+
+What this shows:
+
+- **CPU overhead is no longer the problem.** Wall time is now within a few milliseconds of GPU
+  time; the remaining gap is largest in steps where buffers grow and are reallocated.
+- **The pressure solve dominates, and it is the weakest part numerically too.** 60 Jacobi sweeps
+  are about 70% of GPU time and do not converge the pressure at these resolutions. A rough
+  estimate puts the sweeps at about 30% of the 3070's memory bandwidth, so kernel tuning could
+  gain perhaps two to three times. A solver that converges in far fewer passes (multigrid) is the
+  larger gain and also fixes the accuracy problem.
+
 With the resident driver, on llvmpipe, every channel still equals the CPU reference bit for bit:
 32×32×48 over 12 steps, and 48×48×72 over 14 steps, where the active set grows from 64 to 160
 bricks and the channel buffers are replaced once.
@@ -221,13 +252,9 @@ bricks and the channel buffers are replaced once.
 
 ## Next steps
 
-1. Run `--profile` on real GPUs and optimize the kernels that dominate. Cell classification has
-   moved to the GPU and duplicate brick-table lookups were removed from advect and jacobi; on
-   llvmpipe at 48×48×72 the CPU topology time fell from about 1.8 ms to 0.09 ms per step and the
-   step from 328 ms to 195 ms, with results still bit-identical. Not yet measured on a real GPU.
-2. Replace Jacobi with a multigrid-preconditioned or multigrid solver over the brick hierarchy,
+1. Replace Jacobi with a multigrid-preconditioned or multigrid solver over the brick hierarchy,
    with GPU reductions.
-3. MacCormack advection and CFL substepping, then compare with the Mantaflow engine on a case
+2. MacCormack advection and CFL substepping, then compare with the Mantaflow engine on a case
    where the active region covers the domain.
-4. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind
+3. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind
    the existing node, with the CPU reference as fallback.

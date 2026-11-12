@@ -265,8 +265,34 @@ took 28 ms per step at 192 (24 calls of about 1.2 ms), against the 11 ms it repl
 median step rose from 19.8 to 29.2 ms: one work group is slow on the first dense level's 20,736
 cells. Results were still correct (comparison passed, same differences). The driver now hands
 over only the trailing levels of at most 512 cells and gives larger levels their own dispatches
-again; `--tiny-limit` changes the limit and `--w-depth` the W-cycle depth for experiments. This
-version is not yet measured on a real GPU.
+again; `--tiny-limit` changes the limit and `--w-depth` the W-cycle depth for experiments.
+
+**Variants measured on the RTX 3070**, 192×192×288, 40 steps, six cycles, median per step:
+
+| Variant | Wall | GPU | Divergence left |
+| --- | --- | --- | --- |
+| Every level its own dispatches (limit 0) | 18.7 ms | 13.8 ms | 4.5e-5 |
+| Single dispatch for levels up to 64 cells | 17.4 ms | 13.4 ms | 4.5e-5 |
+| Up to 512 cells (default) | 16.8 ms | 13.5 ms | 4.5e-5 |
+| Up to 4096 cells | 17.2 ms | 13.8 ms | 4.5e-5 |
+| Up to 512 cells, W-cycle on one level only (`--w-depth 1`) | 14.5 ms | 11.1 ms | 7.3e-5 |
+| 60 Jacobi sweeps, for reference | 19.3 ms | 14.4 ms | 4.2e-2 |
+
+The comparison run passed again (largest difference 9.1e-6). What the numbers say:
+
+- **The size limit barely matters**; the differences between the first four rows are within the
+  run-to-run noise. Individual steps at the same brick count vary by a factor of two (for
+  example 5 and 11 ms GPU), so these medians are rough.
+- **The solve is bound by the number of dispatches, not by the work.** A 128×128×192 run with
+  679 bricks takes about as long (13.1 ms GPU) as the 192×192×288 run with 1111 bricks
+  (12.9 ms). In the 192 profile the voxel-level smoothing, where most of the cells are, is
+  2.4 ms; smoothing on the coarse levels, with a seventh of the cells, is 4.2 ms.
+- Visiting fewer levels twice (`--w-depth 1`) removes about 40% of the dispatches and is the
+  only variant that is clearly faster, for a somewhat larger remaining divergence.
+- Multigrid now takes about the same time per step as 60 Jacobi sweeps on this scene, leaves
+  about 1000 times less divergence, and keeps the plume in a quarter of the bricks.
+
+Because the cost is per dispatch, it should weigh less on larger problems; that is untested.
 
 With the resident driver, on llvmpipe, every channel still equals the CPU reference bit for bit:
 32×32×48 over 12 steps, and 48×48×72 over 14 steps, where the active set grows from 64 to 160
@@ -285,8 +311,9 @@ bricks and the channel buffers are replaced once.
 - **The physics is not yet the dense node's.** Advection is first-order semi-Lagrangian, which is
   much more diffusive than the MacCormack scheme the Mantaflow node uses, and it spreads smoke
   into more bricks than necessary. There is no comparison against the Mantaflow engine yet.
-- **Coarse-level dispatch overhead.** Measured on the RTX 3070 and partly addressed (see above);
-  the per-brick coarse levels still issue about 400 small dispatches per step.
+- **Multigrid is dispatch-bound at these sizes.** About 1,000 dispatches per step, most of them
+  on coarse levels with little work. Larger problems, where the work should dominate, have not
+  been measured.
 - **Aggregation multigrid converges slowly for a multigrid method** (0.31 per cycle). As a
   preconditioner for conjugate gradients it would do better, but that needs reductions on the
   device.
@@ -308,8 +335,8 @@ bricks and the channel buffers are replaced once.
 
 ## Next steps
 
-1. Measure the single-dispatch dense cycle on real GPUs, and reduce the remaining per-brick
-   coarse-level dispatches if they still show.
+1. Measure multigrid at larger sizes, where dispatch overhead should matter less, before
+   tuning it further.
 2. MacCormack advection and CFL substepping, then compare with the Mantaflow engine on a case
    where the active region covers the domain.
 3. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind

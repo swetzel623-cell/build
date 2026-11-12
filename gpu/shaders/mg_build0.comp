@@ -9,7 +9,7 @@ layout(std430, binding = 4) writeonly buffer CoarseOperator { vec4 coarse_op[]; 
 void main()
 {
   int index;
-  if (!cell_in_range(index)) {
+  if (!cell_in_range(P.lb, index)) {
     return;
   }
   ivec3 c = level_coords(P.lb, index);

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Shared by the multigrid kernels. Mirrors src/sparse_multigrid.cpp.
 //
-// A level is described by an ivec4: w is the number of cells per brick side for levels stored
-// per brick slot (the voxel level uses the brick size), or 0 for a dense grid of size xyz.
+// A level is described by an ivec4. For levels stored per brick slot, w is the number of cells
+// per brick side (the voxel level uses the brick size). For dense levels, xyz is the grid size and
+// w is minus the level's first cell in the buffers that all dense levels share.
 
 layout(local_size_x = 64) in;
 
@@ -29,11 +30,11 @@ int level_index(ivec4 level, ivec3 c)
   if (any(lessThan(c, ivec3(0)))) {
     return -1;
   }
-  if (level.w == 0) {
+  if (level.w <= 0) {
     if (any(greaterThanEqual(c, level.xyz))) {
       return -1;
     }
-    return c.x + level.x * (c.y + level.y * c.z);
+    return -level.w + c.x + level.x * (c.y + level.y * c.z);
   }
   int side = level.w;
   ivec3 b = c / side;
@@ -51,7 +52,8 @@ int level_index(ivec4 level, ivec3 c)
 /* Level coordinates of a stored cell. */
 ivec3 level_coords(ivec4 level, int index)
 {
-  if (level.w == 0) {
+  if (level.w <= 0) {
+    index += level.w;
     return ivec3(index % level.x, (index / level.x) % level.y, index / (level.x * level.y));
   }
   int side = level.w;
@@ -62,10 +64,12 @@ ivec3 level_coords(ivec4 level, int index)
          ivec3(local % side, (local / side) % side, local / (side * side));
 }
 
-bool cell_in_range(out int index)
+/* The storage index of this invocation's cell on `level`; false for padding invocations. */
+bool cell_in_range(ivec4 level, out int index)
 {
-  index = int(gl_GlobalInvocationID.x);
-  return index < P.count;
+  int cell = int(gl_GlobalInvocationID.x);
+  index = cell + (level.w <= 0 ? -level.w : 0);
+  return cell < P.count;
 }
 
 /* Voxel level, from the packed word written by classify_links. */

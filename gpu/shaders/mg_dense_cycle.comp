@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: MIT
+// One V-cycle over all dense multigrid levels in a single dispatch.
+//
+// The dense levels are tiny, and visiting them with one dispatch per sweep costs far more in
+// dispatch overhead than in work. Here one work group runs the whole cycle: its invocations
+// share each pass over a level and meet at a barrier between passes. The sequence of passes is
+// exactly v_cycle in src/sparse_multigrid.cpp restricted to these levels.
+#version 450
+layout(local_size_x = 128) in;
+const int THREADS = 128;
+
+layout(push_constant) uniform Params
+{
+  int level_count;
+  int pre_sweeps;
+  int post_sweeps;
+  int coarsest_sweeps;
+  float scale;
+}
+P;
+/* Per dense level: grid size and first cell in the shared buffers. */
+layout(std430, binding = 1) readonly buffer Levels { ivec4 levels[]; };
+layout(std430, binding = 2) readonly buffer Operator { vec4 op[]; };
+layout(std430, binding = 3) buffer Rhs { float rhs[]; };
+layout(std430, binding = 4) buffer Values { float x[]; };
+layout(std430, binding = 5) buffer Residual { float residual[]; };
+
+const ivec3 AXES[3] = ivec3[3](ivec3(1, 0, 0), ivec3(0, 1, 0), ivec3(0, 0, 1));
+
+int cell_count(ivec4 level)
+{
+  return level.x * level.y * level.z;
+}
+
+int cell_index(ivec4 level, ivec3 c)
+{
+  if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, level.xyz))) {
+    return -1;
+  }
+  return level.w + c.x + level.x * (c.y + level.y * c.z);
+}
+
+ivec3 cell_coords(ivec4 level, int local)
+{
+  return ivec3(local % level.x, (local / level.x) % level.y, local / (level.x * level.y));
+}
+
+float neighbor_sum(ivec4 level, int index, ivec3 c)
+{
+  float sum = 0.0;
+  for (int axis = 0; axis < 3; ++axis) {
+    float lower = op[index][1 + axis];
+    if (lower != 0.0) {
+      sum += lower * x[cell_index(level, c - AXES[axis])];
+    }
+    int above = cell_index(level, c + AXES[axis]);
+    if (above >= 0) {
+      float upper = op[above][1 + axis];
+      if (upper != 0.0) {
+        sum += upper * x[above];
+      }
+    }
+  }
+  return sum;
+}
+
+/* Every invocation must reach every barrier, so all loops around it have uniform bounds. */
+void sync()
+{
+  memoryBarrierBuffer();
+  barrier();
+}
+
+void relax(ivec4 level, int sweeps)
+{
+  int thread = int(gl_LocalInvocationID.x);
+  int count = cell_count(level);
+  for (int sweep = 0; sweep < sweeps; ++sweep) {
+    for (int color = 0; color < 2; ++color) {
+      for (int local = thread; local < count; local += THREADS) {
+        ivec3 c = cell_coords(level, local);
+        int index = level.w + local;
+        float diagonal = op[index].x;
+        if (((c.x + c.y + c.z) & 1) == color && diagonal > 0.0) {
+          x[index] = (rhs[index] + neighbor_sum(level, index, c)) / diagonal;
+        }
+      }
+      sync();
+    }
+  }
+}
+
+void main()
+{
+  int thread = int(gl_LocalInvocationID.x);
+  int last = P.level_count - 1;
+
+  for (int l = 0; l < last; ++l) {
+    ivec4 level = levels[l];
+    ivec4 coarse = levels[l + 1];
+    relax(level, P.pre_sweeps);
+
+    int count = cell_count(level);
+    for (int local = thread; local < count; local += THREADS) {
+      int index = level.w + local;
+      float diagonal = op[index].x;
+      residual[index] = diagonal > 0.0 ?
+                            rhs[index] - (diagonal * x[index] -
+                                          neighbor_sum(level, index, cell_coords(level, local))) :
+                            0.0;
+    }
+    sync();
+
+    int coarse_count = cell_count(coarse);
+    for (int local = thread; local < coarse_count; local += THREADS) {
+      ivec3 c = cell_coords(coarse, local);
+      float sum = 0.0;
+      for (int child = 0; child < 8; ++child) {
+        int i = cell_index(level, 2 * c + ivec3(child & 1, (child >> 1) & 1, (child >> 2) & 1));
+        sum += i < 0 ? 0.0 : residual[i];
+      }
+      rhs[coarse.w + local] = sum;
+      x[coarse.w + local] = 0.0;
+    }
+    sync();
+  }
+
+  relax(levels[last], P.coarsest_sweeps);
+
+  for (int l = last - 1; l >= 0; --l) {
+    ivec4 level = levels[l];
+    ivec4 coarse = levels[l + 1];
+    int count = cell_count(level);
+    for (int local = thread; local < count; local += THREADS) {
+      int index = level.w + local;
+      if (op[index].x > 0.0) {
+        int parent = cell_index(coarse, cell_coords(level, local) >> 1);
+        x[index] += P.scale * (parent < 0 ? 0.0 : x[parent]);
+      }
+    }
+    sync();
+    relax(level, P.post_sweeps);
+  }
+}

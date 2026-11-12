@@ -18,6 +18,7 @@
 #include "mg_prolong.comp.h"
 #include "mg_build0.comp.h"
 #include "mg_build.comp.h"
+#include "mg_dense_cycle.comp.h"
 #include "divergence.comp.h"
 #include "gradient.comp.h"
 #include "jacobi.comp.h"
@@ -60,6 +61,15 @@ struct MultigridParams {
   std::int32_t unused;
 };
 
+/** Push constants of mg_dense_cycle.comp. */
+struct DenseCycleParams {
+  std::int32_t level_count;
+  std::int32_t pre_sweeps;
+  std::int32_t post_sweeps;
+  std::int32_t coarsest_sweeps;
+  float scale;
+};
+
 struct RemapParams {
   std::int32_t voxels_per_brick;
   std::int32_t count;
@@ -85,15 +95,21 @@ struct SparseGasGpu::Impl {
   Compute compute;
   int advect, buoyancy, walls, divergence, jacobi, gradient, activity, remap, classify;
   int classify_links, mask_pressure, mg_smooth0, mg_residual0, mg_smooth, mg_residual;
-  int mg_restrict, mg_prolong0, mg_prolong, mg_build0, mg_build;
+  int mg_restrict, mg_prolong0, mg_prolong, mg_build0, mg_build, mg_dense_cycle;
 
   /** One coarse multigrid level on the device. */
   struct Level {
     sparse::MultigridLevel layout;
     std::size_t cells = 0;
+    /** Dense levels: first cell in the buffers all dense levels share. */
+    std::size_t offset = 0;
+    /** Owned by the level if it is stored per brick; copies of the shared buffers if dense. */
     Compute::Buffer op, values, rhs, residual;
   };
   std::vector<Level> levels;
+  /** All dense levels back to back, so one dispatch can cycle through them. */
+  Compute::Buffer dense_op, dense_values, dense_rhs, dense_residual, dense_table;
+  int first_dense = 0;
   /** Per voxel: cell type and neighbor links, packed by the classify_links kernel. */
   Compute::Buffer links;
 
@@ -129,12 +145,15 @@ struct SparseGasGpu::Impl {
     mg_prolong = KERNEL(mg_prolong);
     mg_build0 = KERNEL(mg_build0);
     mg_build = KERNEL(mg_build);
+    mg_dense_cycle = KERNEL(mg_dense_cycle);
 #undef KERNEL
   }
 
   ~Impl()
   {
-    for (Compute::Buffer *buffer : {&table, &coords, &types, &slot_map, &flags, &links}) {
+    for (Compute::Buffer *buffer : {&table, &coords, &types, &slot_map, &flags, &links, &dense_op,
+                                    &dense_values, &dense_rhs, &dense_residual, &dense_table})
+    {
       compute.destroy_buffer(*buffer);
     }
     for (Level &level : levels) {
@@ -161,6 +180,9 @@ struct SparseGasGpu::Impl {
 
   void destroy_level(Level &level)
   {
+    if (level.layout.dense) {
+      return;
+    }
     for (Compute::Buffer *buffer : {&level.op, &level.values, &level.rhs, &level.residual}) {
       compute.destroy_buffer(*buffer);
     }
@@ -180,18 +202,48 @@ struct SparseGasGpu::Impl {
     ensure(links, next.voxel_count() * sizeof(std::uint32_t));
 
     const std::vector<sparse::MultigridLevel> layout = sparse::multigrid_layout(next);
-    for (std::size_t i = layout.size(); i < levels.size(); ++i) {
-      destroy_level(levels[i]);
+    bool same_shape = layout.size() == levels.size();
+    for (std::size_t i = 0; same_shape && i < layout.size(); ++i) {
+      same_shape = layout[i].dense == levels[i].layout.dense;
     }
-    levels.resize(layout.size());
+    if (!same_shape) {
+      for (Level &level : levels) {
+        destroy_level(level);
+      }
+      levels.assign(layout.size(), {});
+    }
+    std::size_t dense_cells = 0;
+    int dense_levels = 0;
+    first_dense = static_cast<int>(layout.size());
     for (std::size_t i = 0; i < layout.size(); ++i) {
       Level &level = levels[i];
       level.layout = layout[i];
       level.cells = sparse::multigrid_cell_count(next, layout[i]);
-      ensure(level.op, level.cells * 4 * sizeof(float));
-      ensure(level.values, level.cells * sizeof(float));
-      ensure(level.rhs, level.cells * sizeof(float));
-      ensure(level.residual, level.cells * sizeof(float));
+      if (layout[i].dense) {
+        first_dense = std::min(first_dense, static_cast<int>(i));
+        level.offset = dense_cells;
+        dense_cells += level.cells;
+        ++dense_levels;
+      }
+      else {
+        ensure(level.op, level.cells * 4 * sizeof(float));
+        ensure(level.values, level.cells * sizeof(float));
+        ensure(level.rhs, level.cells * sizeof(float));
+        ensure(level.residual, level.cells * sizeof(float));
+      }
+    }
+    ensure(dense_op, dense_cells * 4 * sizeof(float));
+    ensure(dense_values, dense_cells * sizeof(float));
+    ensure(dense_rhs, dense_cells * sizeof(float));
+    ensure(dense_residual, dense_cells * sizeof(float));
+    ensure(dense_table, static_cast<std::size_t>(dense_levels) * 4 * sizeof(std::int32_t));
+    for (Level &level : levels) {
+      if (level.layout.dense) {
+        level.op = dense_op;
+        level.values = dense_values;
+        level.rhs = dense_rhs;
+        level.residual = dense_residual;
+      }
     }
   }
 
@@ -207,7 +259,9 @@ struct SparseGasGpu::Impl {
     out[0] = layout.dense ? layout.dims.x : 0;
     out[1] = layout.dense ? layout.dims.y : 0;
     out[2] = layout.dense ? layout.dims.z : 0;
-    out[3] = layout.dense ? 0 : layout.side;
+    out[3] = layout.dense ?
+                 -static_cast<std::int32_t>(levels[static_cast<std::size_t>(level)].offset) :
+                 layout.side;
   }
 
   std::size_t level_cells(const int level) const
@@ -283,8 +337,25 @@ struct SparseGasGpu::Impl {
       const int coarse_cycles = coarse < settings.multigrid_w_depth ?
                                     settings.multigrid_coarse_cycles :
                                     1;
-      for (int i = 0; i < coarse_cycles; ++i) {
-        self(self, coarse);
+      if (coarse == first_dense && settings.multigrid_w_depth <= first_dense) {
+        /* Every dense level takes plain V-cycles: run them all in one dispatch. */
+        const DenseCycleParams dense = {static_cast<std::int32_t>(levels.size()) - first_dense,
+                                        settings.multigrid_pre_sweeps,
+                                        settings.multigrid_post_sweeps,
+                                        settings.multigrid_coarsest_sweeps,
+                                        settings.multigrid_overcorrection};
+        compute.dispatch(mg_dense_cycle,
+                         &dense,
+                         sizeof(dense),
+                         {&dense_table, &dense_op, &dense_rhs, &dense_values, &dense_residual,
+                          nullptr, nullptr, nullptr},
+                         1,
+                         "mg dense levels");
+      }
+      else {
+        for (int i = 0; i < coarse_cycles; ++i) {
+          self(self, coarse);
+        }
       }
       MultigridParams up = multigrid_params(l, coarse, level_cells(l));
       up.scale = settings.multigrid_overcorrection;
@@ -323,6 +394,15 @@ struct SparseGasGpu::Impl {
                      {&table, &coords, &types, &links, nullptr, nullptr, nullptr, nullptr},
                      groups_for(topology.voxel_count()),
                      "classify");
+    std::vector<std::int32_t> dense_levels;
+    for (const Level &level : levels) {
+      if (level.layout.dense) {
+        dense_levels.insert(dense_levels.end(),
+                            {level.layout.dims.x, level.layout.dims.y, level.layout.dims.z,
+                             static_cast<std::int32_t>(level.offset)});
+      }
+    }
+    compute.upload(dense_table, dense_levels.data(), dense_levels.size() * sizeof(std::int32_t));
     /* Coarse operators, each from the level below it. */
     for (int i = 0; i < static_cast<int>(levels.size()); ++i) {
       const MultigridParams build = multigrid_params(i - 1, i, level_cells(i));

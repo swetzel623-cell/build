@@ -238,6 +238,30 @@ What this shows:
   gain perhaps two to three times. A solver that converges in far fewer passes (multigrid) is the
   larger gain and also fixes the accuracy problem.
 
+**Multigrid on the RTX 3070, first version** (one dispatch per sweep on every level):
+
+- Comparison mode, 64×64×96, 20 steps: passes; largest difference 9.1e-6.
+- 192×192×288, 40 steps, six cycles against 60 Jacobi sweeps:
+
+| | Multigrid | Jacobi |
+| --- | --- | --- |
+| Divergence left, relative to peak velocity | 4.5e-5 | 4.2e-2 |
+| Peak active bricks | 1111 | 4517 |
+| Median step, wall / GPU | 19.8 / 15.0 ms | 18.3 / 14.2 ms |
+| Last step, wall | 32.7 ms at 1099 bricks | 38.2 ms at 4517 bricks |
+
+  With the pressure converged the plume stays compact: a quarter of the bricks that the
+  unconverged Jacobi run activates. Per brick, though, this version was several times slower.
+- `--profile` at 192: smoothing on coarse levels 11.1 ms (56%), on the voxel level 3.3 ms (17%),
+  advection 1.3 ms. The coarse levels hold about a seventh of the cells, so nearly all of their
+  time is overhead: about 1,800 small dispatches per step at roughly 6 µs each.
+
+In response, all dense levels now live back to back in shared buffers and one dispatch runs
+their whole V-cycle: a single work group of 128 invocations shares each pass over a level and
+meets at a barrier between passes. That removes about 1,400 of the dispatches. On llvmpipe the
+results stay bit-identical and a 48×48×72 step fell from 478 ms to 299 ms. Not yet measured on a
+real GPU. The two levels stored per brick still take one dispatch per sweep.
+
 With the resident driver, on llvmpipe, every channel still equals the CPU reference bit for bit:
 32×32×48 over 12 steps, and 48×48×72 over 14 steps, where the active set grows from 64 to 160
 bricks and the channel buffers are replaced once.
@@ -255,9 +279,8 @@ bricks and the channel buffers are replaced once.
 - **The physics is not yet the dense node's.** Advection is first-order semi-Lagrangian, which is
   much more diffusive than the MacCormack scheme the Mantaflow node uses, and it spreads smoke
   into more bricks than necessary. There is no comparison against the Mantaflow engine yet.
-- **Multigrid on a real GPU is unmeasured.** A step with six cycles is several hundred small
-  dispatches on the coarse levels. On llvmpipe those dominate the step; whether dispatch overhead
-  matters on a real GPU is not known yet.
+- **Coarse-level dispatch overhead.** Measured on the RTX 3070 and partly addressed (see above);
+  the per-brick coarse levels still issue about 400 small dispatches per step.
 - **Aggregation multigrid converges slowly for a multigrid method** (0.31 per cycle). As a
   preconditioner for conjugate gradients it would do better, but that needs reductions on the
   device.
@@ -279,8 +302,8 @@ bricks and the channel buffers are replaced once.
 
 ## Next steps
 
-1. Measure multigrid on real GPUs with `--profile`, and reduce coarse-level dispatch cost if it
-   shows.
+1. Measure the single-dispatch dense cycle on real GPUs, and reduce the remaining per-brick
+   coarse-level dispatches if they still show.
 2. MacCormack advection and CFL substepping, then compare with the Mantaflow engine on a case
    where the active region covers the domain.
 3. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -72,9 +73,15 @@ double seconds_since(const std::chrono::steady_clock::time_point start)
 
 int main(int argc, char **argv)
 {
+  /* Write every line immediately, so a crash still shows how far the run got. */
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+  std::cout << std::unitbuf;
+
   const int resolution = argc > 1 ? std::atoi(argv[1]) : 32;
   const int steps = argc > 2 ? std::atoi(argv[2]) : 8;
 
+  std::cout << "Starting: resolution " << resolution << ", " << steps << " steps\n";
+  std::cout << "Creating the Vulkan device...\n";
   std::unique_ptr<gpu::SparseGasGpu> solver;
   try {
     solver = std::make_unique<gpu::SparseGasGpu>();
@@ -99,6 +106,7 @@ int main(int argc, char **argv)
 
   double cpu_seconds = 0.0, device_seconds = 0.0;
   for (int i = 0; i < steps; ++i) {
+    std::cout << "step " << i << ": running...\n";
     auto start = std::chrono::steady_clock::now();
     sparse::step(cpu, settings);
     cpu_seconds += seconds_since(start);

@@ -151,6 +151,38 @@ uploaded and downloaded the whole state every step and submitted and awaited abo
 separately. The resident driver above replaces it; its timings on a real GPU are still to be
 measured with `sparse_gas_gpu_tests <resolution> <steps> --bench`.
 
+**Resident driver on the RTX 3070** (same machine, CI-built binary, 60 Jacobi sweeps per step):
+
+- Comparison mode, 64×64×96, 20 steps: passes with the same round-off-level differences as
+  before (largest 7.3e-6). 7.3 ms per step including a full download every step for the
+  comparison, against 19.1 ms for the first driver.
+- `--bench`, 40 steps each, median per step:
+
+| Domain | Peak active bricks | Wall | GPU | Topology (CPU) |
+| --- | --- | --- | --- | --- |
+| 64×64×96 | 452 of 768 (59%) | 8.9 ms | 3.9 ms | 2.5 ms |
+| 128×128×192 | 1896 of 6144 (31%) | 18.3 ms | 8.0 ms | 8.1 ms |
+| 192×192×288 | 4517 of 20736 (22%) | 45.3 ms | 23.8 ms | 17.6 ms |
+
+  The last 192 step, with 2.3 million stored voxels, took 114 ms wall and 62 ms GPU.
+
+What this shows:
+
+- **The CPU topology rebuild is now as large as the GPU work.** It classifies every stored voxel
+  on the CPU, and the per-voxel cell types are then uploaded. The topology changed in 24 to 38 of
+  40 steps, so this cost is paid almost every step.
+- **The GPU work is several times above what memory bandwidth allows.** A rough estimate for one
+  Jacobi sweep over 2.3 million voxels is about 0.2 ms at the 3070's bandwidth, about 12 ms for
+  60 sweeps, against 62 ms measured for the whole step. Neighbor lookups through the brick table
+  and a full barrier after every dispatch are the likely causes; per-kernel timing is needed to
+  confirm.
+- **The active region grows quickly.** First-order advection diffuses smoke into neighboring
+  bricks, and the activity threshold is low. Over 40 steps the plume at 192 reached 22% of the
+  box.
+- These figures are not comparable with the Mantaflow node's timings: different machine,
+  different numerics (60 unconverged Jacobi sweeps against a converged multigrid solve,
+  first-order against MacCormack advection), and a different scene.
+
 With the resident driver, on llvmpipe, every channel still equals the CPU reference bit for bit:
 32×32×48 over 12 steps, and 48×48×72 over 14 steps, where the active set grows from 64 to 160
 bricks and the channel buffers are replaced once.
@@ -187,7 +219,8 @@ bricks and the channel buffers are replaced once.
 
 ## Next steps
 
-1. Measure the resident driver on real GPUs with `--bench`, and profile where GPU time goes.
+1. Classify cells on the GPU from the brick table, so the CPU only builds the brick table and
+   per-voxel cell types are no longer uploaded. Add per-kernel GPU timing.
 2. Replace Jacobi with a multigrid-preconditioned or multigrid solver over the brick hierarchy,
    with GPU reductions.
 3. MacCormack advection and CFL substepping, then compare with the Mantaflow engine on a case

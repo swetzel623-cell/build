@@ -71,38 +71,34 @@ double seconds_since(const std::chrono::steady_clock::time_point start)
 
 }  // namespace
 
-int main(int argc, char **argv)
+double median(std::vector<double> values)
 {
-  /* Write every line immediately, so a crash still shows how far the run got. */
-  std::setvbuf(stdout, nullptr, _IONBF, 0);
-  std::cout << std::unitbuf;
-
-  const int resolution = argc > 1 ? std::atoi(argv[1]) : 32;
-  const int steps = argc > 2 ? std::atoi(argv[2]) : 8;
-
-  std::cout << "Starting: resolution " << resolution << ", " << steps << " steps\n";
-  std::cout << "Creating the Vulkan device...\n";
-  std::unique_ptr<gpu::SparseGasGpu> solver;
-  try {
-    solver = std::make_unique<gpu::SparseGasGpu>();
+  if (values.empty()) {
+    return 0.0;
   }
-  catch (const std::exception &error) {
-    std::cout << "SKIP: " << error.what() << '\n';
-    return 77;
-  }
-  std::cout << "Vulkan device: " << solver->device_name()
-            << (solver->is_software_device() ? " (software)" : "") << '\n';
+  std::sort(values.begin(), values.end());
+  return values[values.size() / 2];
+}
 
+sparse::Settings test_settings(const int resolution)
+{
   sparse::Settings settings;
   settings.gravity[2] = -9.81f * resolution / 2.0f;
   settings.heat_buoyancy = 0.5f;
   settings.density_buoyancy = 0.5f;
   settings.pressure_solver = sparse::PressureSolver::Jacobi;
   settings.pressure_iterations = 60;
+  return settings;
+}
 
+/** Step the device and the CPU reference side by side and compare every channel each step. */
+int compare(gpu::SparseGasGpu &solver, const int resolution, const int steps)
+{
+  const sparse::Settings settings = test_settings(resolution);
   const sparse::Extent extent = {resolution, resolution, resolution * 3 / 2};
   sparse::State cpu = sparse::from_dense(blob(extent), 8, settings.thresholds, settings.dilation);
-  sparse::State device = cpu;
+  solver.upload(cpu);
+  sparse::State device;
 
   double cpu_seconds = 0.0, device_seconds = 0.0;
   for (int i = 0; i < steps; ++i) {
@@ -111,8 +107,9 @@ int main(int argc, char **argv)
     sparse::step(cpu, settings);
     cpu_seconds += seconds_since(start);
     start = std::chrono::steady_clock::now();
-    const sparse::StepInfo info = solver->step(device, settings);
+    const sparse::StepInfo info = solver.step(settings);
     device_seconds += seconds_since(start);
+    solver.download(device);
 
     if (cpu.topology.brick_table != device.topology.brick_table) {
       std::cout << "FAIL: topologies diverged at step " << i << '\n';
@@ -137,7 +134,90 @@ int main(int argc, char **argv)
     return 1;
   }
   std::cout << "CPU reference " << cpu_seconds / steps * 1000.0 << " ms/step, device "
-            << device_seconds / steps * 1000.0 << " ms/step (includes upload and download)\n";
+            << device_seconds / steps * 1000.0 << " ms/step (state kept on the device)\n";
   std::cout << "PASS: device kernels match the CPU reference\n";
   return 0;
+}
+
+/** Time the device alone. The state stays on the device until the end. */
+int benchmark(gpu::SparseGasGpu &solver, const int resolution, const int steps)
+{
+  const sparse::Settings settings = test_settings(resolution);
+  const sparse::Extent extent = {resolution, resolution, resolution * 3 / 2};
+  sparse::State state = sparse::from_dense(blob(extent), 8, settings.thresholds, settings.dilation);
+  const std::size_t total_bricks = state.topology.brick_table.size();
+  solver.upload(state);
+
+  std::vector<double> wall, gpu_time, topology;
+  std::size_t peak_bricks = 0;
+  int changes = 0;
+  for (int i = 0; i < steps; ++i) {
+    const sparse::StepInfo info = solver.step(settings);
+    const gpu::SparseGasGpu::Timing &timing = solver.last_timing();
+    wall.push_back(timing.wall_ms);
+    gpu_time.push_back(timing.gpu_ms);
+    topology.push_back(timing.topology_ms);
+    peak_bricks = std::max(peak_bricks, info.active_bricks);
+    changes += timing.topology_changed;
+    std::cout << "step " << i << ": " << info.active_bricks << " bricks, wall " << timing.wall_ms
+              << " ms, GPU " << timing.gpu_ms << " ms\n";
+  }
+  solver.download(state);
+  for (const float value : state.density) {
+    if (!std::isfinite(value)) {
+      std::cout << "FAIL: non-finite density\n";
+      return 1;
+    }
+  }
+  std::cout << "Domain " << extent.x << "x" << extent.y << "x" << extent.z << ", peak "
+            << peak_bricks << " of " << total_bricks << " bricks active, topology changed in "
+            << changes << " of " << steps << " steps\n";
+  std::cout << "Median per step: wall " << median(wall) << " ms, GPU "
+            << (solver.has_timestamps() ? median(gpu_time) : -1.0) << " ms, topology (CPU) "
+            << median(topology) << " ms\n";
+  std::cout << "DONE: benchmark (no correctness check in this mode)\n";
+  return 0;
+}
+
+int main(int argc, char **argv)
+{
+  /* Write every line immediately, so a crash still shows how far the run got. */
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+  std::cout << std::unitbuf;
+
+  bool bench = false;
+  std::vector<int> numbers;
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--bench") {
+      bench = true;
+    }
+    else {
+      numbers.push_back(std::atoi(argv[i]));
+    }
+  }
+  const int resolution = numbers.size() > 0 ? numbers[0] : 32;
+  const int steps = numbers.size() > 1 ? numbers[1] : 8;
+
+  std::cout << "Starting: resolution " << resolution << ", " << steps << " steps"
+            << (bench ? ", benchmark" : "") << '\n';
+  std::cout << "Creating the Vulkan device...\n";
+  std::unique_ptr<gpu::SparseGasGpu> solver;
+  try {
+    solver = std::make_unique<gpu::SparseGasGpu>();
+  }
+  catch (const std::exception &error) {
+    std::cout << "SKIP: " << error.what() << '\n';
+    return 77;
+  }
+  std::cout << "Vulkan device: " << solver->device_name()
+            << (solver->is_software_device() ? " (software)" : "")
+            << (solver->has_timestamps() ? "" : " (no GPU timestamps)") << '\n';
+
+  try {
+    return bench ? benchmark(*solver, resolution, steps) : compare(*solver, resolution, steps);
+  }
+  catch (const std::exception &error) {
+    std::cout << "FAIL: " << error.what() << '\n';
+    return 1;
+  }
 }

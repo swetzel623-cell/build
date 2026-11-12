@@ -60,7 +60,7 @@ if(MANTA_IMPROVE_BUILD_GPU)
     set(MANTA_IMPROVE_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
     file(MAKE_DIRECTORY "${MANTA_IMPROVE_SHADER_DIR}")
     set(MANTA_IMPROVE_SHADER_HEADERS)
-    foreach(KERNEL advect buoyancy walls divergence jacobi gradient)
+    foreach(KERNEL advect buoyancy walls divergence jacobi gradient activity remap)
       set(SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/${KERNEL}.comp")
       set(SHADER_HEADER "${MANTA_IMPROVE_SHADER_DIR}/${KERNEL}.comp.h")
       add_custom_command(
@@ -84,15 +84,14 @@ if(MANTA_IMPROVE_BUILD_GPU)
     )
     target_link_libraries(manta_improve_sparse_gpu PUBLIC manta_improve_sparse Vulkan::Vulkan)
     if(NOT MSVC)
-      target_compile_options(
-        manta_improve_sparse_gpu PRIVATE -Wall -Wextra -Wno-missing-field-initializers
-      )
+      target_compile_options(manta_improve_sparse_gpu PRIVATE -Wall -Wextra)
     endif()
 
     if(BUILD_TESTING)
       add_executable(sparse_gas_gpu_tests tests/sparse_gas_gpu_tests.cpp)
       target_link_libraries(sparse_gas_gpu_tests PRIVATE manta_improve_sparse_gpu)
-      add_test(NAME sparse_gas_gpu_tests COMMAND sparse_gas_gpu_tests)
+      # 48 voxels and 10 steps make the active set outgrow its first allocation.
+      add_test(NAME sparse_gas_gpu_tests COMMAND sparse_gas_gpu_tests 48 10)
       set_tests_properties(sparse_gas_gpu_tests PROPERTIES SKIP_RETURN_CODE 77)
     endif()
   else()

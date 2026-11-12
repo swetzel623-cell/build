@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-// Minimal Vulkan compute runner: storage buffers and one-dispatch-at-a-time kernels.
+// Minimal Vulkan compute runner for the sparse solver's kernels.
 //
-// This is test scaffolding for running the sparse solver's GLSL kernels on any Vulkan device,
-// including software implementations. It is not tuned: buffers are host-visible and every
-// dispatch is submitted and waited for on its own.
+// Storage buffers live in device memory. Work is recorded between begin() and submit() into one
+// command buffer, with a full memory barrier after every command, and submitted once. Uploads and
+// downloads go through temporary host-visible staging buffers. The GPU time of each submission is
+// measured with timestamp queries where the device supports them.
 
 #include <array>
 #include <cstddef>
@@ -15,17 +16,19 @@
 
 namespace manta_improve::gpu {
 
-/** Number of storage-buffer bindings every kernel declares. */
-constexpr std::size_t binding_count = 9;
+/** Kernels see storage buffers at bindings 1 to 8. */
+constexpr std::size_t binding_count = 8;
+/** Every kernel receives up to this many bytes of push constants. */
+constexpr std::size_t push_constant_bytes = 48;
 
 class Compute {
  public:
   struct Buffer {
-    void *mapped = nullptr;
-    std::size_t size = 0;
     std::uint64_t handle = 0;
     std::uint64_t memory = 0;
+    std::size_t size = 0;
   };
+  using Bindings = std::array<const Buffer *, binding_count>;
 
   /** Throws std::runtime_error if no Vulkan device with a compute queue is available. */
   Compute();
@@ -36,17 +39,35 @@ class Compute {
   const std::string &device_name() const;
   /** True for software implementations such as llvmpipe. */
   bool is_software_device() const;
+  /** True if submit() can report GPU execution time. */
+  bool has_timestamps() const;
 
+  /** A device-memory storage buffer. Must not be called between begin() and submit(). */
   Buffer create_buffer(std::size_t bytes);
+  /** Must not be called between begin() and submit(). */
   void destroy_buffer(Buffer &buffer);
 
   /** Compile a SPIR-V compute shader into a kernel and return its id. */
   int create_kernel(const std::uint32_t *spirv, std::size_t word_count);
 
-  /** Run a kernel over `group_count` work groups. Null entries bind a dummy buffer. */
+  void begin();
+  /** Copy `bytes` from host memory into the start of `target` when the work is submitted. */
+  void upload(const Buffer &target, const void *data, std::size_t bytes);
+  /** Copy the start of `source` into `out` once submit() returns. */
+  void download(const Buffer &source, void *out, std::size_t bytes);
+  /** Set every 32-bit word of `target` to `value`. */
+  void fill(const Buffer &target, std::uint32_t value);
+  /** Run a kernel over `group_count` work groups. Null bindings receive a dummy buffer. */
   void dispatch(int kernel,
-                const std::array<const Buffer *, binding_count> &buffers,
+                const void *push_constants,
+                std::size_t push_bytes,
+                const Bindings &buffers,
                 std::uint32_t group_count);
+  /**
+   * Submit the recorded work, wait for it, and complete the downloads. Returns the GPU execution
+   * time in milliseconds, or a negative value if the device has no usable timestamps.
+   */
+  double submit();
 
  private:
   struct Impl;

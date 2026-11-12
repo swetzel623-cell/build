@@ -82,8 +82,9 @@ correctness reference for the physics.
 | --- | --- |
 | Topology, state, dense conversion, CPU reference kernels and step | `include/manta_improve/sparse_gas.hpp`, `src/sparse_gas.cpp` |
 | GLSL compute kernels: advect, buoyancy, walls, divergence, jacobi, gradient | `gpu/shaders/` |
-| Minimal Vulkan compute runner (test scaffolding) | `gpu/vulkan_compute.*` |
-| Step driver that runs the kernels on a Vulkan device | `gpu/sparse_gas_gpu.*` |
+| GLSL kernels for the active-region test and for moving channels onto a new topology | `gpu/shaders/activity.comp`, `gpu/shaders/remap.comp` |
+| Vulkan compute runner: device-memory buffers, batched recording, GPU timestamps | `gpu/vulkan_compute.*` |
+| Driver that keeps the state on the device and runs each step | `gpu/sparse_gas_gpu.*` |
 | CPU tests | `tests/sparse_gas_tests.cpp` |
 | GPU-versus-CPU test and timing | `tests/sparse_gas_gpu_tests.cpp` |
 
@@ -96,6 +97,16 @@ topology and uploaded.
 **The step.** Rebuild topology from the current values, advect density, temperature, and the
 three velocity components, add heat and density buoyancy, zero wall faces, solve pressure, subtract
 its gradient. Buoyancy and the wall rule follow Mantaflow's operators.
+
+**The device driver.** The state stays in device memory between steps; `upload()` and
+`download()` are the only full transfers. A step is two submissions. The first runs the activity
+kernel and downloads one flag per brick, 4 bytes per active brick. The CPU builds the next
+topology from those flags with the same code as the reference. The second submission uploads the
+topology tables and a slot map if the topology changed, moves the six state channels onto it with
+the remap kernel, and runs the whole step. Every command is followed by a full memory barrier.
+Descriptor sets are cached per combination of buffers, and parameters are push constants. Channel
+buffers are allocated with 50% headroom and replaced when the active set outgrows them. GPU time
+is measured with timestamp queries around each submission.
 
 **Pressure.** The system is the 7-point Poisson matrix over fluid cells with Neumann conditions at
 walls and Dirichlet zero at open cells. The CPU reference has Jacobi-preconditioned CG and plain
@@ -135,9 +146,14 @@ buffer layout, and the driver.
 - 19.1 ms per step on the device path against 482 ms per step for the CPU reference.
 
 That timing ratio is **not** a measure of the solver's speed. The CPU reference is deliberately
-simple and single-threaded, and is not the Mantaflow engine. The 19.1 ms includes topology
-rebuilding on the CPU, uploading and downloading the whole state, a CPU divergence check, and
-about 70 separately submitted and awaited dispatches. How much of it is GPU work is unknown.
+simple and single-threaded, and is not the Mantaflow engine. That run used the first driver, which
+uploaded and downloaded the whole state every step and submitted and awaited about 70 dispatches
+separately. The resident driver above replaces it; its timings on a real GPU are still to be
+measured with `sparse_gas_gpu_tests <resolution> <steps> --bench`.
+
+With the resident driver, on llvmpipe, every channel still equals the CPU reference bit for bit:
+32×32×48 over 12 steps, and 48×48×72 over 14 steps, where the active set grows from 64 to 160
+bricks and the channel buffers are replaced once.
 
 ## Not verified, and known gaps
 
@@ -146,6 +162,9 @@ about 70 separately submitted and awaited dispatches. How much of it is GPU work
   so a fair comparison needs matched numerics first. The driver is also not written for speed: buffers
   are host-visible, every dispatch is submitted and waited for separately, and the whole state is
   uploaded and downloaded every step.
+- **The driver is not tuned.** Every command is followed by a full barrier, kernels use 64-thread
+  groups over a flat voxel range, neighbors are found through the brick table, and staging buffers
+  are allocated per transfer. None of this has been profiled.
 - **The physics is not yet the dense node's.** Advection is first-order semi-Lagrangian, which is
   much more diffusive than the MacCormack scheme the Mantaflow node uses, and it spreads smoke
   into more bricks than necessary. There is no comparison against the Mantaflow engine yet.
@@ -168,12 +187,10 @@ about 70 separately submitted and awaited dispatches. How much of it is GPU work
 
 ## Next steps
 
-1. Time the GPU work separately from the CPU-side work in the driver.
-2. Make the driver fair to the GPU: device-local buffers, one command buffer per step, state kept
-   on the device between steps.
-3. Replace Jacobi with a multigrid-preconditioned or multigrid solver over the brick hierarchy,
+1. Measure the resident driver on real GPUs with `--bench`, and profile where GPU time goes.
+2. Replace Jacobi with a multigrid-preconditioned or multigrid solver over the brick hierarchy,
    with GPU reductions.
-4. MacCormack advection and CFL substepping, then compare with the Mantaflow engine on a case
+3. MacCormack advection and CFL substepping, then compare with the Mantaflow engine on a case
    where the active region covers the domain.
-5. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind
+4. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind
    the existing node, with the CPU reference as fallback.

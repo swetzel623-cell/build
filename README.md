@@ -74,6 +74,13 @@ a machine with a Vulkan-capable GPU, this runs them against the CPU reference an
 ./build/sparse_gas_gpu_tests 64 20
 ```
 
+Add `--bench` to time the GPU path alone, with the state kept on the device and no CPU
+comparison:
+
+```sh
+./build/sparse_gas_gpu_tests 128 30 --bench
+```
+
 Run the activity-mask microbenchmark with defaults:
 
 ```sh

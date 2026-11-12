@@ -4,7 +4,7 @@
 
 layout(local_size_x = 64) in;
 
-layout(std430, binding = 0) readonly buffer Params
+layout(push_constant) uniform Params
 {
   ivec4 extent; /* Domain size in voxels; w is the brick size. */
   ivec4 bricks; /* Brick grid size; w is the number of stored voxels. */

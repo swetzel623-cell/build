@@ -416,6 +416,37 @@ void test_advance_takes_cfl_substeps()
   require(failed, "exhausting the substep limit must fail");
 }
 
+/**
+ * The default CFL number must keep most of a fast plume's smoke. Semi-Lagrangian tracing loses
+ * mass when a step moves smoke several voxels through an accelerating flow, which is what limits
+ * the step size; see "Fewer substeps" in docs/gpu-sparse-solver.md.
+ */
+void test_default_cfl_keeps_mass()
+{
+  const DenseFields initial = blob({32, 32, 48}, 16.0f, 16.0f, 8.0f, 4.0f);
+  const double initial_mass = sum(initial.density);
+  const auto kept = [&](const float cfl) {
+    Settings settings = plume_settings();
+    settings.pressure_solver = PressureSolver::Multigrid;
+    settings.pressure_iterations = 6;
+    settings.cfl = cfl;
+    State state = from_dense(initial, 8, settings.thresholds, settings.dilation);
+    int substeps = 0;
+    for (int i = 0; i < 6; ++i) {
+      /* Long frames, so that the limit and not the frame length sets the step. */
+      substeps += advance(state, settings, 1.0f / 8.0f).substeps;
+    }
+    const double fraction = sum(to_dense(state).density) / initial_mass;
+    std::cout << "  CFL " << cfl << ": " << substeps << " substeps, mass kept " << fraction << '\n';
+    return fraction;
+  };
+  const double at_default = kept(Settings().cfl);
+  const double at_four = kept(4.0f);
+  require(at_default > 0.65, "the default CFL number lost too much smoke");
+  require(at_default < 1.1, "the default CFL number created smoke");
+  require(at_four < at_default - 0.1, "a larger CFL number was expected to lose more smoke");
+}
+
 }  // namespace
 
 int main()
@@ -431,6 +462,7 @@ int main()
       {"multigrid converges", test_multigrid_converges},
       {"MacCormack is sharper and bounded", test_maccormack_is_sharper_and_bounded},
       {"advance takes CFL substeps", test_advance_takes_cfl_substeps},
+      {"default CFL keeps mass", test_default_cfl_keeps_mass},
   };
   for (const auto &[name, test] : tests) {
     test();

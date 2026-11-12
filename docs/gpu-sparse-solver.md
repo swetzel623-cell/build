@@ -377,6 +377,39 @@ levels are paid for by count. Measured on the CPU reference, on a developed 96×
   for bit. Together with the new default, a substep at 192×192×288 goes from about 1014
   dispatches to about 550. Its effect on the RTX 3070 is not measured yet.
 
+**Fewer substeps (larger CFL number): not adopted.** Blender's Mantaflow domain defaults to a
+CFL number of 4; this solver uses 2. Measured on the CPU reference, a 48×48×72 plume, multigrid,
+MacCormack, 7 frames of 1/8 s (long frames, so the limit sets the step and not the frame
+length), initial mass 895:
+
+| CFL | Substeps | Mass kept | Peak density | Density difference from CFL 0.5 (relative L2) |
+|---|---|---|---|---|
+| 0.5 | 100 | 92% | 0.87 | 0 |
+| 1 | 48 | 88% | 0.87 | 0.46 |
+| 2 (default) | 25 | 92% | 0.81 | 0.80 |
+| 3 | 17 | 63% | 0.78 | 0.80 |
+| 4 | 12 | 53% | 0.73 | 0.85 |
+| 6 | 11 | 44% | 0.76 | 0.99 |
+| 8 | 7 | 34% | 0.93 | 1.09 |
+
+- **Above 2 voxels per step the plume loses smoke quickly**: about a third at 3 and half at 4.
+  Up to 2 the mass stays within a few percent of the small-step run.
+- **It is not the sparse layout.** A dilation of two bricks gives the same loss (51% kept at
+  CFL 4), so smoke is not outrunning the active region. First-order advection loses more at
+  every CFL number (60% kept at 2, 30% at 4). The loss comes from the single-stage backward
+  trace through a strongly accelerating flow.
+- The density fields differ a lot point by point even between CFL 0.5 and 1. The plume is thin
+  and rolls up, so this measure mostly reports that the fields are shifted; mass, height
+  (within 4% up to CFL 4), and peak density are the usable comparisons.
+- With normal frames of 1/30 s at this resolution the plume moves about 2 voxels per frame, and
+  every CFL number from 3 up takes one step per frame; the question only arises at higher
+  resolution or speed.
+
+The default therefore stays at 2, and a CPU test now requires the default to keep at least 65%
+of a small fast plume's mass (it keeps 76%, against 58% at CFL 4). A larger step needs a more accurate trace (for example a midpoint
+trace) first; that is not implemented. Whether Mantaflow loses mass the same way at its
+default of 4 has not been checked.
+
 ## Not verified, and known gaps
 
 - **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.
@@ -412,8 +445,10 @@ levels are paid for by count. Measured on the CPU reference, on a developed 96×
 
 ## Next steps
 
-1. Measure multigrid at larger sizes, where dispatch overhead should matter less, before
-   tuning it further.
-2. Compare with the Mantaflow engine on a case where the active region covers the domain.
-3. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind
+1. Measure the dispatch-cutting change on the RTX 3070.
+2. A midpoint (second-order) backward trace, then repeat the CFL measurement: if mass holds at
+   4 voxels per step, frames need about half the substeps.
+3. Measure multigrid at larger sizes, where dispatch overhead should matter less.
+4. Compare with the Mantaflow engine on a case where the active region covers the domain.
+5. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind
    the existing node, with the CPU reference as fallback.

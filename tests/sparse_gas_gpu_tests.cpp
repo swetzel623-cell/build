@@ -94,6 +94,7 @@ bool first_order = false;
 float cfl = -1.0f;
 constexpr float frame_time = 1.0f / 30.0f;
 int multigrid_w_depth = -1;
+int coarse_pre_sweeps = -1, coarse_post_sweeps = -1;
 
 sparse::Settings test_settings(const int resolution)
 {
@@ -116,6 +117,10 @@ sparse::Settings test_settings(const int resolution)
     settings.pressure_iterations = 6;
     if (multigrid_w_depth >= 0) {
       settings.multigrid_w_depth = multigrid_w_depth;
+    }
+    if (coarse_pre_sweeps >= 0) {
+      settings.multigrid_coarse_pre_sweeps = coarse_pre_sweeps;
+      settings.multigrid_coarse_post_sweeps = coarse_post_sweeps;
     }
   }
   return settings;
@@ -279,6 +284,10 @@ int main(int argc, char **argv)
     else if (std::string(argv[i]) == "--w-depth" && i + 1 < argc) {
       multigrid_w_depth = std::atoi(argv[++i]);
     }
+    else if (std::string(argv[i]) == "--coarse-sweeps" && i + 2 < argc) {
+      coarse_pre_sweeps = std::atoi(argv[++i]);
+      coarse_post_sweeps = std::atoi(argv[++i]);
+    }
     else if (std::string(argv[i]) == "--profile") {
       bench = true;
       profile = true;
@@ -313,6 +322,10 @@ int main(int argc, char **argv)
   }
   if (multigrid_w_depth >= 0) {
     std::cout << "Multigrid W-cycle depth: " << multigrid_w_depth << '\n';
+  }
+  if (coarse_pre_sweeps >= 0) {
+    std::cout << "Multigrid coarse sweeps: " << coarse_pre_sweeps << " before, "
+              << coarse_post_sweeps << " after\n";
   }
   try {
     return bench ? benchmark(*solver, resolution, steps, profile) :

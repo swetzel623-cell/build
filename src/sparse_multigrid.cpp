@@ -262,7 +262,12 @@ template<typename View> void v_cycle(const Topology &topology,
     }
     return;
   }
-  for (int i = 0; i < settings.multigrid_pre_sweeps; ++i) {
+  const bool finest = coarse_level == 0;
+  const int pre_sweeps = finest ? settings.multigrid_pre_sweeps :
+                                  settings.multigrid_coarse_pre_sweeps;
+  const int post_sweeps = finest ? settings.multigrid_post_sweeps :
+                                   settings.multigrid_coarse_post_sweeps;
+  for (int i = 0; i < pre_sweeps; ++i) {
     smooth(view, rhs, values);
   }
   residual(view, rhs, values, scratch);
@@ -281,7 +286,7 @@ template<typename View> void v_cycle(const Topology &topology,
   }
   prolong(view, coarse, next.values, settings.multigrid_overcorrection, values);
 
-  for (int i = 0; i < settings.multigrid_post_sweeps; ++i) {
+  for (int i = 0; i < post_sweeps; ++i) {
     smooth(view, rhs, values);
   }
 }

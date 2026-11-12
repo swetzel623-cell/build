@@ -61,7 +61,7 @@ if(MANTA_IMPROVE_BUILD_GPU)
     file(MAKE_DIRECTORY "${MANTA_IMPROVE_SHADER_DIR}")
     set(MANTA_IMPROVE_SHADER_HEADERS)
     foreach(KERNEL advect maccormack buoyancy walls divergence jacobi gradient activity remap classify
-            classify_links mask_pressure mg_smooth0 mg_residual0 mg_smooth mg_residual mg_restrict mg_prolong0 mg_prolong mg_build0 mg_build mg_dense_cycle)
+            classify_links mask_pressure mg_smooth0 mg_restrict0 mg_smooth mg_restrict mg_prolong0 mg_prolong mg_build0 mg_build mg_dense_cycle)
       set(SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/${KERNEL}.comp")
       set(SHADER_HEADER "${MANTA_IMPROVE_SHADER_DIR}/${KERNEL}.comp.h")
       add_custom_command(
@@ -99,8 +99,12 @@ if(MANTA_IMPROVE_BUILD_GPU)
                COMMAND sparse_gas_gpu_tests 32 6 --jacobi --first-order)
       # A low CFL number forces several substeps per frame.
       add_test(NAME sparse_gas_gpu_substep_tests COMMAND sparse_gas_gpu_tests 32 8 --cfl 0.5)
+      # The deeper W-cycle and uneven coarse sweeps are not the defaults; keep them covered.
+      add_test(NAME sparse_gas_gpu_wcycle_tests
+               COMMAND sparse_gas_gpu_tests 32 6 --w-depth 2 --coarse-sweeps 1 2)
       set_tests_properties(
         sparse_gas_gpu_tests sparse_gas_gpu_jacobi_tests sparse_gas_gpu_substep_tests
+        sparse_gas_gpu_wcycle_tests
         PROPERTIES SKIP_RETURN_CODE 77
       )
     endif()

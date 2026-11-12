@@ -158,11 +158,21 @@ struct Settings {
   /** Multigrid: red-black sweeps before and after each coarse correction, and on the last level. */
   int multigrid_pre_sweeps = 2;
   int multigrid_post_sweeps = 2;
+  /**
+   * Multigrid: sweeps before and after the correction on the coarse levels. Coarse sweeps cost
+   * little work but two dispatches each on a GPU, where the dispatch count bounds the solve.
+   */
+  int multigrid_coarse_pre_sweeps = 2;
+  int multigrid_coarse_post_sweeps = 2;
   int multigrid_coarsest_sweeps = 8;
   /** Multigrid: recursive cycles per coarse solve. 1 is a V-cycle, 2 a W-cycle. */
   int multigrid_coarse_cycles = 2;
-  /** Multigrid: how many of the finest coarse levels are solved with `multigrid_coarse_cycles`. */
-  int multigrid_w_depth = 2;
+  /**
+   * Multigrid: how many of the finest coarse levels are solved with `multigrid_coarse_cycles`.
+   * Every further level doubles the visits to all levels below it. 1 costs about 40% fewer GPU
+   * dispatches than 2 and converges almost as fast per cycle (0.34 against 0.31).
+   */
+  int multigrid_w_depth = 1;
   /** Multigrid: factor applied to coarse corrections; aggregation underestimates them. */
   float multigrid_overcorrection = 1.4f;
 

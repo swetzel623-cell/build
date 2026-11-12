@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: MIT
+// From the voxel level to the first coarse level: sum the residuals of the 2x2x2 voxels under
+// each coarse cell into its right-hand side, and start the coarse unknown at zero. The residual
+// is computed here, not in a pass of its own, which saves a dispatch and a buffer.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "mg_common.glsl"
+layout(std430, binding = 3) readonly buffer Links { uint links[]; };
+layout(std430, binding = 4) readonly buffer Rhs { float rhs[]; };
+layout(std430, binding = 5) readonly buffer Values { float x[]; };
+layout(std430, binding = 6) writeonly buffer CoarseRhs { float coarse_rhs[]; };
+layout(std430, binding = 7) writeonly buffer CoarseValues { float coarse_x[]; };
+
+float fine_residual(int index, ivec3 c)
+{
+  uint packed = links[index];
+  if (!fine_is_fluid(packed)) {
+    return 0.0;
+  }
+  float sum = 0.0;
+  for (int axis = 0; axis < 3; ++axis) {
+    if (fine_linked(packed, 2 * axis)) {
+      sum += x[level_index(P.la, c - AXES[axis])];
+    }
+    if (fine_linked(packed, 2 * axis + 1)) {
+      sum += x[level_index(P.la, c + AXES[axis])];
+    }
+  }
+  return rhs[index] - (fine_diagonal(packed) * x[index] - sum);
+}
+
+void main()
+{
+  int index;
+  if (!cell_in_range(P.lb, index)) {
+    return;
+  }
+  ivec3 c = level_coords(P.lb, index);
+  float sum = 0.0;
+  for (int child = 0; child < 8; ++child) {
+    ivec3 fine = 2 * c + ivec3(child & 1, (child >> 1) & 1, (child >> 2) & 1);
+    int i = level_index(P.la, fine);
+    sum += i < 0 ? 0.0 : fine_residual(i, fine);
+  }
+  coarse_rhs[index] = sum;
+  coarse_x[index] = 0.0;
+}

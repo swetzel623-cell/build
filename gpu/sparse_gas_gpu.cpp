@@ -10,9 +10,8 @@
 #include "classify_links.comp.h"
 #include "mask_pressure.comp.h"
 #include "mg_smooth0.comp.h"
-#include "mg_residual0.comp.h"
+#include "mg_restrict0.comp.h"
 #include "mg_smooth.comp.h"
-#include "mg_residual.comp.h"
 #include "mg_restrict.comp.h"
 #include "mg_prolong0.comp.h"
 #include "mg_prolong.comp.h"
@@ -96,7 +95,7 @@ std::uint32_t groups_for(const std::size_t count)
 struct SparseGasGpu::Impl {
   Compute compute;
   int advect, maccormack, buoyancy, walls, divergence, jacobi, gradient, activity, remap, classify;
-  int classify_links, mask_pressure, mg_smooth0, mg_residual0, mg_smooth, mg_residual;
+  int classify_links, mask_pressure, mg_smooth0, mg_restrict0, mg_smooth;
   int mg_restrict, mg_prolong0, mg_prolong, mg_build0, mg_build, mg_dense_cycle;
 
   /** One coarse multigrid level on the device. */
@@ -106,7 +105,7 @@ struct SparseGasGpu::Impl {
     /** Dense levels: first cell in the buffers all dense levels share. */
     std::size_t offset = 0;
     /** Owned by the level if it is stored per brick; copies of the shared buffers if dense. */
-    Compute::Buffer op, values, rhs, residual;
+    Compute::Buffer op, values, rhs;
   };
   std::vector<Level> levels;
   /** All dense levels back to back, so one dispatch can cycle through them. */
@@ -145,9 +144,8 @@ struct SparseGasGpu::Impl {
     classify_links = KERNEL(classify_links);
     mask_pressure = KERNEL(mask_pressure);
     mg_smooth0 = KERNEL(mg_smooth0);
-    mg_residual0 = KERNEL(mg_residual0);
+    mg_restrict0 = KERNEL(mg_restrict0);
     mg_smooth = KERNEL(mg_smooth);
-    mg_residual = KERNEL(mg_residual);
     mg_restrict = KERNEL(mg_restrict);
     mg_prolong0 = KERNEL(mg_prolong0);
     mg_prolong = KERNEL(mg_prolong);
@@ -192,7 +190,7 @@ struct SparseGasGpu::Impl {
     if (level.layout.dense) {
       return;
     }
-    for (Compute::Buffer *buffer : {&level.op, &level.values, &level.rhs, &level.residual}) {
+    for (Compute::Buffer *buffer : {&level.op, &level.values, &level.rhs}) {
       compute.destroy_buffer(*buffer);
     }
   }
@@ -239,7 +237,6 @@ struct SparseGasGpu::Impl {
         ensure(level.op, level.cells * 4 * sizeof(float));
         ensure(level.values, level.cells * sizeof(float));
         ensure(level.rhs, level.cells * sizeof(float));
-        ensure(level.residual, level.cells * sizeof(float));
       }
     }
     first_single = static_cast<int>(layout.size());
@@ -259,7 +256,6 @@ struct SparseGasGpu::Impl {
         level.op = dense_op;
         level.values = dense_values;
         level.rhs = dense_rhs;
-        level.residual = dense_residual;
       }
     }
   }
@@ -299,8 +295,7 @@ struct SparseGasGpu::Impl {
   }
 
   /** Run V/W-cycles on the device; mirrors v_cycle in src/sparse_multigrid.cpp. */
-  void record_multigrid(const sparse::Settings &settings, const int rhs_channel,
-                        const int residual_channel)
+  void record_multigrid(const sparse::Settings &settings, const int rhs_channel)
   {
     const auto op = [&](const int l) -> const Compute::Buffer & {
       return l < 0 ? links : levels[static_cast<std::size_t>(l)].op;
@@ -310,9 +305,6 @@ struct SparseGasGpu::Impl {
     };
     const auto rhs = [&](const int l) -> const Compute::Buffer & {
       return l < 0 ? channel(rhs_channel) : levels[static_cast<std::size_t>(l)].rhs;
-    };
-    const auto residual = [&](const int l) -> const Compute::Buffer & {
-      return l < 0 ? channel(residual_channel) : levels[static_cast<std::size_t>(l)].residual;
     };
     const auto smooth = [&](const int l, const int sweeps) {
       MultigridParams p = multigrid_params(l, -1, level_cells(l));
@@ -334,23 +326,17 @@ struct SparseGasGpu::Impl {
         smooth(l, settings.multigrid_coarsest_sweeps);
         return;
       }
-      smooth(l, settings.multigrid_pre_sweeps);
-      const MultigridParams here = multigrid_params(l, -1, level_cells(l));
-      compute.dispatch(l < 0 ? mg_residual0 : mg_residual,
-                       &here,
-                       sizeof(here),
-                       {&table, &coords, &op(l), &rhs(l), &values(l), &residual(l), nullptr, nullptr},
-                       groups_for(level_cells(l)),
-                       l < 0 ? "mg residual (voxels)" : "mg residual (coarse)");
+      smooth(l, l < 0 ? settings.multigrid_pre_sweeps : settings.multigrid_coarse_pre_sweeps);
+      /* The residual is computed inside the restriction: one dispatch, not two. */
       const int coarse = l + 1;
       const MultigridParams down = multigrid_params(l, coarse, level_cells(coarse));
-      compute.dispatch(mg_restrict,
+      compute.dispatch(l < 0 ? mg_restrict0 : mg_restrict,
                        &down,
                        sizeof(down),
-                       {&table, &coords, nullptr, &residual(l), &rhs(coarse), &values(coarse),
-                        nullptr, nullptr},
+                       {&table, &coords, &op(l), &rhs(l), &values(l), &rhs(coarse),
+                        &values(coarse), nullptr},
                        groups_for(level_cells(coarse)),
-                       "mg restrict");
+                       l < 0 ? "mg restrict (voxels)" : "mg restrict (coarse)");
       const int coarse_cycles = coarse < settings.multigrid_w_depth ?
                                     settings.multigrid_coarse_cycles :
                                     1;
@@ -358,8 +344,8 @@ struct SparseGasGpu::Impl {
         /* The remaining levels are tiny and take plain V-cycles: one dispatch runs them all. */
         const DenseCycleParams dense = {first_single - first_dense,
                                         static_cast<std::int32_t>(levels.size()) - first_single,
-                                        settings.multigrid_pre_sweeps,
-                                        settings.multigrid_post_sweeps,
+                                        settings.multigrid_coarse_pre_sweeps,
+                                        settings.multigrid_coarse_post_sweeps,
                                         settings.multigrid_coarsest_sweeps,
                                         settings.multigrid_overcorrection};
         compute.dispatch(mg_dense_cycle,
@@ -384,7 +370,7 @@ struct SparseGasGpu::Impl {
                         nullptr},
                        groups_for(level_cells(l)),
                        "mg prolong");
-      smooth(l, settings.multigrid_post_sweeps);
+      smooth(l, l < 0 ? settings.multigrid_post_sweeps : settings.multigrid_coarse_post_sweeps);
     };
     for (int i = 0; i < settings.pressure_iterations; ++i) {
       cycle(cycle, -1);
@@ -806,7 +792,7 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
     g.stencil(g.divergence, "divergence", g.params(-1.0f, 0, 0, 0), U, V, W, rhs);
     if (settings.pressure_solver == sparse::PressureSolver::Multigrid) {
       g.stencil(g.mask_pressure, "mask pressure", g.params(0, 0, 0, 0), Pressure);
-      g.record_multigrid(settings, rhs, next_pressure);
+      g.record_multigrid(settings, rhs);
     }
     else {
       for (int i = 0; i < settings.pressure_iterations; ++i) {

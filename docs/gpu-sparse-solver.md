@@ -133,11 +133,14 @@ needed at walls or at the edge of the active region. Levels that still have seve
 brick are stored per brick slot like the voxels; from one cell per brick on, levels are small
 dense grids over the brick grid, down to at most 2 cells per side. Smoothing is red-black
 Gauss-Seidel, two sweeps before and after each coarse correction and eight on the last level.
-Plain aggregation underestimates the coarse correction, so it is scaled by 1.4, and the two
-finest coarse levels are visited twice per cycle (a W-cycle near the top, V-cycles below). These
-values were chosen by measurement: the residual then falls by about 0.31 per cycle on sparse and
-closed domains from 32 to 128 voxels wide, against 0.55 for plain V-cycles; larger scaling
-factors diverge. On the device, the coarse operators are rebuilt by kernels whenever the topology
+Plain aggregation underestimates the coarse correction, so it is scaled by 1.4, and the finest
+coarse level is visited twice per cycle (a W-cycle at the top, V-cycles below;
+`multigrid_w_depth = 1`). These values were chosen by measurement: with the two finest coarse
+levels visited twice the residual falls by about 0.31 per cycle on sparse and closed domains from
+32 to 128 voxels wide, with one level 0.34, and with plain V-cycles 0.49 to 0.55; larger scaling
+factors diverge. One level is the default because it needs about 40% fewer dispatches (see
+"Cutting dispatches" below). On the device the residual is computed inside the restriction
+kernel, so a level visit costs one dispatch less and needs no residual buffer. On the device, the coarse operators are rebuilt by kernels whenever the topology
 changes, and the voxel level reads a packed word per voxel (cell type and which neighbors are
 fluid or not solid) instead of looking up neighbor types.
 
@@ -157,9 +160,9 @@ CPU reference, 7 tests in `sparse_gas_tests`:
   plume rise 17.6 against 17.2 voxels, total density within 2%, density relative L2 difference
   0.18.
 - 3000 Jacobi sweeps agree with CG to 3e-7 on a 16³ box.
-- Multigrid reduces the residual by at least a factor of 0.31 per cycle and by 3e-4 in six
+- Multigrid reduces the residual by at least a factor of 0.33 per cycle and by 5e-4 in six
   cycles, on a sparse and on a closed 48×48×64 domain; six steps of a plume solved with ten cycles
-  agree with CG to 8e-7 in velocity.
+  agree with CG to 1.2e-6 in velocity.
 
 - MacCormack keeps a plume's peak density at 0.97 after 25 steps where first-order advection
   leaves 0.72, in fewer active bricks, and stays inside the initial value range.
@@ -342,6 +345,37 @@ Whole frames at 192×192×288, 40 frames, median per frame:
 With the resident driver, on llvmpipe, every channel still equals the CPU reference bit for bit:
 32×32×48 over 12 steps, and 48×48×72 over 14 steps, where the active set grows from 64 to 160
 bricks and the channel buffers are replaced once.
+
+**Cutting dispatches.** A coarse dispatch costs about 6 µs on the RTX 3070 whatever its size
+(672 coarse smoothing dispatches per substep took 4.0 ms in the profile above), so the coarse
+levels are paid for by count. Measured on the CPU reference, on a developed 96×96×144 plume
+(208 bricks), six cycles each:
+
+| Variant | Residual after 6 cycles | Factor per cycle | Coarse dispatches per cycle |
+|---|---|---|---|
+| W on two levels, 2+2 coarse sweeps (old default) | 6.3e-4 | 0.31 | 114 |
+| W on one level (new default) | 9.4e-4 | 0.34 | 68 |
+| Plain V-cycle | 7.1e-3 | 0.49 | 34 |
+| W on two levels, 1+1 coarse sweeps | 1.1e-3 | 0.34 | 74 |
+| W on one level, 1+2 coarse sweeps | 1.3e-3 | 0.36 | 56 |
+| W on one level, 1+1 coarse sweeps | 2.5e-3 | 0.40 | 44 |
+| W on two levels, 0+1 coarse sweeps | 4.8e-3 | 0.43 | 54 |
+
+(Dispatch counts are from before the residual was merged into the restriction.)
+
+- **The convergence rate is set by the voxel-level aggregation**, not by how well the coarse
+  levels are solved: every variant sits between 0.31 and 0.43 except the plain V-cycle.
+- **Fewer coarse sweeps buy little.** Halving them saves a third of the coarse dispatches but
+  costs about as much convergence, so the sweeps stay at 2+2. They are now separate settings
+  (`multigrid_coarse_pre_sweeps`, `multigrid_coarse_post_sweeps`; `--coarse-sweeps A B` in the
+  test program).
+- **The W-cycle depth is the lever.** One level instead of two was already measured on the
+  RTX 3070 (15.8 against 18.3 ms per substep, twice the remaining divergence, still 2e-4 of the
+  peak velocity) and is now the default.
+- **Merging the residual into the restriction** removes one of eleven dispatches per level
+  visit without changing any result: on llvmpipe the device still equals the CPU reference bit
+  for bit. Together with the new default, a substep at 192×192×288 goes from about 1014
+  dispatches to about 550. Its effect on the RTX 3070 is not measured yet.
 
 ## Not verified, and known gaps
 

@@ -23,6 +23,7 @@ layout(std430, binding = 5) buffer B5 { float b5[]; };
 layout(std430, binding = 6) buffer B6 { float b6[]; };
 layout(std430, binding = 7) buffer B7 { float b7[]; };
 layout(std430, binding = 8) buffer B8 { float b8[]; };
+layout(std430, binding = 9) buffer B9 { float b9[]; };
 #endif
 
 const uint CELL_OPEN = 0u;

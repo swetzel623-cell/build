@@ -22,6 +22,7 @@
 #include "divergence.comp.h"
 #include "gradient.comp.h"
 #include "jacobi.comp.h"
+#include "maccormack.comp.h"
 #include "remap.comp.h"
 #include "walls.comp.h"
 
@@ -94,7 +95,7 @@ std::uint32_t groups_for(const std::size_t count)
 
 struct SparseGasGpu::Impl {
   Compute compute;
-  int advect, buoyancy, walls, divergence, jacobi, gradient, activity, remap, classify;
+  int advect, maccormack, buoyancy, walls, divergence, jacobi, gradient, activity, remap, classify;
   int classify_links, mask_pressure, mg_smooth0, mg_residual0, mg_smooth, mg_residual;
   int mg_restrict, mg_prolong0, mg_prolong, mg_build0, mg_build, mg_dense_cycle;
 
@@ -118,18 +119,21 @@ struct SparseGasGpu::Impl {
   Compute::Buffer links;
 
   sparse::Topology topology;
-  Compute::Buffer table, coords, types, slot_map, flags;
+  Compute::Buffer table, coords, types, slot_map, flags, speeds;
   std::size_t slot_capacity = 0;
   /** Physical buffers; `role[channel]` says which one currently plays each channel. */
   std::vector<Compute::Buffer> buffers;
   std::array<int, AllChannels> role{};
   std::size_t voxel_capacity = 0;
   Timing timing;
+  /** Largest velocity component at the start of the last step. */
+  float last_speed = 0.0f;
 
   Impl()
   {
 #define KERNEL(name) compute.create_kernel(name##_spv, sizeof(name##_spv) / sizeof(std::uint32_t))
     advect = KERNEL(advect);
+    maccormack = KERNEL(maccormack);
     buoyancy = KERNEL(buoyancy);
     walls = KERNEL(walls);
     divergence = KERNEL(divergence);
@@ -155,7 +159,8 @@ struct SparseGasGpu::Impl {
 
   ~Impl()
   {
-    for (Compute::Buffer *buffer : {&table, &coords, &types, &slot_map, &flags, &links, &dense_op,
+    for (Compute::Buffer *buffer : {&table, &coords, &types, &slot_map, &flags, &speeds, &links,
+                                    &dense_op,
                                     &dense_values, &dense_rhs, &dense_residual, &dense_table})
     {
       compute.destroy_buffer(*buffer);
@@ -201,6 +206,7 @@ struct SparseGasGpu::Impl {
       ensure(coords, slot_capacity * 4 * sizeof(std::int32_t));
       ensure(slot_map, slot_capacity * sizeof(std::int32_t));
       ensure(flags, slot_capacity * sizeof(std::uint32_t));
+      ensure(speeds, slot_capacity * sizeof(std::uint32_t));
     }
     ensure(types, next.voxel_count() * sizeof(std::uint32_t));
     ensure(links, next.voxel_count() * sizeof(std::uint32_t));
@@ -467,13 +473,15 @@ struct SparseGasGpu::Impl {
                const int c5 = -1,
                const int c6 = -1,
                const int c7 = -1,
-               const int c8 = -1)
+               const int c8 = -1,
+               const int c9 = -1)
   {
     const auto bind = [&](const int logical) { return logical < 0 ? nullptr : &channel(logical); };
     compute.dispatch(kernel,
                      &p,
                      sizeof(p),
-                     {&table, &coords, &types, bind(c4), bind(c5), bind(c6), bind(c7), bind(c8)},
+                     {&table, &coords, &types, bind(c4), bind(c5), bind(c6), bind(c7), bind(c8),
+                      bind(c9)},
                      groups_for(topology.voxel_count()),
                      label);
   }
@@ -567,6 +575,46 @@ void SparseGasGpu::download(sparse::State &state)
 
 sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings)
 {
+  return impl_step(settings, nullptr);
+}
+
+sparse::FrameInfo SparseGasGpu::advance(const sparse::Settings &settings, const float frame_time)
+{
+  sparse::FrameInfo frame;
+  Timing total;
+  total.gpu_ms = 0.0;
+  float remaining = frame_time;
+  while (remaining > 0.0f) {
+    if (frame.substeps >= settings.max_substeps) {
+      throw std::runtime_error("The sparse solver exhausted its substep limit");
+    }
+    frame.last_step = impl_step(settings, &remaining);
+    frame.max_speed = std::max(frame.max_speed, impl_->last_speed);
+    remaining -= frame.last_step.dt;
+    ++frame.substeps;
+
+    const Timing &timing = impl_->timing;
+    total.gpu_ms = timing.gpu_ms < 0.0 || total.gpu_ms < 0.0 ? -1.0 : total.gpu_ms + timing.gpu_ms;
+    total.wall_ms += timing.wall_ms;
+    total.topology_ms += timing.topology_ms;
+    total.topology_changed = total.topology_changed || timing.topology_changed;
+    for (const auto &[label, ms] : timing.kernels) {
+      auto entry = std::find_if(total.kernels.begin(), total.kernels.end(),
+                                [&](const auto &item) { return item.first == label; });
+      if (entry == total.kernels.end()) {
+        total.kernels.emplace_back(label, ms);
+      }
+      else {
+        entry->second += ms;
+      }
+    }
+  }
+  impl_->timing = total;
+  return frame;
+}
+
+sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const float *remaining)
+{
   if (settings.pressure_solver == sparse::PressureSolver::ConjugateGradient ||
       settings.pressure_iterations < 1)
   {
@@ -588,6 +636,7 @@ sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings)
   const sparse::Topology &old_topology = g.topology;
   const std::size_t old_slots = old_topology.brick_count();
   std::vector<std::uint32_t> slot_flags(old_slots, 0);
+  std::vector<float> slot_speeds(old_slots, 0.0f);
   if (old_slots > 0) {
     const ActivityParams params = {static_cast<std::int32_t>(old_topology.voxels_per_brick()),
                                    static_cast<std::int32_t>(old_topology.voxel_count()),
@@ -595,6 +644,7 @@ sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings)
                                    settings.thresholds.velocity};
     g.compute.begin();
     g.compute.fill(g.flags, 0);
+    g.compute.fill(g.speeds, 0);
     g.compute.dispatch(g.activity,
                        &params,
                        sizeof(params),
@@ -604,14 +654,22 @@ sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings)
                         &g.channel(V),
                         &g.channel(W),
                         &g.flags,
-                        nullptr,
-                        nullptr},
+                        &g.speeds},
                        groups_for(old_topology.voxel_count()),
                        "activity");
     g.compute.download(g.flags, slot_flags.data(), old_slots * sizeof(std::uint32_t));
+    /* The speeds were accumulated as bit patterns; they are floats. */
+    g.compute.download(g.speeds, slot_speeds.data(), old_slots * sizeof(float));
     add_gpu_time(g.compute.submit());
     g.collect_profile();
   }
+
+  g.last_speed = 0.0f;
+  for (const float speed : slot_speeds) {
+    g.last_speed = std::max(g.last_speed, speed);
+  }
+  const float dt = remaining ? sparse::cfl_time_step(*remaining, settings.cfl, g.last_speed) :
+                               settings.dt;
 
   /* 2. The next topology, built on the CPU exactly as the reference does. */
   const auto topology_start = std::chrono::steady_clock::now();
@@ -706,22 +764,20 @@ sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings)
   }
 
   if (count > 0) {
-    const float dt = settings.dt;
     const float offsets[5][3] = {{0.5f, 0.5f, 0.5f},
                                  {0.5f, 0.5f, 0.5f},
                                  {0.0f, 0.5f, 0.5f},
                                  {0.5f, 0.0f, 0.5f},
                                  {0.5f, 0.5f, 0.0f}};
     /* Every channel is advected by the velocity from the start of the step. */
+    const bool second_order = settings.advection == sparse::Advection::MacCormack;
+    const int forward = StateChannels + 5;
     for (int i = 0; i < 5; ++i) {
-      g.stencil(g.advect,
-                "advect",
-                g.params(offsets[i][0], offsets[i][1], offsets[i][2], dt),
-                U,
-                V,
-                W,
-                i,
-                StateChannels + i);
+      const Params p = g.params(offsets[i][0], offsets[i][1], offsets[i][2], dt);
+      g.stencil(g.advect, "advect", p, U, V, W, i, second_order ? forward : StateChannels + i);
+      if (second_order) {
+        g.stencil(g.maccormack, "maccormack", p, U, V, W, i, forward, StateChannels + i);
+      }
     }
     for (int i = 0; i < 5; ++i) {
       std::swap(g.role[static_cast<std::size_t>(i)],
@@ -771,6 +827,7 @@ sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings)
   }
 
   info.pressure_iterations = count > 0 ? settings.pressure_iterations : 0;
+  info.dt = dt;
   g.timing.gpu_ms = gpu_timed ? gpu_ms : -1.0;
   g.timing.wall_ms = milliseconds_since(start);
   return info;

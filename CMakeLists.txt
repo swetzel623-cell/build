@@ -60,7 +60,7 @@ if(MANTA_IMPROVE_BUILD_GPU)
     set(MANTA_IMPROVE_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
     file(MAKE_DIRECTORY "${MANTA_IMPROVE_SHADER_DIR}")
     set(MANTA_IMPROVE_SHADER_HEADERS)
-    foreach(KERNEL advect buoyancy walls divergence jacobi gradient activity remap classify
+    foreach(KERNEL advect maccormack buoyancy walls divergence jacobi gradient activity remap classify
             classify_links mask_pressure mg_smooth0 mg_residual0 mg_smooth mg_residual mg_restrict mg_prolong0 mg_prolong mg_build0 mg_build mg_dense_cycle)
       set(SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/${KERNEL}.comp")
       set(SHADER_HEADER "${MANTA_IMPROVE_SHADER_DIR}/${KERNEL}.comp.h")
@@ -95,9 +95,13 @@ if(MANTA_IMPROVE_BUILD_GPU)
       target_link_libraries(sparse_gas_gpu_tests PRIVATE manta_improve_sparse_gpu)
       # 48 voxels and 10 steps make the active set outgrow its first allocation.
       add_test(NAME sparse_gas_gpu_tests COMMAND sparse_gas_gpu_tests 48 10)
-      add_test(NAME sparse_gas_gpu_jacobi_tests COMMAND sparse_gas_gpu_tests 32 6 --jacobi)
+      add_test(NAME sparse_gas_gpu_jacobi_tests
+               COMMAND sparse_gas_gpu_tests 32 6 --jacobi --first-order)
+      # A low CFL number forces several substeps per frame.
+      add_test(NAME sparse_gas_gpu_substep_tests COMMAND sparse_gas_gpu_tests 32 8 --cfl 0.5)
       set_tests_properties(
-        sparse_gas_gpu_tests sparse_gas_gpu_jacobi_tests PROPERTIES SKIP_RETURN_CODE 77
+        sparse_gas_gpu_tests sparse_gas_gpu_jacobi_tests sparse_gas_gpu_substep_tests
+        PROPERTIES SKIP_RETURN_CODE 77
       )
     endif()
   else()

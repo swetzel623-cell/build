@@ -60,9 +60,16 @@ class SparseGasGpu {
    * and is reported as NaN.
    */
   sparse::StepInfo step(const sparse::Settings &settings);
+  /**
+   * Advance by `frame_time` in CFL-limited substeps, like sparse::advance. The speed that limits
+   * each substep comes back with the activity flags, so this adds no transfers.
+   */
+  sparse::FrameInfo advance(const sparse::Settings &settings, float frame_time);
+  /** Timing of the last step(), or the sum over the substeps of the last advance(). */
   const Timing &last_timing() const;
 
  private:
+  sparse::StepInfo impl_step(const sparse::Settings &settings, const float *remaining);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

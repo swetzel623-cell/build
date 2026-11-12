@@ -90,6 +90,9 @@ double median(std::vector<double> values)
 }
 
 bool use_jacobi = false;
+bool first_order = false;
+float cfl = -1.0f;
+constexpr float frame_time = 1.0f / 30.0f;
 int multigrid_w_depth = -1;
 
 sparse::Settings test_settings(const int resolution)
@@ -98,6 +101,12 @@ sparse::Settings test_settings(const int resolution)
   settings.gravity[2] = -9.81f * resolution / 2.0f;
   settings.heat_buoyancy = 0.5f;
   settings.density_buoyancy = 0.5f;
+  if (cfl > 0.0f) {
+    settings.cfl = cfl;
+  }
+  if (first_order) {
+    settings.advection = sparse::Advection::SemiLagrangian;
+  }
   if (use_jacobi) {
     settings.pressure_solver = sparse::PressureSolver::Jacobi;
     settings.pressure_iterations = 60;
@@ -125,11 +134,17 @@ int compare(gpu::SparseGasGpu &solver, const int resolution, const int steps)
   for (int i = 0; i < steps; ++i) {
     std::cout << "step " << i << ": running...\n";
     auto start = std::chrono::steady_clock::now();
-    sparse::step(cpu, settings);
+    const sparse::FrameInfo cpu_frame = sparse::advance(cpu, settings, frame_time);
     cpu_seconds += seconds_since(start);
     start = std::chrono::steady_clock::now();
-    const sparse::StepInfo info = solver.step(settings);
+    const sparse::FrameInfo frame = solver.advance(settings, frame_time);
+    const sparse::StepInfo &info = frame.last_step;
     device_seconds += seconds_since(start);
+    if (cpu_frame.substeps != frame.substeps) {
+      std::cout << "FAIL: substep counts differ at step " << i << ": CPU " << cpu_frame.substeps
+                << ", device " << frame.substeps << '\n';
+      return 1;
+    }
     solver.download(device);
 
     if (cpu.topology.brick_table != device.topology.brick_table) {
@@ -147,7 +162,8 @@ int compare(gpu::SparseGasGpu &solver, const int resolution, const int steps)
                                   max_difference(cpu.v, device.v) / scale,
                                   max_difference(cpu.w, device.w) / scale,
                                   max_difference(cpu.pressure, device.pressure) / scale});
-    std::cout << "step " << i << ": " << info.active_bricks << " bricks, peak |w| " << max_abs(cpu.w)
+    std::cout << "step " << i << ": " << frame.substeps << " substeps, " << info.active_bricks
+              << " bricks, peak |w| " << max_abs(cpu.w)
               << ", divergence left " << relative_divergence(device)
               << ", largest CPU/device difference " << worst << '\n';
     if (!(worst < 1.0e-4f)) {
@@ -159,8 +175,8 @@ int compare(gpu::SparseGasGpu &solver, const int resolution, const int steps)
     std::cout << "FAIL: the test flow did not develop\n";
     return 1;
   }
-  std::cout << "CPU reference " << cpu_seconds / steps * 1000.0 << " ms/step, device "
-            << device_seconds / steps * 1000.0 << " ms/step (state kept on the device)\n";
+  std::cout << "CPU reference " << cpu_seconds / steps * 1000.0 << " ms/frame, device "
+            << device_seconds / steps * 1000.0 << " ms/frame (state kept on the device)\n";
   std::cout << "PASS: device kernels match the CPU reference\n";
   return 0;
 }
@@ -178,9 +194,11 @@ int benchmark(gpu::SparseGasGpu &solver, const int resolution, const int steps, 
 
   std::vector<double> wall, gpu_time, topology;
   std::size_t peak_bricks = 0;
-  int changes = 0;
+  int changes = 0, substeps = 0;
   for (int i = 0; i < steps; ++i) {
-    const sparse::StepInfo info = solver.step(settings);
+    const sparse::FrameInfo frame = solver.advance(settings, frame_time);
+    const sparse::StepInfo &info = frame.last_step;
+    substeps += frame.substeps;
     const gpu::SparseGasGpu::Timing &timing = solver.last_timing();
     wall.push_back(timing.wall_ms);
     gpu_time.push_back(timing.gpu_ms);
@@ -198,7 +216,8 @@ int benchmark(gpu::SparseGasGpu &solver, const int resolution, const int steps, 
         entry->second += ms;
       }
     }
-    std::cout << "step " << i << ": " << info.active_bricks << " bricks, wall " << timing.wall_ms
+    std::cout << "frame " << i << ": " << frame.substeps << " substeps, " << info.active_bricks
+              << " bricks, wall " << timing.wall_ms
               << " ms, GPU " << timing.gpu_ms << " ms\n";
   }
   solver.download(state);
@@ -213,7 +232,8 @@ int benchmark(gpu::SparseGasGpu &solver, const int resolution, const int steps, 
   std::cout << "Domain " << extent.x << "x" << extent.y << "x" << extent.z << ", peak "
             << peak_bricks << " of " << total_bricks << " bricks active, topology changed in "
             << changes << " of " << steps << " steps\n";
-  std::cout << "Median per step: wall " << median(wall) << " ms, GPU "
+  std::cout << substeps << " substeps in " << steps << " frames\n";
+  std::cout << "Median per frame: wall " << median(wall) << " ms, GPU "
             << (solver.has_timestamps() ? median(gpu_time) : -1.0) << " ms, topology (CPU) "
             << median(topology) << " ms\n";
   if (profile) {
@@ -221,7 +241,7 @@ int benchmark(gpu::SparseGasGpu &solver, const int resolution, const int steps, 
     for (const auto &item : kernel_totals) {
       total += item.second;
     }
-    std::cout << "GPU time per step by kernel (profiling adds a timestamp per command):\n";
+    std::cout << "GPU time per frame by kernel (profiling adds a timestamp per command):\n";
     for (const auto &[label, ms] : kernel_totals) {
       std::cout << "  " << label << ": " << ms / steps << " ms ("
                 << (total > 0.0 ? 100.0 * ms / total : 0.0) << "%)\n";
@@ -244,6 +264,12 @@ int main(int argc, char **argv)
     if (std::string(argv[i]) == "--bench") {
       bench = true;
     }
+    else if (std::string(argv[i]) == "--cfl" && i + 1 < argc) {
+      cfl = static_cast<float>(std::atof(argv[++i]));
+    }
+    else if (std::string(argv[i]) == "--first-order") {
+      first_order = true;
+    }
     else if (std::string(argv[i]) == "--jacobi") {
       use_jacobi = true;
     }
@@ -262,11 +288,12 @@ int main(int argc, char **argv)
     }
   }
   const int resolution = numbers.size() > 0 ? numbers[0] : 32;
-  const int steps = numbers.size() > 1 ? numbers[1] : 8;
+  const int steps = numbers.size() > 1 ? numbers[1] : 8; /* Frames. */
 
-  std::cout << "Starting: resolution " << resolution << ", " << steps << " steps"
+  std::cout << "Starting: resolution " << resolution << ", " << steps << " frames"
             << (profile ? ", profile" : bench ? ", benchmark" : "")
-            << (use_jacobi ? ", 60 Jacobi sweeps" : ", 6 multigrid cycles") << '\n';
+            << (use_jacobi ? ", 60 Jacobi sweeps" : ", 6 multigrid cycles")
+            << (first_order ? ", first-order advection" : ", MacCormack advection") << '\n';
   std::cout << "Creating the Vulkan device...\n";
   std::unique_ptr<gpu::SparseGasGpu> solver;
   try {

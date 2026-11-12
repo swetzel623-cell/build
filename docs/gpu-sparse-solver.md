@@ -98,6 +98,17 @@ topology and uploaded.
 three velocity components, add heat and density buoyancy, zero wall faces, solve pressure, subtract
 its gradient. Buoyancy and the wall rule follow Mantaflow's operators.
 
+**Advection.** MacCormack by default: a forward and a backward semi-Lagrangian trace, the error
+estimate added back for values inside the fluid, and the result clamped to the eight values the
+forward trace interpolated. Where that trace reads a voxel without storage, the first-order value
+is kept. This is the scheme the Mantaflow node uses, but not the same code; the two have not been
+compared.
+
+**Frames.** `advance()` takes a frame in substeps of at most `cfl` voxels of travel, measured by
+the largest velocity component at the start of each substep, and fails past a substep limit. On
+the device that speed is gathered per brick by the activity kernel and comes back with the
+activity flags, so substepping adds no transfer.
+
 **The device driver.** The state stays in device memory between steps; `upload()` and
 `download()` are the only full transfers. A step is two submissions. The first runs the activity
 kernel and downloads one flag per brick, 4 bytes per active brick. The CPU builds the next brick
@@ -149,6 +160,13 @@ CPU reference, 7 tests in `sparse_gas_tests`:
 - Multigrid reduces the residual by at least a factor of 0.31 per cycle and by 3e-4 in six
   cycles, on a sparse and on a closed 48×48×64 domain; six steps of a plume solved with ten cycles
   agree with CG to 8e-7 in velocity.
+
+- MacCormack keeps a plume's peak density at 0.97 after 25 steps where first-order advection
+  leaves 0.72, in fewer active bricks, and stays inside the initial value range.
+- `advance()` subdivides frames at CFL 1 and fails when the substep limit is exhausted.
+
+GPU MacCormack and substepping on llvmpipe: every channel equals the CPU reference bit for bit,
+with the same substep counts, including a run forced to several substeps per frame.
 
 GPU multigrid on llvmpipe: every channel equals the CPU reference bit for bit (32×32×48 over 8
 steps and 48×48×72 over 10). After six cycles the remaining divergence relative to peak velocity
@@ -308,16 +326,14 @@ bricks and the channel buffers are replaced once.
 - **The driver is not tuned.** Every command is followed by a full barrier, kernels use 64-thread
   groups over a flat voxel range, neighbors are found through the brick table, and staging buffers
   are allocated per transfer. None of this has been profiled.
-- **The physics is not yet the dense node's.** Advection is first-order semi-Lagrangian, which is
-  much more diffusive than the MacCormack scheme the Mantaflow node uses, and it spreads smoke
-  into more bricks than necessary. There is no comparison against the Mantaflow engine yet.
+- **Not compared with the Mantaflow engine.** The scheme now matches in kind (MacCormack
+  advection, CFL substeps, converged pressure), but nothing has been checked against it.
 - **Multigrid is dispatch-bound at these sizes.** About 1,000 dispatches per step, most of them
   on coarse levels with little work. Larger problems, where the work should dominate, have not
   been measured.
 - **Aggregation multigrid converges slowly for a multigrid method** (0.31 per cycle). As a
   preconditioner for conjugate gradients it would do better, but that needs reductions on the
   device.
-- **No CFL substepping.** Smoke must not cross the padding of one brick in a step.
 - **The CPU reference is deliberately simple and slow** (single-threaded, a table lookup per
   neighbor read).
 - **Not connected to Blender.**
@@ -337,7 +353,6 @@ bricks and the channel buffers are replaced once.
 
 1. Measure multigrid at larger sizes, where dispatch overhead should matter less, before
    tuning it further.
-2. MacCormack advection and CFL substepping, then compare with the Mantaflow engine on a case
-   where the active region covers the domain.
+2. Compare with the Mantaflow engine on a case where the active region covers the domain.
 3. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind
    the existing node, with the CPU reference as fallback.

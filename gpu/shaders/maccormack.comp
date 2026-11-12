@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: MIT
+// MacCormack correction of a forward-advected channel. Mirrors advect_maccormack in the CPU
+// reference. P.a = (offset of the advected channel, dt).
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#define U b4
+#define V b5
+#define W b6
+#define SOURCE b7
+#define FORWARD b8
+#define RESULT b9
+
+#define SAMPLE(name, channel) \
+  float name##_at(ivec3 c) \
+  { \
+    int i = index_of(c); \
+    return i < 0 ? 0.0 : channel[i]; \
+  } \
+  float name(vec3 p, vec3 offset) \
+  { \
+    vec3 f = p - offset; \
+    vec3 base = floor(f); \
+    ivec3 i = ivec3(base); \
+    vec3 t = f - base; \
+    float f000 = name##_at(i); \
+    float f100 = name##_at(i + ivec3(1, 0, 0)); \
+    float f010 = name##_at(i + ivec3(0, 1, 0)); \
+    float f110 = name##_at(i + ivec3(1, 1, 0)); \
+    float f001 = name##_at(i + ivec3(0, 0, 1)); \
+    float f101 = name##_at(i + ivec3(1, 0, 1)); \
+    float f011 = name##_at(i + ivec3(0, 1, 1)); \
+    float f111 = name##_at(i + ivec3(1, 1, 1)); \
+    float c00 = f000 + (f100 - f000) * t.x; \
+    float c10 = f010 + (f110 - f010) * t.x; \
+    float c01 = f001 + (f101 - f001) * t.x; \
+    float c11 = f011 + (f111 - f011) * t.x; \
+    float c0 = c00 + (c10 - c00) * t.y; \
+    float c1 = c01 + (c11 - c01) * t.y; \
+    return c0 + (c1 - c0) * t.z; \
+  }
+
+SAMPLE(sample_u, U)
+SAMPLE(sample_v, V)
+SAMPLE(sample_w, W)
+SAMPLE(sample_forward, FORWARD)
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index)) {
+    return;
+  }
+  uint type = cell_type[index];
+  if (type == CELL_SOLID) {
+    RESULT[index] = 0.0;
+    return;
+  }
+  float forward = FORWARD[index];
+  RESULT[index] = forward;
+
+  /* Only correct values that lie inside the fluid. A staggered component sits on the face
+   * shared with the cell below it along its axis. */
+  ivec3 c = coords_of(index);
+  vec3 offset = P.a.xyz;
+  int axis = offset.x == 0.0 ? 0 : offset.y == 0.0 ? 1 : offset.z == 0.0 ? 2 : -1;
+  if (type != CELL_FLUID) {
+    return;
+  }
+  if (axis >= 0) {
+    ivec3 below = c;
+    below[axis] -= 1;
+    if (type_at(below) != CELL_FLUID) {
+      return;
+    }
+  }
+
+  vec3 p = vec3(c) + offset;
+  vec3 velocity = vec3(sample_u(p, vec3(0.0, 0.5, 0.5)),
+                       sample_v(p, vec3(0.5, 0.0, 0.5)),
+                       sample_w(p, vec3(0.5, 0.5, 0.0)));
+  float dt = P.a.w;
+
+  /* The values the forward trace interpolated bound the result. If any has no storage, the
+   * trace left the active region: keep the first-order value. */
+  ivec3 base = ivec3(floor(p - dt * velocity - offset));
+  float lowest = 0.0, highest = 0.0;
+  for (int corner = 0; corner < 8; ++corner) {
+    int i = index_of(base + ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1));
+    if (i < 0) {
+      return;
+    }
+    float value = SOURCE[i];
+    lowest = corner == 0 ? value : min(lowest, value);
+    highest = corner == 0 ? value : max(highest, value);
+  }
+
+  float backward = sample_forward(p + dt * velocity, offset);
+  float corrected = forward + 0.5 * (SOURCE[index] - backward);
+  RESULT[index] = min(max(corrected, lowest), highest);
+}

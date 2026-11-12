@@ -81,7 +81,8 @@ comparison:
 ./build/sparse_gas_gpu_tests 128 30 --bench
 ```
 
-`--profile` does the same and also reports the GPU time of each kernel.
+`--profile` does the same and also reports the GPU time of each kernel. The pressure solve is
+six multigrid cycles by default; `--jacobi` selects 60 Jacobi sweeps instead.
 
 Run the activity-mask microbenchmark with defaults:
 

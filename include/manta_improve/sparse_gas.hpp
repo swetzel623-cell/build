@@ -226,6 +226,11 @@ struct Multigrid {
 std::int64_t multigrid_index(const Topology &topology, const MultigridLevel &level, int x, int y,
                              int z);
 
+/** The levels of the hierarchy for a topology, with empty operator arrays. */
+std::vector<MultigridLevel> multigrid_layout(const Topology &topology);
+/** Number of cells a level stores on a topology. */
+std::size_t multigrid_cell_count(const Topology &topology, const MultigridLevel &level);
+
 Multigrid build_multigrid(const Topology &topology);
 
 /** Run `cycles` V-cycles on `A pressure = rhs`, starting from the given pressure. */

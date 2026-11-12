@@ -21,7 +21,7 @@ namespace manta_improve::gpu {
 /** Kernels see storage buffers at bindings 1 to 8. */
 constexpr std::size_t binding_count = 8;
 /** Every kernel receives up to this many bytes of push constants. */
-constexpr std::size_t push_constant_bytes = 48;
+constexpr std::size_t push_constant_bytes = 64;
 
 class Compute {
  public:
@@ -54,7 +54,7 @@ class Compute {
 
   /** A device-memory storage buffer. Must not be called between begin() and submit(). */
   Buffer create_buffer(std::size_t bytes);
-  /** Must not be called between begin() and submit(). */
+  /** Abandons any recording in progress, so that cleanup after an error is safe. */
   void destroy_buffer(Buffer &buffer);
 
   /** Compile a SPIR-V compute shader into a kernel and return its id. */

@@ -72,6 +72,14 @@ double seconds_since(const std::chrono::steady_clock::time_point start)
 
 }  // namespace
 
+/** Largest divergence left in fluid cells, relative to the largest velocity. */
+float relative_divergence(const sparse::State &state)
+{
+  std::vector<float> values;
+  sparse::divergence(state, values);
+  return max_abs(values) / std::max(1.0e-6f, max_abs(state.w));
+}
+
 double median(std::vector<double> values)
 {
   if (values.empty()) {
@@ -81,14 +89,22 @@ double median(std::vector<double> values)
   return values[values.size() / 2];
 }
 
+bool use_jacobi = false;
+
 sparse::Settings test_settings(const int resolution)
 {
   sparse::Settings settings;
   settings.gravity[2] = -9.81f * resolution / 2.0f;
   settings.heat_buoyancy = 0.5f;
   settings.density_buoyancy = 0.5f;
-  settings.pressure_solver = sparse::PressureSolver::Jacobi;
-  settings.pressure_iterations = 60;
+  if (use_jacobi) {
+    settings.pressure_solver = sparse::PressureSolver::Jacobi;
+    settings.pressure_iterations = 60;
+  }
+  else {
+    settings.pressure_solver = sparse::PressureSolver::Multigrid;
+    settings.pressure_iterations = 6;
+  }
   return settings;
 }
 
@@ -128,6 +144,7 @@ int compare(gpu::SparseGasGpu &solver, const int resolution, const int steps)
                                   max_difference(cpu.w, device.w) / scale,
                                   max_difference(cpu.pressure, device.pressure) / scale});
     std::cout << "step " << i << ": " << info.active_bricks << " bricks, peak |w| " << max_abs(cpu.w)
+              << ", divergence left " << relative_divergence(device)
               << ", largest CPU/device difference " << worst << '\n';
     if (!(worst < 1.0e-4f)) {
       std::cout << "FAIL: device result differs from the CPU reference\n";
@@ -187,6 +204,8 @@ int benchmark(gpu::SparseGasGpu &solver, const int resolution, const int steps, 
       return 1;
     }
   }
+  std::cout << "Divergence left after the last step, relative to peak velocity: "
+            << relative_divergence(state) << '\n';
   std::cout << "Domain " << extent.x << "x" << extent.y << "x" << extent.z << ", peak "
             << peak_bricks << " of " << total_bricks << " bricks active, topology changed in "
             << changes << " of " << steps << " steps\n";
@@ -220,6 +239,9 @@ int main(int argc, char **argv)
     if (std::string(argv[i]) == "--bench") {
       bench = true;
     }
+    else if (std::string(argv[i]) == "--jacobi") {
+      use_jacobi = true;
+    }
     else if (std::string(argv[i]) == "--profile") {
       bench = true;
       profile = true;
@@ -232,7 +254,8 @@ int main(int argc, char **argv)
   const int steps = numbers.size() > 1 ? numbers[1] : 8;
 
   std::cout << "Starting: resolution " << resolution << ", " << steps << " steps"
-            << (profile ? ", profile" : bench ? ", benchmark" : "") << '\n';
+            << (profile ? ", profile" : bench ? ", benchmark" : "")
+            << (use_jacobi ? ", 60 Jacobi sweeps" : ", 6 multigrid cycles") << '\n';
   std::cout << "Creating the Vulkan device...\n";
   std::unique_ptr<gpu::SparseGasGpu> solver;
   try {

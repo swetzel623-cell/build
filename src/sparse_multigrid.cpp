@@ -317,14 +317,47 @@ std::int64_t multigrid_index(const Topology &topology,
   return static_cast<std::int64_t>(slot) * side * side * side + lx + side * (ly + side * lz);
 }
 
-Multigrid build_multigrid(const Topology &topology)
+std::vector<MultigridLevel> multigrid_layout(const Topology &topology)
 {
   const int brick_size = topology.brick_size;
   if (brick_size & (brick_size - 1)) {
     throw std::invalid_argument("The multigrid pressure solver needs a power-of-two brick size");
   }
+  std::vector<MultigridLevel> levels;
+  /* Levels that still have several cells per brick are stored per brick slot. */
+  for (int side = brick_size / 2; side >= 2; side /= 2) {
+    MultigridLevel level;
+    level.side = side;
+    levels.push_back(level);
+  }
+  /* From one cell per brick on, levels are dense grids over the brick grid. */
+  Extent dims = topology.brick_extent;
+  while (true) {
+    MultigridLevel level;
+    level.dense = true;
+    level.dims = dims;
+    levels.push_back(level);
+    if (std::max({dims.x, dims.y, dims.z}) <= 2) {
+      break;
+    }
+    dims = {(dims.x + 1) / 2, (dims.y + 1) / 2, (dims.z + 1) / 2};
+  }
+  return levels;
+}
+
+std::size_t multigrid_cell_count(const Topology &topology, const MultigridLevel &level)
+{
+  if (level.dense) {
+    return static_cast<std::size_t>(level.dims.x) * level.dims.y * level.dims.z;
+  }
+  return topology.brick_count() * static_cast<std::size_t>(level.side) * level.side * level.side;
+}
+
+Multigrid build_multigrid(const Topology &topology)
+{
   Multigrid multigrid;
-  const auto add_level = [&](MultigridLevel level, const std::size_t cells) {
+  const auto add_level = [&](MultigridLevel level) {
+    const std::size_t cells = multigrid_cell_count(topology, level);
     level.diagonal.assign(cells, 0.0f);
     level.weight_x.assign(cells, 0.0f);
     level.weight_y.assign(cells, 0.0f);
@@ -342,23 +375,8 @@ Multigrid build_multigrid(const Topology &topology)
     }
   };
 
-  /* Levels that still have several cells per brick are stored per brick slot. */
-  for (int side = brick_size / 2; side >= 2; side /= 2) {
-    MultigridLevel level;
-    level.side = side;
-    add_level(std::move(level), topology.brick_count() * side * side * side);
-  }
-  /* From one cell per brick on, levels are dense grids over the brick grid. */
-  Extent dims = topology.brick_extent;
-  while (true) {
-    MultigridLevel level;
-    level.dense = true;
-    level.dims = dims;
-    add_level(std::move(level), static_cast<std::size_t>(dims.x) * dims.y * dims.z);
-    if (std::max({dims.x, dims.y, dims.z}) <= 2) {
-      break;
-    }
-    dims = {(dims.x + 1) / 2, (dims.y + 1) / 2, (dims.z + 1) / 2};
+  for (const MultigridLevel &level : multigrid_layout(topology)) {
+    add_level(level);
   }
   return multigrid;
 }

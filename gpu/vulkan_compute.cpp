@@ -468,7 +468,11 @@ void Compute::destroy_buffer(Buffer &buffer)
   }
   Impl &v = *impl_;
   if (v.recording) {
-    throw std::logic_error("destroy_buffer while recording");
+    /* Only reached while unwinding from an error: drop the unsubmitted commands. */
+    vkEndCommandBuffer(v.commands);
+    v.recording = false;
+    v.downloads.clear();
+    v.release_staging();
   }
   v.clear_descriptor_cache();
   vkDestroyBuffer(v.device, to_vk(buffer), nullptr);

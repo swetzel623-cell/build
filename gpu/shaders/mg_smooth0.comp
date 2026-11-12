@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: MIT
+// One color of a red-black Gauss-Seidel sweep on the voxel level.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "mg_common.glsl"
+layout(std430, binding = 3) readonly buffer Links { uint links[]; };
+layout(std430, binding = 4) readonly buffer Rhs { float rhs[]; };
+layout(std430, binding = 5) buffer Values { float x[]; };
+
+void main()
+{
+  int index;
+  if (!cell_in_range(index)) {
+    return;
+  }
+  uint packed = links[index];
+  if (!fine_is_fluid(packed)) {
+    return;
+  }
+  ivec3 c = level_coords(P.la, index);
+  if (((c.x + c.y + c.z) & 1) != P.color) {
+    return;
+  }
+  float sum = 0.0;
+  for (int axis = 0; axis < 3; ++axis) {
+    if (fine_linked(packed, 2 * axis)) {
+      sum += x[level_index(P.la, c - AXES[axis])];
+    }
+    if (fine_linked(packed, 2 * axis + 1)) {
+      sum += x[level_index(P.la, c + AXES[axis])];
+    }
+  }
+  x[index] = (rhs[index] + sum) / fine_diagonal(packed);
+}

@@ -18,7 +18,8 @@ namespace manta_improve::gpu {
  * uploads the brick table if it changed, classifies cells on the device, moves every channel onto
  * the new bricks, and runs the whole step. The state is transferred only by upload() and download().
  *
- * Only PressureSolver::Jacobi is available, with at least one sweep.
+ * PressureSolver::Jacobi and PressureSolver::Multigrid are available. With multigrid, the coarse
+ * operators are rebuilt on the device whenever the topology changes.
  */
 class SparseGasGpu {
  public:

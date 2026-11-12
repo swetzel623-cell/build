@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: MIT
+// Pack what the fine multigrid level needs about each voxel into one word, so its kernels never
+// look up a neighbor's type: bits 0-1 the cell type, bits 2-7 "neighbor is not solid", bits 8-13
+// "neighbor is fluid", both in the order -X, +X, -Y, +Y, -Z, +Z and only set for fluid cells.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#define NO_FLOAT_CHANNELS
+#include "common.glsl"
+layout(std430, binding = 4) writeonly buffer Links { uint links[]; };
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index)) {
+    return;
+  }
+  uint packed = cell_type[index];
+  if (packed == CELL_FLUID) {
+    ivec3 c = coords_of(index);
+    const ivec3 offsets[6] = ivec3[6](ivec3(-1, 0, 0), ivec3(1, 0, 0), ivec3(0, -1, 0),
+                                      ivec3(0, 1, 0), ivec3(0, 0, -1), ivec3(0, 0, 1));
+    for (int n = 0; n < 6; ++n) {
+      uint type = type_at(c + offsets[n]);
+      if (type != CELL_SOLID) {
+        packed |= 1u << (2 + n);
+      }
+      if (type == CELL_FLUID) {
+        packed |= 1u << (8 + n);
+      }
+    }
+  }
+  links[index] = packed;
+}

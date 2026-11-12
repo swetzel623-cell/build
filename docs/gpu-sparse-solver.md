@@ -111,9 +111,24 @@ buffers are allocated with 50% headroom and replaced when the active set outgrow
 is measured with timestamp queries around each submission.
 
 **Pressure.** The system is the 7-point Poisson matrix over fluid cells with Neumann conditions at
-walls and Dirichlet zero at open cells. The CPU reference has Jacobi-preconditioned CG and plain
-Jacobi sweeps. The GPU path has Jacobi sweeps only: they need no reductions, so the GPU result can
-be compared with the reference sweep for sweep.
+walls and Dirichlet zero at open cells. The CPU reference has Jacobi-preconditioned CG, plain
+Jacobi sweeps, and multigrid. The GPU path has Jacobi sweeps and multigrid: neither needs a
+reduction, so the GPU result can be compared with the reference operation for operation.
+
+**Multigrid.** Coarse levels aggregate 2×2×2 cells with piecewise-constant transfer. The Galerkin
+coarse operator of a 7-point stencil is then again a 7-point stencil, a diagonal and one weight
+per lower face, so every level shares one smoother and one residual, and nothing special is
+needed at walls or at the edge of the active region. Levels that still have several cells per
+brick are stored per brick slot like the voxels; from one cell per brick on, levels are small
+dense grids over the brick grid, down to at most 2 cells per side. Smoothing is red-black
+Gauss-Seidel, two sweeps before and after each coarse correction and eight on the last level.
+Plain aggregation underestimates the coarse correction, so it is scaled by 1.4, and the two
+finest coarse levels are visited twice per cycle (a W-cycle near the top, V-cycles below). These
+values were chosen by measurement: the residual then falls by about 0.31 per cycle on sparse and
+closed domains from 32 to 128 voxels wide, against 0.55 for plain V-cycles; larger scaling
+factors diverge. On the device, the coarse operators are rebuilt by kernels whenever the topology
+changes, and the voxel level reads a packed word per voxel (cell type and which neighbors are
+fluid or not solid) instead of looking up neighbor types.
 
 ## Verified
 
@@ -131,6 +146,13 @@ CPU reference, 7 tests in `sparse_gas_tests`:
   plume rise 17.6 against 17.2 voxels, total density within 2%, density relative L2 difference
   0.18.
 - 3000 Jacobi sweeps agree with CG to 3e-7 on a 16³ box.
+- Multigrid reduces the residual by at least a factor of 0.31 per cycle and by 3e-4 in six
+  cycles, on a sparse and on a closed 48×48×64 domain; six steps of a plume solved with ten cycles
+  agree with CG to 8e-7 in velocity.
+
+GPU multigrid on llvmpipe: every channel equals the CPU reference bit for bit (32×32×48 over 8
+steps and 48×48×72 over 10). After six cycles the remaining divergence relative to peak velocity
+is about 5e-6, against 2e-3 after 60 Jacobi sweeps on the same flow.
 
 GPU kernels, `sparse_gas_gpu_tests`: on llvmpipe, a software Vulkan implementation, every
 channel equals the CPU reference bit for bit after each of 8 steps of a rising plume (32×32×48,
@@ -233,7 +255,12 @@ bricks and the channel buffers are replaced once.
 - **The physics is not yet the dense node's.** Advection is first-order semi-Lagrangian, which is
   much more diffusive than the MacCormack scheme the Mantaflow node uses, and it spreads smoke
   into more bricks than necessary. There is no comparison against the Mantaflow engine yet.
-- **Jacobi is not a production pressure solver.** Its convergence degrades with resolution.
+- **Multigrid on a real GPU is unmeasured.** A step with six cycles is several hundred small
+  dispatches on the coarse levels. On llvmpipe those dominate the step; whether dispatch overhead
+  matters on a real GPU is not known yet.
+- **Aggregation multigrid converges slowly for a multigrid method** (0.31 per cycle). As a
+  preconditioner for conjugate gradients it would do better, but that needs reductions on the
+  device.
 - **No CFL substepping.** Smoke must not cross the padding of one brick in a step.
 - **The CPU reference is deliberately simple and slow** (single-threaded, a table lookup per
   neighbor read).
@@ -252,8 +279,8 @@ bricks and the channel buffers are replaced once.
 
 ## Next steps
 
-1. Replace Jacobi with a multigrid-preconditioned or multigrid solver over the brick hierarchy,
-   with GPU reductions.
+1. Measure multigrid on real GPUs with `--profile`, and reduce coarse-level dispatch cost if it
+   shows.
 2. MacCormack advection and CFL substepping, then compare with the Mantaflow engine on a case
    where the active region covers the domain.
 3. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind

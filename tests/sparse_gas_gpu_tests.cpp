@@ -90,6 +90,7 @@ double median(std::vector<double> values)
 }
 
 bool use_jacobi = false;
+int multigrid_w_depth = -1;
 
 sparse::Settings test_settings(const int resolution)
 {
@@ -104,6 +105,9 @@ sparse::Settings test_settings(const int resolution)
   else {
     settings.pressure_solver = sparse::PressureSolver::Multigrid;
     settings.pressure_iterations = 6;
+    if (multigrid_w_depth >= 0) {
+      settings.multigrid_w_depth = multigrid_w_depth;
+    }
   }
   return settings;
 }
@@ -234,6 +238,7 @@ int main(int argc, char **argv)
   std::cout << std::unitbuf;
 
   bool bench = false, profile = false;
+  int tiny_limit = -1;
   std::vector<int> numbers;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--bench") {
@@ -241,6 +246,12 @@ int main(int argc, char **argv)
     }
     else if (std::string(argv[i]) == "--jacobi") {
       use_jacobi = true;
+    }
+    else if (std::string(argv[i]) == "--tiny-limit" && i + 1 < argc) {
+      tiny_limit = std::atoi(argv[++i]);
+    }
+    else if (std::string(argv[i]) == "--w-depth" && i + 1 < argc) {
+      multigrid_w_depth = std::atoi(argv[++i]);
     }
     else if (std::string(argv[i]) == "--profile") {
       bench = true;
@@ -269,6 +280,13 @@ int main(int argc, char **argv)
             << (solver->is_software_device() ? " (software)" : "")
             << (solver->has_timestamps() ? "" : " (no GPU timestamps)") << '\n';
 
+  if (tiny_limit >= 0) {
+    solver->set_single_dispatch_cell_limit(static_cast<std::size_t>(tiny_limit));
+    std::cout << "Single-dispatch level limit: " << tiny_limit << " cells\n";
+  }
+  if (multigrid_w_depth >= 0) {
+    std::cout << "Multigrid W-cycle depth: " << multigrid_w_depth << '\n';
+  }
   try {
     return bench ? benchmark(*solver, resolution, steps, profile) :
                    compare(*solver, resolution, steps);

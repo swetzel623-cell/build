@@ -44,6 +44,12 @@ class SparseGasGpu {
   /** Time each kernel separately. Adds a timestamp per command, so totals rise slightly. */
   void set_profiling(bool enabled);
 
+  /**
+   * Multigrid levels of at most this many cells are cycled together in one dispatch; 0 gives
+   * every level its own dispatches. Takes effect at the next upload() or topology change.
+   */
+  void set_single_dispatch_cell_limit(std::size_t cells);
+
   /** Replace the device state with `state`. */
   void upload(const sparse::State &state);
   /** Copy the device state, including its topology, into `state`. */

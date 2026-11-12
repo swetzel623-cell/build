@@ -63,6 +63,7 @@ struct MultigridParams {
 
 /** Push constants of mg_dense_cycle.comp. */
 struct DenseCycleParams {
+  std::int32_t first_level;
   std::int32_t level_count;
   std::int32_t pre_sweeps;
   std::int32_t post_sweeps;
@@ -110,6 +111,9 @@ struct SparseGasGpu::Impl {
   /** All dense levels back to back, so one dispatch can cycle through them. */
   Compute::Buffer dense_op, dense_values, dense_rhs, dense_residual, dense_table;
   int first_dense = 0;
+  /** First level handed to the single-dispatch cycle: the dense levels from here on are tiny. */
+  int first_single = 0;
+  std::size_t single_dispatch_cell_limit = 512;
   /** Per voxel: cell type and neighbor links, packed by the classify_links kernel. */
   Compute::Buffer links;
 
@@ -232,6 +236,13 @@ struct SparseGasGpu::Impl {
         ensure(level.residual, level.cells * sizeof(float));
       }
     }
+    first_single = static_cast<int>(layout.size());
+    for (int i = static_cast<int>(layout.size()) - 1; i >= first_dense; --i) {
+      if (levels[static_cast<std::size_t>(i)].cells > single_dispatch_cell_limit) {
+        break;
+      }
+      first_single = i;
+    }
     ensure(dense_op, dense_cells * 4 * sizeof(float));
     ensure(dense_values, dense_cells * sizeof(float));
     ensure(dense_rhs, dense_cells * sizeof(float));
@@ -337,9 +348,10 @@ struct SparseGasGpu::Impl {
       const int coarse_cycles = coarse < settings.multigrid_w_depth ?
                                     settings.multigrid_coarse_cycles :
                                     1;
-      if (coarse == first_dense && settings.multigrid_w_depth <= first_dense) {
-        /* Every dense level takes plain V-cycles: run them all in one dispatch. */
-        const DenseCycleParams dense = {static_cast<std::int32_t>(levels.size()) - first_dense,
+      if (coarse == first_single && settings.multigrid_w_depth <= first_single) {
+        /* The remaining levels are tiny and take plain V-cycles: one dispatch runs them all. */
+        const DenseCycleParams dense = {first_single - first_dense,
+                                        static_cast<std::int32_t>(levels.size()) - first_single,
                                         settings.multigrid_pre_sweeps,
                                         settings.multigrid_post_sweeps,
                                         settings.multigrid_coarsest_sweeps,
@@ -350,7 +362,7 @@ struct SparseGasGpu::Impl {
                          {&dense_table, &dense_op, &dense_rhs, &dense_values, &dense_residual,
                           nullptr, nullptr, nullptr},
                          1,
-                         "mg dense levels");
+                         "mg tiny levels");
       }
       else {
         for (int i = 0; i < coarse_cycles; ++i) {
@@ -483,6 +495,11 @@ bool SparseGasGpu::is_software_device() const
 bool SparseGasGpu::has_timestamps() const
 {
   return impl_->compute.has_timestamps();
+}
+
+void SparseGasGpu::set_single_dispatch_cell_limit(const std::size_t cells)
+{
+  impl_->single_dispatch_cell_limit = cells;
 }
 
 void SparseGasGpu::set_profiling(const bool enabled)

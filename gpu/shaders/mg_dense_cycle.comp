@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
-// One V-cycle over all dense multigrid levels in a single dispatch.
+// One V-cycle over the smallest dense multigrid levels in a single dispatch.
 //
-// The dense levels are tiny, and visiting them with one dispatch per sweep costs far more in
-// dispatch overhead than in work. Here one work group runs the whole cycle: its invocations
-// share each pass over a level and meet at a barrier between passes. The sequence of passes is
+// Levels of a few hundred cells cost far more in dispatch overhead than in work when every sweep
+// is its own dispatch. Here one work group runs the whole cycle over them: its invocations share
+// each pass over a level and meet at a barrier between passes. A single work group is slow on
+// larger levels (measured: about 1 ms for a 20,000-cell level), so the driver only hands over
+// levels below a size limit. The sequence of passes is
 // exactly v_cycle in src/sparse_multigrid.cpp restricted to these levels.
 #version 450
 layout(local_size_x = 128) in;
@@ -11,6 +13,7 @@ const int THREADS = 128;
 
 layout(push_constant) uniform Params
 {
+  int first_level; /* Entry of the level table to start at. */
   int level_count;
   int pre_sweeps;
   int post_sweeps;
@@ -96,8 +99,8 @@ void main()
   int last = P.level_count - 1;
 
   for (int l = 0; l < last; ++l) {
-    ivec4 level = levels[l];
-    ivec4 coarse = levels[l + 1];
+    ivec4 level = levels[P.first_level + l];
+    ivec4 coarse = levels[P.first_level + l + 1];
     relax(level, P.pre_sweeps);
 
     int count = cell_count(level);
@@ -125,11 +128,11 @@ void main()
     sync();
   }
 
-  relax(levels[last], P.coarsest_sweeps);
+  relax(levels[P.first_level + last], P.coarsest_sweeps);
 
   for (int l = last - 1; l >= 0; --l) {
-    ivec4 level = levels[l];
-    ivec4 coarse = levels[l + 1];
+    ivec4 level = levels[P.first_level + l];
+    ivec4 coarse = levels[P.first_level + l + 1];
     int count = cell_count(level);
     for (int local = thread; local < count; local += THREADS) {
       int index = level.w + local;

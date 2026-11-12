@@ -256,11 +256,17 @@ What this shows:
   advection 1.3 ms. The coarse levels hold about a seventh of the cells, so nearly all of their
   time is overhead: about 1,800 small dispatches per step at roughly 6 µs each.
 
-In response, all dense levels now live back to back in shared buffers and one dispatch runs
-their whole V-cycle: a single work group of 128 invocations shares each pass over a level and
-meets at a barrier between passes. That removes about 1,400 of the dispatches. On llvmpipe the
-results stay bit-identical and a 48×48×72 step fell from 478 ms to 299 ms. Not yet measured on a
-real GPU. The two levels stored per brick still take one dispatch per sweep.
+In response, all dense levels now live back to back in shared buffers and one dispatch can run
+a V-cycle over several of them: a single work group of 128 invocations shares each pass over a
+level and meets at a barrier between passes.
+
+Handing it **all** dense levels was a mistake that llvmpipe hid. On the RTX 3070 that dispatch
+took 28 ms per step at 192 (24 calls of about 1.2 ms), against the 11 ms it replaced, and the
+median step rose from 19.8 to 29.2 ms: one work group is slow on the first dense level's 20,736
+cells. Results were still correct (comparison passed, same differences). The driver now hands
+over only the trailing levels of at most 512 cells and gives larger levels their own dispatches
+again; `--tiny-limit` changes the limit and `--w-depth` the W-cycle depth for experiments. This
+version is not yet measured on a real GPU.
 
 With the resident driver, on llvmpipe, every channel still equals the CPU reference bit for bit:
 32×32×48 over 12 steps, and 48×48×72 over 14 steps, where the active set grows from 64 to 160

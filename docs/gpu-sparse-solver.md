@@ -139,8 +139,9 @@ coarse level is visited twice per cycle (a W-cycle at the top, V-cycles below;
 levels visited twice the residual falls by about 0.31 per cycle on sparse and closed domains from
 32 to 128 voxels wide, with one level 0.34, and with plain V-cycles 0.49 to 0.55; larger scaling
 factors diverge. One level is the default because it needs about 40% fewer dispatches (see
-"Cutting dispatches" below). On the device the residual is computed inside the restriction
-kernel, so a level visit costs one dispatch less and needs no residual buffer. On the device, the coarse operators are rebuilt by kernels whenever the topology
+"Cutting dispatches" below). On the device the voxel-level residual is computed inside the
+restriction kernel, which saves a pass over the voxels; the coarse levels keep a residual pass
+of their own, because merging it there measured slower. On the device, the coarse operators are rebuilt by kernels whenever the topology
 changes, and the voxel level reads a packed word per voxel (cell type and which neighbors are
 fluid or not solid) instead of looking up neighbor types.
 
@@ -375,7 +376,36 @@ levels are paid for by count. Measured on the CPU reference, on a developed 96×
 - **Merging the residual into the restriction** removes one of eleven dispatches per level
   visit without changing any result: on llvmpipe the device still equals the CPU reference bit
   for bit. Together with the new default, a substep at 192×192×288 goes from about 1014
-  dispatches to about 550. Its effect on the RTX 3070 is not measured yet.
+  dispatches to about 550.
+
+**Measured on the RTX 3070: the merge did not pay off on the coarse levels.** The comparison run
+passed (largest difference 1.1e-5). 192×192×288, 40 frames, 190 substeps each, averaged per
+substep:
+
+| Variant | Wall | GPU | Divergence left |
+|---|---|---|---|
+| Default (W on one level, merged restriction) | 16.8 ms | 14.0 ms | 2.1e-4 |
+| `--w-depth 2` | 19.3 ms | 16.2 ms | 1.1e-4 |
+| `--coarse-sweeps 1 2` | 15.1 ms | 12.6 ms | 2.8e-4 |
+| Before the merge, W on one level (earlier session) | 15.8 ms | 12.2 ms | 2.1e-4 |
+| Before the merge, W on two levels (earlier session) | 18.3 ms | 14.1 ms | 1.1e-4 |
+
+- **Nearly half the dispatches gone, and no gain.** Both cycle shapes came out about 6% slower
+  than before the merge. The sessions are a day apart and timings vary that much on their own,
+  so this shows no gain, not a certain loss.
+- **The profile says where.** Scaled by the voxel-level smoothing, which did not change, the
+  merged coarse restriction costs about as much with half the visits as the separate residual
+  and restriction did before: twice as much per visit. A coarse cell now does the work of its
+  eight children in one thread, and on these small levels a dispatch takes as long as its
+  longest thread, not as long as its total work. So the 6 µs per coarse dispatch is not a
+  fixed cost that fewer dispatches avoid.
+- On the voxel level the merged restriction costs about 2.3 ms per frame on the same scale,
+  against about 2.8 ms for the two passes it replaced; that part stays.
+- **The coarse levels are back to a separate residual pass** (about 590 dispatches per substep).
+  This revert is verified on llvmpipe only and has not been timed on the RTX 3070.
+- One sweep before and two after on the coarse levels is 10% faster in the same session for a
+  third more remaining divergence, in line with the CPU measurement: about even per digit of
+  accuracy. The default stays at 2+2.
 
 **Fewer substeps (larger CFL number): not adopted.** Blender's Mantaflow domain defaults to a
 CFL number of 4; this solver uses 2. Measured on the CPU reference, a 48×48×72 plume, multigrid,
@@ -445,7 +475,7 @@ default of 4 has not been checked.
 
 ## Next steps
 
-1. Measure the dispatch-cutting change on the RTX 3070.
+1. Time the coarse-level revert on the RTX 3070, with both variants in one session.
 2. A midpoint (second-order) backward trace, then repeat the CFL measurement: if mass holds at
    4 voxels per step, frames need about half the substeps.
 3. Measure multigrid at larger sizes, where dispatch overhead should matter less.

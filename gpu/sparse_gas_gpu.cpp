@@ -11,6 +11,7 @@
 #include "mask_pressure.comp.h"
 #include "mg_smooth0.comp.h"
 #include "mg_restrict0.comp.h"
+#include "mg_residual.comp.h"
 #include "mg_smooth.comp.h"
 #include "mg_restrict.comp.h"
 #include "mg_prolong0.comp.h"
@@ -95,7 +96,7 @@ std::uint32_t groups_for(const std::size_t count)
 struct SparseGasGpu::Impl {
   Compute compute;
   int advect, maccormack, buoyancy, walls, divergence, jacobi, gradient, activity, remap, classify;
-  int classify_links, mask_pressure, mg_smooth0, mg_restrict0, mg_smooth;
+  int classify_links, mask_pressure, mg_smooth0, mg_restrict0, mg_smooth, mg_residual;
   int mg_restrict, mg_prolong0, mg_prolong, mg_build0, mg_build, mg_dense_cycle;
 
   /** One coarse multigrid level on the device. */
@@ -105,7 +106,7 @@ struct SparseGasGpu::Impl {
     /** Dense levels: first cell in the buffers all dense levels share. */
     std::size_t offset = 0;
     /** Owned by the level if it is stored per brick; copies of the shared buffers if dense. */
-    Compute::Buffer op, values, rhs;
+    Compute::Buffer op, values, rhs, residual;
   };
   std::vector<Level> levels;
   /** All dense levels back to back, so one dispatch can cycle through them. */
@@ -145,6 +146,7 @@ struct SparseGasGpu::Impl {
     mask_pressure = KERNEL(mask_pressure);
     mg_smooth0 = KERNEL(mg_smooth0);
     mg_restrict0 = KERNEL(mg_restrict0);
+    mg_residual = KERNEL(mg_residual);
     mg_smooth = KERNEL(mg_smooth);
     mg_restrict = KERNEL(mg_restrict);
     mg_prolong0 = KERNEL(mg_prolong0);
@@ -190,7 +192,7 @@ struct SparseGasGpu::Impl {
     if (level.layout.dense) {
       return;
     }
-    for (Compute::Buffer *buffer : {&level.op, &level.values, &level.rhs}) {
+    for (Compute::Buffer *buffer : {&level.op, &level.values, &level.rhs, &level.residual}) {
       compute.destroy_buffer(*buffer);
     }
   }
@@ -237,6 +239,7 @@ struct SparseGasGpu::Impl {
         ensure(level.op, level.cells * 4 * sizeof(float));
         ensure(level.values, level.cells * sizeof(float));
         ensure(level.rhs, level.cells * sizeof(float));
+        ensure(level.residual, level.cells * sizeof(float));
       }
     }
     first_single = static_cast<int>(layout.size());
@@ -256,6 +259,7 @@ struct SparseGasGpu::Impl {
         level.op = dense_op;
         level.values = dense_values;
         level.rhs = dense_rhs;
+        level.residual = dense_residual;
       }
     }
   }
@@ -327,16 +331,38 @@ struct SparseGasGpu::Impl {
         return;
       }
       smooth(l, l < 0 ? settings.multigrid_pre_sweeps : settings.multigrid_coarse_pre_sweeps);
-      /* The residual is computed inside the restriction: one dispatch, not two. */
       const int coarse = l + 1;
       const MultigridParams down = multigrid_params(l, coarse, level_cells(coarse));
-      compute.dispatch(l < 0 ? mg_restrict0 : mg_restrict,
-                       &down,
-                       sizeof(down),
-                       {&table, &coords, &op(l), &rhs(l), &values(l), &rhs(coarse),
-                        &values(coarse), nullptr},
-                       groups_for(level_cells(coarse)),
-                       l < 0 ? "mg restrict (voxels)" : "mg restrict (coarse)");
+      if (l < 0) {
+        /* On the voxels the residual is computed inside the restriction: one pass over them
+         * less. On the coarse levels that measured slower on a real GPU, where a dispatch
+         * takes as long as its longest thread, so they keep a residual pass of their own. */
+        compute.dispatch(mg_restrict0,
+                         &down,
+                         sizeof(down),
+                         {&table, &coords, &op(l), &rhs(l), &values(l), &rhs(coarse),
+                          &values(coarse), nullptr},
+                         groups_for(level_cells(coarse)),
+                         "mg restrict (voxels)");
+      }
+      else {
+        const Compute::Buffer &residual = levels[static_cast<std::size_t>(l)].residual;
+        const MultigridParams here = multigrid_params(l, -1, level_cells(l));
+        compute.dispatch(mg_residual,
+                         &here,
+                         sizeof(here),
+                         {&table, &coords, &op(l), &rhs(l), &values(l), &residual, nullptr,
+                          nullptr},
+                         groups_for(level_cells(l)),
+                         "mg residual (coarse)");
+        compute.dispatch(mg_restrict,
+                         &down,
+                         sizeof(down),
+                         {&table, &coords, nullptr, &residual, &rhs(coarse), &values(coarse),
+                          nullptr, nullptr},
+                         groups_for(level_cells(coarse)),
+                         "mg restrict (coarse)");
+      }
       const int coarse_cycles = coarse < settings.multigrid_w_depth ?
                                     settings.multigrid_coarse_cycles :
                                     1;

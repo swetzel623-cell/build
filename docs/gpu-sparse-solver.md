@@ -109,6 +109,11 @@ the largest velocity component at the start of each substep, and fails past a su
 the device that speed is gathered per brick by the activity kernel and comes back with the
 activity flags, so substepping adds no transfer.
 
+**Steps.** By default a step is an advection-reflection step: advect for half the step, add
+buoyancy, project; reflect the velocity about its projection; advect the reflected velocity and
+the scalars through the projected field for the other half; add buoyancy and project again. With
+`reflection = false` a step is one advection, buoyancy, and one projection.
+
 **The device driver.** The state stays in device memory between steps; `upload()` and
 `download()` are the only full transfers. A step is two submissions. The first runs the activity
 kernel and downloads one flag per brick, 4 bytes per active brick. The CPU builds the next brick
@@ -535,7 +540,7 @@ since it advects and projects twice; that is an estimate, not a GPU timing.
 - **Vorticity confinement does not restore the shape.** At strengths 2 and 6 (in voxel units)
   the cap stays wide; at 15 the plume breaks into noise and gains 14% mass. It adds detail, not
   the missing roll-up, and is not pursued.
-- Reflection is implemented as `Settings::reflection`, off by default, in the CPU reference and
+- Reflection is implemented as `Settings::reflection` in the CPU reference and
   on the device (two small kernels keep and reflect the unprojected velocity). On llvmpipe the
   device equals the CPU reference bit for bit with it.
 
@@ -559,6 +564,15 @@ slower throughout than the one that measured the midpoint trace):
   correction 33%) and multigrid 49%; keeping and reflecting the velocity is 0.2%.
 - The shapes these runs produce at this resolution were not compared; the shape comparison
   above is from the CPU reference at 96×96×144.
+
+**Current defaults: advection-reflection at CFL 6**, with the midpoint trace and MacCormack
+advection. This was chosen for the rolled-up plume at 1.4 times the frame time of plain steps.
+`reflection = false` with `cfl = 4` gives the faster, smoother result. "(default)" in the
+tables above marks the default at the time of each measurement. A CPU test requires the
+defaults to keep at least 65% of a small fast plume's mass (they keep 88%), and plain steps
+with the midpoint trace to keep clearly more than with the single-stage trace (90% against
+58% at CFL 4). All GPU test programs compare the device with the CPU reference under the new
+defaults on llvmpipe; a separate one covers plain steps.
 
 ## Not verified, and known gaps
 
@@ -595,8 +609,8 @@ slower throughout than the one that measured the midpoint trace):
 
 ## Next steps
 
-1. Decide whether reflection at CFL 6 becomes the default (1.4 times the frame time for the
-   rolled-up plume).
+1. Compare the plume shapes of reflection and plain steps at 192×192×288 on the GPU; so far
+   shapes were compared on the CPU reference at 96×96×144 only.
 2. Make the MacCormack correction cheaper: it now takes a third of the GPU time, and its two
    traces repeat velocity samples the forward pass already made.
 3. Measure multigrid at larger sizes, where dispatch overhead should matter less.

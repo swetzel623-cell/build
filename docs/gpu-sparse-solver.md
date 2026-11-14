@@ -535,7 +535,9 @@ since it advects and projects twice; that is an estimate, not a GPU timing.
 - **Vorticity confinement does not restore the shape.** At strengths 2 and 6 (in voxel units)
   the cap stays wide; at 15 the plume breaks into noise and gains 14% mass. It adds detail, not
   the missing roll-up, and is not pursued.
-- Reflection is implemented in the CPU reference as `Settings::reflection`, off by default.
+- Reflection is implemented as `Settings::reflection`, off by default, in the CPU reference and
+  on the device (two small kernels keep and reflect the unprojected velocity). On llvmpipe the
+  device equals the CPU reference bit for bit with it; it has not run on a real GPU.
 
 ## Not verified, and known gaps
 
@@ -572,7 +574,7 @@ since it advects and projects twice; that is an estimate, not a GPU timing.
 
 ## Next steps
 
-1. Run advection-reflection on the GPU and time it against the plain step.
+1. Time advection-reflection on the RTX 3070 against the plain step.
 2. Make the MacCormack correction cheaper: it now takes a third of the GPU time, and its two
    traces repeat velocity samples the forward pass already made.
 3. Measure multigrid at larger sizes, where dispatch overhead should matter less.

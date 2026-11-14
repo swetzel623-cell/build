@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: MIT
+// Copy three channels. Used to keep the unprojected velocity for advection-reflection.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index)) {
+    return;
+  }
+  b7[index] = b4[index];
+  b8[index] = b5[index];
+  b9[index] = b6[index];
+}

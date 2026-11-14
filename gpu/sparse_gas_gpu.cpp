@@ -11,6 +11,8 @@
 #include "mask_pressure.comp.h"
 #include "mg_smooth0.comp.h"
 #include "mg_restrict0.comp.h"
+#include "copy3.comp.h"
+#include "reflect.comp.h"
 #include "mg_residual.comp.h"
 #include "mg_smooth.comp.h"
 #include "mg_restrict.comp.h"
@@ -97,7 +99,7 @@ std::uint32_t groups_for(const std::size_t count)
 struct SparseGasGpu::Impl {
   Compute compute;
   int advect, maccormack, buoyancy, walls, divergence, jacobi, gradient, activity, remap, classify;
-  int classify_links, mask_pressure, mg_smooth0, mg_restrict0, mg_smooth, mg_residual;
+  int classify_links, mask_pressure, mg_smooth0, mg_restrict0, mg_smooth, mg_residual, copy3, reflect;
   int mg_restrict, mg_prolong0, mg_prolong, mg_build0, mg_build, mg_dense_cycle;
 
   /** One coarse multigrid level on the device. */
@@ -147,6 +149,8 @@ struct SparseGasGpu::Impl {
     mask_pressure = KERNEL(mask_pressure);
     mg_smooth0 = KERNEL(mg_smooth0);
     mg_restrict0 = KERNEL(mg_restrict0);
+    copy3 = KERNEL(copy3);
+    reflect = KERNEL(reflect);
     mg_residual = KERNEL(mg_residual);
     mg_smooth = KERNEL(mg_smooth);
     mg_restrict = KERNEL(mg_restrict);
@@ -783,53 +787,97 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
                                  {0.0f, 0.5f, 0.5f},
                                  {0.5f, 0.0f, 0.5f},
                                  {0.5f, 0.5f, 0.0f}};
-    /* Every channel is advected by the velocity from the start of the step. */
     const bool second_order = settings.advection == sparse::Advection::MacCormack;
     const int forward = StateChannels + 5;
-    for (int i = 0; i < 5; ++i) {
-      Params p = g.params(offsets[i][0], offsets[i][1], offsets[i][2], dt);
+    /* Advect `source` (staggered like state channel `kind`) through U, V, W into `target`. */
+    const auto advect_channel = [&](const int kind, const int source, const int target,
+                                    const float step) {
+      Params p = g.params(offsets[kind][0], offsets[kind][1], offsets[kind][2], step);
       p.flags[0] = settings.midpoint_trace ? 1 : 0;
-      g.stencil(g.advect, "advect", p, U, V, W, i, second_order ? forward : StateChannels + i);
+      g.stencil(g.advect, "advect", p, U, V, W, source, second_order ? forward : target);
       if (second_order) {
-        g.stencil(g.maccormack, "maccormack", p, U, V, W, i, forward, StateChannels + i);
-      }
-    }
-    for (int i = 0; i < 5; ++i) {
-      std::swap(g.role[static_cast<std::size_t>(i)],
-                g.role[static_cast<std::size_t>(StateChannels + i)]);
-    }
-
-    const auto buoyancy = [&](const int factor, const float coefficient) {
-      if (coefficient != 0.0f) {
-        g.stencil(g.buoyancy,
-                "buoyancy",
-                  g.params(-settings.gravity[0] * dt * coefficient,
-                           -settings.gravity[1] * dt * coefficient,
-                           -settings.gravity[2] * dt * coefficient,
-                           0.0f),
-                  factor,
-                  U,
-                  V,
-                  W);
+        g.stencil(g.maccormack, "maccormack", p, U, V, W, source, forward, target);
       }
     };
-    buoyancy(Temperature, settings.heat_buoyancy);
-    buoyancy(Density, settings.density_buoyancy);
-    g.stencil(g.walls, "walls", g.params(0, 0, 0, 0), U, V, W);
+    const auto add_forces = [&](const float step) {
+      const auto buoyancy = [&](const int factor, const float coefficient) {
+        if (coefficient != 0.0f) {
+          g.stencil(g.buoyancy,
+                    "buoyancy",
+                    g.params(-settings.gravity[0] * step * coefficient,
+                             -settings.gravity[1] * step * coefficient,
+                             -settings.gravity[2] * step * coefficient,
+                             0.0f),
+                    factor,
+                    U,
+                    V,
+                    W);
+        }
+      };
+      buoyancy(Temperature, settings.heat_buoyancy);
+      buoyancy(Density, settings.density_buoyancy);
+      g.stencil(g.walls, "walls", g.params(0, 0, 0, 0), U, V, W);
+    };
+    const auto project = [&]() {
+      const int rhs = StateChannels, next_pressure = StateChannels + 1;
+      g.stencil(g.divergence, "divergence", g.params(-1.0f, 0, 0, 0), U, V, W, rhs);
+      if (settings.pressure_solver == sparse::PressureSolver::Multigrid) {
+        g.stencil(g.mask_pressure, "mask pressure", g.params(0, 0, 0, 0), Pressure);
+        g.record_multigrid(settings, rhs);
+      }
+      else {
+        for (int i = 0; i < settings.pressure_iterations; ++i) {
+          g.stencil(g.jacobi, "jacobi", g.params(0, 0, 0, 0), rhs, Pressure, next_pressure);
+          std::swap(g.role[Pressure], g.role[static_cast<std::size_t>(next_pressure)]);
+        }
+      }
+      g.stencil(g.gradient, "gradient", g.params(0, 0, 0, 0), Pressure, U, V, W);
+    };
+    /* Every channel is advected by the velocity from the start of the (half) step. */
+    const auto advect_state = [&](const float step) {
+      for (int i = 0; i < 5; ++i) {
+        advect_channel(i, i, StateChannels + i, step);
+      }
+      for (int i = 0; i < 5; ++i) {
+        std::swap(g.role[static_cast<std::size_t>(i)],
+                  g.role[static_cast<std::size_t>(StateChannels + i)]);
+      }
+    };
 
-    const int rhs = StateChannels, next_pressure = StateChannels + 1;
-    g.stencil(g.divergence, "divergence", g.params(-1.0f, 0, 0, 0), U, V, W, rhs);
-    if (settings.pressure_solver == sparse::PressureSolver::Multigrid) {
-      g.stencil(g.mask_pressure, "mask pressure", g.params(0, 0, 0, 0), Pressure);
-      g.record_multigrid(settings, rhs);
+    if (!settings.reflection) {
+      advect_state(dt);
+      add_forces(dt);
+      project();
     }
     else {
-      for (int i = 0; i < settings.pressure_iterations; ++i) {
-        g.stencil(g.jacobi, "jacobi", g.params(0, 0, 0, 0), rhs, Pressure, next_pressure);
-        std::swap(g.role[Pressure], g.role[static_cast<std::size_t>(next_pressure)]);
-      }
+      /* Mirrors the reflection branch of step() in the CPU reference. */
+      const float half = 0.5f * dt;
+      advect_state(half);
+      add_forces(half);
+      /* Scratch 0 and 1 are used by the projection and scratch 5 by MacCormack. */
+      const int kept = StateChannels + 2;
+      g.stencil(g.copy3, "reflect", g.params(0, 0, 0, 0), U, V, W, kept, kept + 1, kept + 2);
+      project();
+      g.stencil(g.reflect, "reflect", g.params(0, 0, 0, 0), U, V, W, kept, kept + 1, kept + 2);
+      /* The reflected velocity and the scalars travel through the projected field. Each
+       * result goes into a scratch channel that is free by then. */
+      advect_channel(U, kept, StateChannels, half);
+      advect_channel(V, kept + 1, StateChannels + 1, half);
+      advect_channel(W, kept + 2, kept, half);
+      advect_channel(Density, Density, kept + 1, half);
+      advect_channel(Temperature, Temperature, kept + 2, half);
+      const auto adopt = [&](const int state_channel, const int scratch) {
+        std::swap(g.role[static_cast<std::size_t>(state_channel)],
+                  g.role[static_cast<std::size_t>(scratch)]);
+      };
+      adopt(U, StateChannels);
+      adopt(V, StateChannels + 1);
+      adopt(W, kept);
+      adopt(Density, kept + 1);
+      adopt(Temperature, kept + 2);
+      add_forces(half);
+      project();
     }
-    g.stencil(g.gradient, "gradient", g.params(0, 0, 0, 0), Pressure, U, V, W);
   }
   add_gpu_time(g.compute.submit());
   g.collect_profile();

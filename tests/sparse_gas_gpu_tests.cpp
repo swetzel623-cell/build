@@ -96,6 +96,7 @@ constexpr float frame_time = 1.0f / 30.0f;
 int multigrid_w_depth = -1;
 int coarse_pre_sweeps = -1, coarse_post_sweeps = -1;
 int midpoint = -1;
+bool reflection = false;
 
 sparse::Settings test_settings(const int resolution)
 {
@@ -106,6 +107,7 @@ sparse::Settings test_settings(const int resolution)
   if (cfl > 0.0f) {
     settings.cfl = cfl;
   }
+  settings.reflection = reflection;
   if (midpoint >= 0) {
     settings.midpoint_trace = midpoint != 0;
   }
@@ -288,6 +290,9 @@ int main(int argc, char **argv)
     else if (std::string(argv[i]) == "--w-depth" && i + 1 < argc) {
       multigrid_w_depth = std::atoi(argv[++i]);
     }
+    else if (std::string(argv[i]) == "--reflection") {
+      reflection = true;
+    }
     else if (std::string(argv[i]) == "--midpoint" && i + 1 < argc) {
       midpoint = std::atoi(argv[++i]);
     }
@@ -309,7 +314,8 @@ int main(int argc, char **argv)
   std::cout << "Starting: resolution " << resolution << ", " << steps << " frames"
             << (profile ? ", profile" : bench ? ", benchmark" : "")
             << (use_jacobi ? ", 60 Jacobi sweeps" : ", 6 multigrid cycles")
-            << (first_order ? ", first-order advection" : ", MacCormack advection") << '\n';
+            << (first_order ? ", first-order advection" : ", MacCormack advection")
+            << (reflection ? ", advection-reflection" : "") << '\n';
   std::cout << "Creating the Vulkan device...\n";
   std::unique_ptr<gpu::SparseGasGpu> solver;
   try {

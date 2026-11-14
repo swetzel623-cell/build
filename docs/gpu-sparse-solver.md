@@ -589,6 +589,31 @@ slices from the device:
 - Only the pictures were returned from this run, not the program's printed mass, height, and
   width, so this comparison is by eye.
 
+**Reusing the forward trace's bounds in the MacCormack correction.** The correction used to
+repeat the forward pass's backward trace and its eight corner lookups only to find the bounds
+for clamping. The forward pass now stores the lowest and highest value it interpolated (two
+floats per voxel, lowest above highest when a corner had no storage), and the correction reads
+them. On llvmpipe the device still equals the CPU reference bit for bit. RTX 3070,
+192×192×288, 40 frames, defaults, the previous and the new build run alternately in one
+session:
+
+| Build | Median frame, wall | Median frame, GPU |
+|---|---|---|
+| Previous | 69.8 ms | 60.4 ms |
+| New | 58.5 ms | 49.3 ms |
+| Previous | 68.1 ms | 60.0 ms |
+| New | 59.6 ms | 49.3 ms |
+
+- **A frame takes 15% less wall time and 18% less GPU time**, the same in both pairs.
+- The comparison run of the new build passed (largest difference 9.2e-6). The remaining
+  divergence differs from the previous build in the sixth digit (1.56807e-4 against
+  1.568e-4): the forward pass's interpolation is written out differently, which the GPU's
+  compiler may round differently.
+- In the profile the correction is down from 33% to 18% of the GPU time, level with the
+  forward pass (18%); multigrid is 59%.
+- This session was faster than the one that timed reflection (the previous build measured
+  87.6 ms there), which is why builds are compared within a session.
+
 ## Not verified, and known gaps
 
 - **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.
@@ -624,7 +649,7 @@ slices from the device:
 
 ## Next steps
 
-1. Make the MacCormack correction cheaper: it is a third of the GPU time.
+1. Advect density and temperature in one pass: they share their departure points.
 2. Find out why the plume loses its left-right symmetry.
 3. Measure multigrid at larger sizes, where dispatch overhead should matter less.
 4. Compare with the Mantaflow engine on a case where the active region covers the domain.

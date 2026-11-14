@@ -452,13 +452,34 @@ measurement as the table above:
   small-step run. At 6 it starts to fall behind.
 - **The defaults are now the midpoint trace and a CFL number of 4**, Blender's Mantaflow
   default. A frame then needs about half the substeps it did at 2.
-- On llvmpipe the device equals the CPU reference bit for bit with the midpoint trace. On a real
-  GPU it has not run yet, and its cost there (more samples per trace, half the substeps) is not
-  measured.
+- On llvmpipe the device equals the CPU reference bit for bit with the midpoint trace.
 - A CPU test requires the default to keep at least 65% of a small fast plume's mass and the
   single-stage trace to keep clearly less.
 
 Whether Mantaflow loses mass at its default of 4 has not been checked.
+
+**Midpoint trace and CFL 4 on the RTX 3070.** The comparison run at 64×64×96 passed (largest
+difference 5.0e-6; one substep per frame where CFL 2 took two). 192×192×288, 40 frames, one
+session:
+
+| Variant | Median frame, wall | Median frame, GPU | Substeps | Wall per substep | Peak bricks | Divergence left |
+|---|---|---|---|---|---|---|
+| Midpoint, CFL 4 (default) | 50.7 ms | 40.3 ms | 105 | 18.7 ms | 2493 | 2.0e-4 |
+| Single-stage, CFL 2 (old default) | 89.3 ms | 67.5 ms | 190 | 17.0 ms | 3246 | 2.1e-4 |
+| Midpoint, CFL 2 | 116.9 ms | 89.3 ms | 191 | 22.1 ms | 3368 | 1.7e-4 |
+
+- **A frame takes 43% less time** (39% less summed over the run): 45% fewer substeps, each
+  about 10% slower.
+- **The trace itself costs about 30% per substep** at equal CFL (22.1 against 17.0 ms).
+  Advection is now 46% of the GPU time (forward pass 15%, MacCormack correction 32%) and
+  multigrid about 49%.
+- **The plume occupies fewer bricks at CFL 4** (2493 against 3246 at the last frame). The two
+  runs are different discretisations of the same scene, so some difference is expected, but
+  whether the CFL 4 plume is as developed as the CFL 2 one at this resolution has not been
+  checked; the CPU measurement above covers mass and height at 48×48×72 only.
+- The coarse-level revert cannot be judged from this run: the old settings take 17.0 ms per
+  substep here, against 16.8 ms with the merged kernel and 15.8 ms before it in earlier
+  sessions, which is within the variation between sessions.
 
 ## Not verified, and known gaps
 
@@ -495,8 +516,10 @@ Whether Mantaflow loses mass at its default of 4 has not been checked.
 
 ## Next steps
 
-1. Time the coarse-level revert on the RTX 3070, with both variants in one session.
-2. Time the midpoint trace and CFL 4 on the RTX 3070.
+1. Check at higher resolution that the CFL 4 plume matches the CFL 2 one in shape, not only in
+   mass and height.
+2. Make the MacCormack correction cheaper: it now takes a third of the GPU time, and its two
+   traces repeat velocity samples the forward pass already made.
 3. Measure multigrid at larger sizes, where dispatch overhead should matter less.
 4. Compare with the Mantaflow engine on a case where the active region covers the domain.
 5. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind

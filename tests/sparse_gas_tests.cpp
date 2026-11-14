@@ -108,7 +108,10 @@ void test_topology_and_cell_types()
   require(isolated.type_at(10, 10, 10) == CellFluid, "interior voxel must be fluid");
   require(isolated.type_at(15, 10, 10) == CellOpen && isolated.type_at(10, 10, 15) == CellOpen,
           "the upper layer of an isolated brick holds open-air faces");
-  require(isolated.type_at(8, 10, 10) == CellFluid, "the lower layer needs no ghost cells");
+  require(isolated.type_at(8, 10, 10) == CellOpen && isolated.type_at(10, 10, 8) == CellOpen,
+          "the lower layer must be open air too, so that the boundary is the same on every side");
+  require(isolated.type_at(9, 9, 9) == CellFluid && isolated.type_at(14, 14, 14) == CellFluid,
+          "one voxel inside the brick's surface must be fluid");
   require(isolated.type_at(20, 20, 20) == CellOpen, "unstored interior is open air");
   require(isolated.type_at(0, 5, 5) == CellSolid && isolated.type_at(31, 5, 5) == CellSolid,
           "domain boundary layer must be solid");
@@ -454,6 +457,38 @@ void test_large_steps_keep_mass()
   require(single_stage < midpoint - 0.1, "the midpoint trace was expected to keep more smoke");
 }
 
+/**
+ * A scene that is mirror-symmetric must stay so. The open boundary of the active region once lay
+ * a voxel further out on its lower sides, which made a centred plume lean within a few frames.
+ */
+void test_symmetric_scene_stays_symmetric()
+{
+  const Extent extent{32, 32, 48};
+  const DenseFields initial = blob(extent, 16.0f, 16.0f, 12.0f, 4.0f);
+  Settings settings = plume_settings();
+  settings.pressure_solver = PressureSolver::Multigrid;
+  settings.pressure_iterations = 6;
+  State state = from_dense(initial, 8, settings.thresholds, settings.dilation);
+  for (int i = 0; i < 5; ++i) {
+    advance(state, settings, 1.0f / 15.0f);
+  }
+  const DenseFields result = to_dense(state);
+  float asymmetry = 0.0f;
+  for (int z = 0; z < extent.z; ++z) {
+    for (int y = 0; y < extent.y; ++y) {
+      for (int x = 0; x < extent.x; ++x) {
+        const float value = result.density[dense_index(extent, x, y, z)];
+        asymmetry = std::max(
+            asymmetry, std::abs(value - result.density[dense_index(extent, extent.x - 1 - x, y, z)]));
+        asymmetry = std::max(
+            asymmetry, std::abs(value - result.density[dense_index(extent, x, extent.y - 1 - y, z)]));
+      }
+    }
+  }
+  std::cout << "  largest density difference between mirrored voxels: " << asymmetry << std::endl;
+  require(asymmetry < 2.0e-4f, "a symmetric plume lost its symmetry");
+}
+
 }  // namespace
 
 int main()
@@ -470,6 +505,7 @@ int main()
       {"MacCormack is sharper and bounded", test_maccormack_is_sharper_and_bounded},
       {"advance takes CFL substeps", test_advance_takes_cfl_substeps},
       {"large steps keep mass", test_large_steps_keep_mass},
+      {"symmetric scene stays symmetric", test_symmetric_scene_stays_symmetric},
   };
   for (const auto &[name, test] : tests) {
     test();

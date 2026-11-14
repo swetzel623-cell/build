@@ -285,7 +285,10 @@ Topology build_topology(const Extent extent,
 
   /* A voxel stores the velocity of its lower faces only. A cell can therefore be solved for only
    * if the cells above it along every axis are stored too, or are walls, whose faces are zero.
-   * The remaining stored cells form a one-voxel layer of open air that holds those faces. */
+   * The same is required of the cells below it, although their storage is not needed: the open
+   * boundary then lies one voxel inside the stored region on every side. Without that the
+   * region would be one voxel larger on its lower sides and a symmetric scene would lose its
+   * symmetry. The remaining stored cells form a one-voxel layer of open air. */
   if (!classify_cells) {
     return topology;
   }
@@ -298,7 +301,8 @@ Topology build_topology(const Extent extent,
       topology.cell_type[index] = CellSolid;
     }
     else if (stored_or_wall(x + 1, y, z) && stored_or_wall(x, y + 1, z) &&
-             stored_or_wall(x, y, z + 1))
+             stored_or_wall(x, y, z + 1) && stored_or_wall(x - 1, y, z) &&
+             stored_or_wall(x, y - 1, z) && stored_or_wall(x, y, z - 1))
     {
       topology.cell_type[index] = CellFluid;
     }

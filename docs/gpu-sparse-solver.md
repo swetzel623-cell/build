@@ -614,6 +614,29 @@ session:
 - This session was faster than the one that timed reflection (the previous build measured
   87.6 ms there), which is why builds are compared within a session.
 
+**The plume's lost symmetry: a one-voxel bias at the open boundary.** A cell used to be fluid
+when the cells above it along every axis were stored, because a voxel stores its lower faces.
+The open boundary therefore lay at the stored region's surface on its lower sides and one voxel
+inside it on its upper sides. Measured on the CPU reference, a centred plume at 48×48×72 with
+the defaults, as the largest density difference between mirrored voxels:
+
+| | After 1 frame | After 14 frames |
+|---|---|---|
+| Before | 1.6e-4 | 5.6e-3 (0.15 with plain steps) |
+| Every brick active (no open boundary) | 2.3e-6 | |
+| After the fix | 2.0e-6 | 1.4e-4 |
+
+- The difference was the same along x and y and the same with an exact pressure solve, so it
+  was neither rounding nor the multigrid solver.
+- **A cell is now fluid only if all six neighbors are stored or solid**, so the open boundary
+  lies one voxel inside the stored region on every side. The CPU reference and the classify
+  kernel changed together; the device still equals the CPU reference bit for bit on llvmpipe.
+- What remains grows from differences of about 1e-6 in the first step, the size of the
+  unconverged pressure and of rounding. Red-black smoothing is not mirror-symmetric (a mirror
+  swaps the colors), so exact symmetry is not expected.
+- A CPU test requires a centred plume to stay symmetric to 2e-4 over five frames. The fix has
+  not run on a real GPU.
+
 ## Not verified, and known gaps
 
 - **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.
@@ -650,7 +673,6 @@ session:
 ## Next steps
 
 1. Advect density and temperature in one pass: they share their departure points.
-2. Find out why the plume loses its left-right symmetry.
 3. Measure multigrid at larger sizes, where dispatch overhead should matter less.
 4. Compare with the Mantaflow engine on a case where the active region covers the domain.
 5. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Classify every stored voxel. Mirrors build_topology in the CPU reference: the domain's outer
-// layer is solid, and a cell is fluid only if the cells above it along every axis are stored or
-// solid, so that all six of its faces have storage. The rest hold faces next to open air.
+// layer is solid, and a cell is fluid only if its six neighbors are stored or solid. The cells
+// above it must be, so that all six of its faces have storage; the cells below it are required
+// too so that the open boundary is the same on every side. The rest are open air.
 #version 450
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
@@ -23,7 +24,8 @@ void main()
     type = CELL_SOLID;
   }
   else if (stored_or_wall(c + ivec3(1, 0, 0)) && stored_or_wall(c + ivec3(0, 1, 0)) &&
-           stored_or_wall(c + ivec3(0, 0, 1)))
+           stored_or_wall(c + ivec3(0, 0, 1)) && stored_or_wall(c - ivec3(1, 0, 0)) &&
+           stored_or_wall(c - ivec3(0, 1, 0)) && stored_or_wall(c - ivec3(0, 0, 1)))
   {
     type = CELL_FLUID;
   }

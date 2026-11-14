@@ -537,7 +537,28 @@ since it advects and projects twice; that is an estimate, not a GPU timing.
   the missing roll-up, and is not pursued.
 - Reflection is implemented as `Settings::reflection`, off by default, in the CPU reference and
   on the device (two small kernels keep and reflect the unprojected velocity). On llvmpipe the
-  device equals the CPU reference bit for bit with it; it has not run on a real GPU.
+  device equals the CPU reference bit for bit with it.
+
+**Advection-reflection on the RTX 3070.** The comparison run at 64×64×96 with reflection passed
+(largest difference 1.2e-5). 192×192×288, 40 frames, one session (this session ran about 20%
+slower throughout than the one that measured the midpoint trace):
+
+| Variant | Median frame, wall | Median frame, GPU | Steps | Wall per step | Peak bricks |
+|---|---|---|---|---|---|
+| Plain, CFL 4 (default) | 61.7 ms | 51.5 ms | 105 | 22.7 ms | 2493 |
+| Reflection, CFL 6 | 87.6 ms | 78.0 ms | 73 | 47.6 ms | 2861 |
+| Reflection, CFL 4 | 140.8 ms | 128.9 ms | 108 | 53.1 ms | 3346 |
+| Plain, CFL 1 | 289.8 ms | 248.0 ms | 394 | 29.9 ms | 3734 |
+
+- **Reflection at CFL 6 costs 1.4 times the default per frame** and a third of plain stepping
+  at CFL 1, the other way to get the rolled-up plume. A reflection step costs 2.1 plain
+  substeps, as estimated.
+- At CFL 4 reflection costs 2.3 times the default: the faster flow makes it take as many steps
+  as plain stepping does.
+- In the profile of reflection at CFL 6, advection is 47% of the GPU time (MacCormack
+  correction 33%) and multigrid 49%; keeping and reflecting the velocity is 0.2%.
+- The shapes these runs produce at this resolution were not compared; the shape comparison
+  above is from the CPU reference at 96×96×144.
 
 ## Not verified, and known gaps
 
@@ -574,7 +595,8 @@ since it advects and projects twice; that is an estimate, not a GPU timing.
 
 ## Next steps
 
-1. Time advection-reflection on the RTX 3070 against the plain step.
+1. Decide whether reflection at CFL 6 becomes the default (1.4 times the frame time for the
+   rolled-up plume).
 2. Make the MacCormack correction cheaper: it now takes a third of the GPU time, and its two
    traces repeat velocity samples the forward pass already made.
 3. Measure multigrid at larger sizes, where dispatch overhead should matter less.

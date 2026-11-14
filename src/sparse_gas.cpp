@@ -731,37 +731,68 @@ StepInfo step(State &state, const Settings &settings)
     return {};
   }
 
-  /* Every channel is advected by the velocity from the start of the step. */
+  /* Advect the scalars and a velocity (`sources`) through the state's velocity for `dt`. */
   std::vector<float> density, temperature, u, v, w, forward;
-  const auto advect_channel = [&](const std::vector<float> &source, const float ox, const float oy,
-                                  const float oz, std::vector<float> &result) {
-    if (settings.advection == Advection::MacCormack) {
-      advect(state, source, ox, oy, oz, settings.dt, forward, settings.midpoint_trace);
-      advect_maccormack(state, source, forward, ox, oy, oz, settings.dt, result,
-                        settings.midpoint_trace);
+  const auto advect_all = [&](const float dt, const std::vector<float> &source_u,
+                              const std::vector<float> &source_v,
+                              const std::vector<float> &source_w) {
+    const auto advect_channel = [&](const std::vector<float> &source, const float ox,
+                                    const float oy, const float oz, std::vector<float> &result) {
+      if (settings.advection == Advection::MacCormack) {
+        advect(state, source, ox, oy, oz, dt, forward, settings.midpoint_trace);
+        advect_maccormack(state, source, forward, ox, oy, oz, dt, result,
+                          settings.midpoint_trace);
+      }
+      else {
+        advect(state, source, ox, oy, oz, dt, result, settings.midpoint_trace);
+      }
+    };
+    advect_channel(state.density, 0.5f, 0.5f, 0.5f, density);
+    advect_channel(state.temperature, 0.5f, 0.5f, 0.5f, temperature);
+    advect_channel(source_u, 0.0f, 0.5f, 0.5f, u);
+    advect_channel(source_v, 0.5f, 0.0f, 0.5f, v);
+    advect_channel(source_w, 0.5f, 0.5f, 0.0f, w);
+    state.density.swap(density);
+    state.temperature.swap(temperature);
+    state.u.swap(u);
+    state.v.swap(v);
+    state.w.swap(w);
+  };
+  const auto add_forces = [&](const float dt) {
+    if (settings.heat_buoyancy != 0.0f) {
+      add_buoyancy(state, state.temperature, settings.heat_buoyancy, dt, settings.gravity);
     }
-    else {
-      advect(state, source, ox, oy, oz, settings.dt, result, settings.midpoint_trace);
+    if (settings.density_buoyancy != 0.0f) {
+      add_buoyancy(state, state.density, settings.density_buoyancy, dt, settings.gravity);
+    }
+    enforce_walls(state);
+  };
+
+  if (!settings.reflection) {
+    /* Every channel is advected by the velocity from the start of the step. */
+    advect_all(settings.dt, state.u, state.v, state.w);
+    add_forces(settings.dt);
+    StepInfo info = project(state, settings);
+    info.dt = settings.dt;
+    return info;
+  }
+
+  const float half = 0.5f * settings.dt;
+  advect_all(half, state.u, state.v, state.w);
+  add_forces(half);
+  std::vector<float> reflected_u = state.u, reflected_v = state.v, reflected_w = state.w;
+  project(state, settings);
+  const auto reflect = [](const std::vector<float> &projected, std::vector<float> &unprojected) {
+    for (std::size_t i = 0; i < projected.size(); ++i) {
+      unprojected[i] = 2.0f * projected[i] - unprojected[i];
     }
   };
-  advect_channel(state.density, 0.5f, 0.5f, 0.5f, density);
-  advect_channel(state.temperature, 0.5f, 0.5f, 0.5f, temperature);
-  advect_channel(state.u, 0.0f, 0.5f, 0.5f, u);
-  advect_channel(state.v, 0.5f, 0.0f, 0.5f, v);
-  advect_channel(state.w, 0.5f, 0.5f, 0.0f, w);
-  state.density.swap(density);
-  state.temperature.swap(temperature);
-  state.u.swap(u);
-  state.v.swap(v);
-  state.w.swap(w);
-
-  if (settings.heat_buoyancy != 0.0f) {
-    add_buoyancy(state, state.temperature, settings.heat_buoyancy, settings.dt, settings.gravity);
-  }
-  if (settings.density_buoyancy != 0.0f) {
-    add_buoyancy(state, state.density, settings.density_buoyancy, settings.dt, settings.gravity);
-  }
-  enforce_walls(state);
+  reflect(state.u, reflected_u);
+  reflect(state.v, reflected_v);
+  reflect(state.w, reflected_w);
+  /* The reflected velocity and the scalars travel through the projected field. */
+  advect_all(half, reflected_u, reflected_v, reflected_w);
+  add_forces(half);
   StepInfo info = project(state, settings);
   info.dt = settings.dt;
   return info;

@@ -147,6 +147,14 @@ struct Settings {
    * the velocity at the arrival point. Costs three more velocity samples per trace.
    */
   bool midpoint_trace = true;
+  /**
+   * Advection-reflection (Zehnder, Narain and Thomaszewski 2018): a step is two half steps. The
+   * first advects, applies forces and projects; the velocity is then reflected about its
+   * projection (twice the projected velocity minus the unprojected one) and advected through the
+   * projected field for the second half, followed by forces and a second projection. Costs about
+   * two plain steps and keeps the rotation that a single projection per step removes.
+   */
+  bool reflection = false;
   /** advance(): largest distance, in voxels, anything may travel in one step. */
   float cfl = 4.0f;
   /** advance(): fail instead of taking more steps than this for one frame. */

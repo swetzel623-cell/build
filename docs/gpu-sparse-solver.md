@@ -506,6 +506,37 @@ sets the step), centre slice of the density:
 - The CFL number is therefore a speed-against-detail setting, as in Blender's Mantaflow domain.
   The default stays at 4; CFL 1 costs about four times as many substeps.
 
+**Keeping the roll-up at large steps.** Two candidates, on the same scene and measurement as
+above (CPU reference, 96×96×144, 1.2 s). "Cost" counts a reflection step as two plain substeps,
+since it advects and projects twice; that is an estimate, not a GPU timing.
+
+![Centre slice of the plume for the candidates](images/rollup_candidates.png)
+
+| Variant | Steps | Cost | Mass kept | Height | Width (rms radius) | Kinetic energy |
+|---|---|---|---|---|---|---|
+| Plain, CFL 1 (target look) | 155 | 155 | 96% | 81.1 | 16.7 | 2.7e8 |
+| Plain, CFL 2 | 73 | 73 | 94% | 79.4 | 19.5 | 2.2e8 |
+| Plain, CFL 4 (default) | 39 | 39 | 97% | 80.5 | 20.1 | 2.1e8 |
+| Reflection, CFL 4 | 46 | 92 | 98% | 84.7 | 16.1 | 3.5e8 |
+| Reflection, CFL 6 | 32 | 64 | 94% | 83.7 | 16.9 | 3.3e8 |
+| Reflection, CFL 8 | 31 | 62 | 89% | 81.5 | 16.8 | 3.2e8 |
+| Confinement 2, CFL 4 | 39 | 39 | 96% | 79.1 | 20.8 | 2.1e8 |
+| Confinement 6, CFL 4 | 45 | 45 | 101% | 78.5 | 19.8 | 2.3e8 |
+| Confinement 15, CFL 4 | 55 | 55 | 114% | 79.6 | 17.9 | 3.5e8 |
+
+- **Advection-reflection brings the roll-up back.** At CFL 4, 6, and 8 the vortex ring rolls
+  up and the plume has the width of the CFL 1 run. At CFL 6 it costs about 1.6 times the
+  default; plain stepping at CFL 2 costs 1.9 times and still gives the smooth cap.
+- **It is more energetic than the small-step run** (kinetic energy 3.3e8 against 2.7e8) and
+  the plume rises 3% higher. Whether CFL 1 or reflection is nearer the true solution is not
+  established; reflection is known to dissipate less than projection alone.
+- At CFL 8 it loses 11% of the mass and takes hardly fewer steps than at 6 (the faster flow
+  shortens the steps), so 6 is the useful limit here.
+- **Vorticity confinement does not restore the shape.** At strengths 2 and 6 (in voxel units)
+  the cap stays wide; at 15 the plume breaks into noise and gains 14% mass. It adds detail, not
+  the missing roll-up, and is not pursued.
+- Reflection is implemented in the CPU reference as `Settings::reflection`, off by default.
+
 ## Not verified, and known gaps
 
 - **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.
@@ -541,8 +572,7 @@ sets the step), centre slice of the density:
 
 ## Next steps
 
-1. Keep roll-up at large steps: the detail is lost between CFL 1 and 2. Candidates are a
-   second-order treatment of the split steps or vorticity confinement; neither is evaluated.
+1. Run advection-reflection on the GPU and time it against the plain step.
 2. Make the MacCormack correction cheaper: it now takes a third of the GPU time, and its two
    traces repeat velocity samples the forward pass already made.
 3. Measure multigrid at larger sizes, where dispatch overhead should matter less.

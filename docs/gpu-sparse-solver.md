@@ -407,7 +407,7 @@ substep:
   third more remaining divergence, in line with the CPU measurement: about even per digit of
   accuracy. The default stays at 2+2.
 
-**Fewer substeps (larger CFL number): not adopted.** Blender's Mantaflow domain defaults to a
+**Fewer substeps (larger CFL number): not possible with a single-stage trace.** Blender's Mantaflow domain defaults to a
 CFL number of 4; this solver uses 2. Measured on the CPU reference, a 48×48×72 plume, multigrid,
 MacCormack, 7 frames of 1/8 s (long frames, so the limit sets the step and not the frame
 length), initial mass 895:
@@ -416,7 +416,7 @@ length), initial mass 895:
 |---|---|---|---|---|
 | 0.5 | 100 | 92% | 0.87 | 0 |
 | 1 | 48 | 88% | 0.87 | 0.46 |
-| 2 (default) | 25 | 92% | 0.81 | 0.80 |
+| 2 | 25 | 92% | 0.81 | 0.80 |
 | 3 | 17 | 63% | 0.78 | 0.80 |
 | 4 | 12 | 53% | 0.73 | 0.85 |
 | 6 | 11 | 44% | 0.76 | 0.99 |
@@ -435,10 +435,30 @@ length), initial mass 895:
   every CFL number from 3 up takes one step per frame; the question only arises at higher
   resolution or speed.
 
-The default therefore stays at 2, and a CPU test now requires the default to keep at least 65%
-of a small fast plume's mass (it keeps 76%, against 58% at CFL 4). A larger step needs a more accurate trace (for example a midpoint
-trace) first; that is not implemented. Whether Mantaflow loses mass the same way at its
-default of 4 has not been checked.
+**The midpoint trace makes CFL 4 usable.** The departure point is now found with the velocity
+half way along a first, single-stage trace (`midpoint_trace`, three more velocity samples per
+trace); MacCormack uses it for both its backward and its forward trace. Same scene and
+measurement as the table above:
+
+| CFL | Substeps | Mass kept, single-stage | Mass kept, midpoint | Height, midpoint |
+|---|---|---|---|---|
+| 0.5 | 100 | 92% | 95% | 30.8 |
+| 2 | 25 | 92% | 98% | 31.1 |
+| 3 | 16 to 17 | 63% | 91% | 30.7 |
+| 4 | 12 | 53% | 93% | 30.7 |
+| 6 | 10 to 11 | 44% | 85% | 29.0 |
+
+- At CFL 4 the plume keeps 93% of its mass, against 53%, and its height stays within 1% of the
+  small-step run. At 6 it starts to fall behind.
+- **The defaults are now the midpoint trace and a CFL number of 4**, Blender's Mantaflow
+  default. A frame then needs about half the substeps it did at 2.
+- On llvmpipe the device equals the CPU reference bit for bit with the midpoint trace. On a real
+  GPU it has not run yet, and its cost there (more samples per trace, half the substeps) is not
+  measured.
+- A CPU test requires the default to keep at least 65% of a small fast plume's mass and the
+  single-stage trace to keep clearly less.
+
+Whether Mantaflow loses mass at its default of 4 has not been checked.
 
 ## Not verified, and known gaps
 
@@ -476,8 +496,7 @@ default of 4 has not been checked.
 ## Next steps
 
 1. Time the coarse-level revert on the RTX 3070, with both variants in one session.
-2. A midpoint (second-order) backward trace, then repeat the CFL measurement: if mass holds at
-   4 voxels per step, frames need about half the substeps.
+2. Time the midpoint trace and CFL 4 on the RTX 3070.
 3. Measure multigrid at larger sizes, where dispatch overhead should matter less.
 4. Compare with the Mantaflow engine on a case where the active region covers the domain.
 5. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind

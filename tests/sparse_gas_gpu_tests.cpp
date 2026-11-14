@@ -7,8 +7,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -72,6 +74,85 @@ double seconds_since(const std::chrono::steady_clock::time_point start)
 
 }  // namespace
 
+/** Write a grayscale image, `width` by `height` values in 0..1 with row 0 at the bottom. */
+void write_bmp(const std::string &path, const std::vector<float> &values, const int width,
+               const int height)
+{
+  const int scale = 2;
+  const int w = width * scale, h = height * scale;
+  const int row_bytes = (3 * w + 3) / 4 * 4;
+  const std::uint32_t data_bytes = static_cast<std::uint32_t>(row_bytes) * h;
+  std::vector<unsigned char> file(54 + data_bytes, 0);
+  const auto put32 = [&](const int at, const std::uint32_t value) {
+    for (int i = 0; i < 4; ++i) {
+      file[static_cast<std::size_t>(at + i)] = static_cast<unsigned char>(value >> (8 * i));
+    }
+  };
+  file[0] = 'B';
+  file[1] = 'M';
+  put32(2, 54 + data_bytes);
+  put32(10, 54);
+  put32(14, 40);
+  put32(18, static_cast<std::uint32_t>(w));
+  put32(22, static_cast<std::uint32_t>(h));
+  file[26] = 1;
+  file[28] = 24;
+  put32(34, data_bytes);
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const float value = values[static_cast<std::size_t>(x / scale) +
+                                 static_cast<std::size_t>(width) * (y / scale)];
+      /* A gamma below one keeps thin smoke visible. */
+      const float shade = std::pow(std::min(1.0f, std::max(0.0f, value)), 0.6f);
+      const unsigned char level = static_cast<unsigned char>(255.0f * shade + 0.5f);
+      const std::size_t at = 54 + static_cast<std::size_t>(y) * row_bytes + 3 * x;
+      file[at] = file[at + 1] = file[at + 2] = level;
+    }
+  }
+  std::ofstream out(path, std::ios::binary);
+  out.write(reinterpret_cast<const char *>(file.data()), static_cast<std::streamsize>(file.size()));
+  if (!out) {
+    throw std::runtime_error("could not write " + path);
+  }
+}
+
+/** Write the centre slice and a side view of the density, and print the plume's measures. */
+void write_plume(const sparse::State &state, const std::string &name)
+{
+  const sparse::DenseFields dense = sparse::to_dense(state);
+  const sparse::Extent &e = dense.extent;
+  std::vector<float> slice(static_cast<std::size_t>(e.x) * e.z, 0.0f);
+  std::vector<float> side(slice.size(), 0.0f);
+  double mass = 0.0, moment = 0.0, spread = 0.0;
+  for (int z = 0; z < e.z; ++z) {
+    for (int y = 0; y < e.y; ++y) {
+      for (int x = 0; x < e.x; ++x) {
+        const float value = dense.density[static_cast<std::size_t>(x) +
+                                          static_cast<std::size_t>(e.x) *
+                                              (y + static_cast<std::size_t>(e.y) * z)];
+        const std::size_t pixel = static_cast<std::size_t>(x) + static_cast<std::size_t>(e.x) * z;
+        side[pixel] += value;
+        if (y == e.y / 2) {
+          slice[pixel] = value;
+        }
+        const double dx = x + 0.5 - 0.5 * e.x, dy = y + 0.5 - 0.5 * e.y;
+        mass += value;
+        moment += static_cast<double>(value) * z;
+        spread += static_cast<double>(value) * (dx * dx + dy * dy);
+      }
+    }
+  }
+  /* The side view adds the density along the line of sight; a fixed scale keeps runs comparable. */
+  for (float &value : side) {
+    value /= 0.2f * static_cast<float>(e.y);
+  }
+  write_bmp(name + "_slice.bmp", slice, e.x, e.z);
+  write_bmp(name + "_side.bmp", side, e.x, e.z);
+  std::cout << "Plume: mass " << mass << ", height " << (mass > 0.0 ? moment / mass : 0.0)
+            << ", width (rms radius) " << (mass > 0.0 ? std::sqrt(spread / mass) : 0.0) << '\n';
+  std::cout << "Wrote " << name << "_slice.bmp and " << name << "_side.bmp\n";
+}
+
 /** Largest divergence left in fluid cells, relative to the largest velocity. */
 float relative_divergence(const sparse::State &state)
 {
@@ -97,6 +178,7 @@ int multigrid_w_depth = -1;
 int coarse_pre_sweeps = -1, coarse_post_sweeps = -1;
 int midpoint = -1;
 int reflection = -1;
+std::string image_name;
 
 sparse::Settings test_settings(const int resolution)
 {
@@ -242,6 +324,9 @@ int benchmark(gpu::SparseGasGpu &solver, const int resolution, const int steps, 
   }
   std::cout << "Divergence left after the last step, relative to peak velocity: "
             << relative_divergence(state) << '\n';
+  if (!image_name.empty()) {
+    write_plume(state, image_name);
+  }
   std::cout << "Domain " << extent.x << "x" << extent.y << "x" << extent.z << ", peak "
             << peak_bricks << " of " << total_bricks << " bricks active, topology changed in "
             << changes << " of " << steps << " steps\n";
@@ -291,6 +376,9 @@ int main(int argc, char **argv)
     }
     else if (std::string(argv[i]) == "--w-depth" && i + 1 < argc) {
       multigrid_w_depth = std::atoi(argv[++i]);
+    }
+    else if (std::string(argv[i]) == "--image" && i + 1 < argc) {
+      image_name = argv[++i];
     }
     else if (std::string(argv[i]) == "--reflection" && i + 1 < argc) {
       reflection = std::atoi(argv[++i]);

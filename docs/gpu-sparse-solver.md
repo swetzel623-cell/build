@@ -474,12 +474,37 @@ session:
   Advection is now 46% of the GPU time (forward pass 15%, MacCormack correction 32%) and
   multigrid about 49%.
 - **The plume occupies fewer bricks at CFL 4** (2493 against 3246 at the last frame). The two
-  runs are different discretisations of the same scene, so some difference is expected, but
-  whether the CFL 4 plume is as developed as the CFL 2 one at this resolution has not been
-  checked; the CPU measurement above covers mass and height at 48×48×72 only.
+  runs are different discretisations of the same scene; "The step size changes the look of
+  the plume" below compares the shapes on the CPU reference.
 - The coarse-level revert cannot be judged from this run: the old settings take 17.0 ms per
   substep here, against 16.8 ms with the merged kernel and 15.8 ms before it in earlier
   sessions, which is within the variation between sessions.
+
+**The step size changes the look of the plume.** The same plume on the CPU reference at
+96×96×144 after 1.2 s (18 frames of 1/15 s, so that the CFL number and not the frame length
+sets the step), centre slice of the density:
+
+![Centre slice of the plume at five step settings](images/plume_step_size.png)
+
+| Setting | Substeps | Mass kept | Height | Top | Width (rms radius) | Bricks |
+|---|---|---|---|---|---|---|
+| Midpoint, CFL 0.5 | 326 | 108% | 83.2 | 98 | 16.1 | 837 |
+| Midpoint, CFL 1 | 155 | 96% | 81.1 | 95 | 16.7 | 747 |
+| Midpoint, CFL 2 | 73 | 94% | 79.4 | 96 | 19.5 | 730 |
+| Midpoint, CFL 4 (default) | 39 | 97% | 80.5 | 94 | 20.1 | 651 |
+| Single-stage, CFL 2 (old default) | 72 | 93% | 81.2 | 97 | 17.9 | 724 |
+
+- **CFL 4 and the old default agree in the gross measures** (height within 1%, top within 3
+  voxels), and both give a smooth cap. At CFL 4 the cap is a little wider and flatter and rolls
+  up less at the rim, which is also why it occupies fewer bricks.
+- **Small steps give a different plume**: at CFL 1 and 0.5 the vortex ring rolls up into a
+  detailed mushroom, and the two look alike. The loss of roll-up happens between CFL 1 and 2,
+  with either trace, so it comes from the time step of the whole scheme (advection, buoyancy,
+  and projection are split), not from the trace.
+- At CFL 0.5 the mass grows by 8%: MacCormack's correction is not conservative and this run
+  applies it 326 times.
+- The CFL number is therefore a speed-against-detail setting, as in Blender's Mantaflow domain.
+  The default stays at 4; CFL 1 costs about four times as many substeps.
 
 ## Not verified, and known gaps
 
@@ -516,8 +541,8 @@ session:
 
 ## Next steps
 
-1. Check at higher resolution that the CFL 4 plume matches the CFL 2 one in shape, not only in
-   mass and height.
+1. Keep roll-up at large steps: the detail is lost between CFL 1 and 2. Candidates are a
+   second-order treatment of the split steps or vorticity confinement; neither is evaluated.
 2. Make the MacCormack correction cheaper: it now takes a third of the GPU time, and its two
    traces repeat velocity samples the forward pass already made.
 3. Measure multigrid at larger sizes, where dispatch overhead should matter less.

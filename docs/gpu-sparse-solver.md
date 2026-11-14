@@ -574,6 +574,21 @@ with the midpoint trace to keep clearly more than with the single-stage trace (9
 58% at CFL 4). All GPU test programs compare the device with the CPU reference under the new
 defaults on llvmpipe; a separate one covers plain steps.
 
+**Plume shapes on the RTX 3070.** `sparse_gas_gpu_tests --bench --image NAME` writes the
+centre slice and a side view of the density. 192×192×288 after 40 frames of 1/30 s, centre
+slices from the device:
+
+![Centre slices from the RTX 3070](images/gpu_plume_slices.png)
+
+- **The default (reflection, CFL 6) rolls up** into a detailed mushroom of the same character
+  as the CFL 1 reference, at about a third of its cost.
+- **Plain steps at CFL 4 give a thin cap** with small curls at the rim and much less smoke in
+  the slice.
+- Reflection and the reference are not the same plume: the reference stands a little higher
+  and has a wider stem. Both are slightly asymmetric left to right.
+- Only the pictures were returned from this run, not the program's printed mass, height, and
+  width, so this comparison is by eye.
+
 ## Not verified, and known gaps
 
 - **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.
@@ -609,10 +624,8 @@ defaults on llvmpipe; a separate one covers plain steps.
 
 ## Next steps
 
-1. Compare the plume shapes of reflection and plain steps at 192×192×288 on the GPU; so far
-   shapes were compared on the CPU reference at 96×96×144 only.
-2. Make the MacCormack correction cheaper: it now takes a third of the GPU time, and its two
-   traces repeat velocity samples the forward pass already made.
+1. Make the MacCormack correction cheaper: it is a third of the GPU time.
+2. Find out why the plume loses its left-right symmetry.
 3. Measure multigrid at larger sizes, where dispatch overhead should matter less.
 4. Compare with the Mantaflow engine on a case where the active region covers the domain.
 5. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind

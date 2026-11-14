@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // First-order semi-Lagrangian advection. P.a = (offset of the advected channel, dt);
-// P.flags.x selects the midpoint trace.
+// P.flags.x selects the midpoint trace. With P.flags.y set, the lowest and highest of the eight
+// values the trace interpolated are stored for the MacCormack correction, which then need not
+// repeat the trace.
 #version 450
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
@@ -9,6 +11,9 @@
 #define W b6
 #define SOURCE b7
 #define RESULT b8
+/* Two floats per voxel: lowest and highest. Lowest above highest marks a trace that read a
+ * voxel without storage. */
+layout(std430, binding = 10) writeonly buffer Bounds { float bounds[]; };
 
 /* One brick-table lookup per corner; missing voxels read 0, as in the CPU reference. */
 #define SAMPLE(name, channel) \
@@ -76,5 +81,34 @@ void main()
     return;
   }
   vec3 p = vec3(coords_of(index)) + P.a.xyz;
-  RESULT[index] = sample_source(trace(p, -P.a.w), P.a.xyz);
+  vec3 from = trace(p, -P.a.w);
+  if (P.flags.y == 0) {
+    RESULT[index] = sample_source(from, P.a.xyz);
+    return;
+  }
+
+  /* The same interpolation as sample_source, keeping the corner values. */
+  vec3 f = from - P.a.xyz;
+  vec3 base = floor(f);
+  ivec3 corner_base = ivec3(base);
+  vec3 t = f - base;
+  float value[8];
+  bool stored = true;
+  float lowest = 0.0, highest = 0.0;
+  for (int corner = 0; corner < 8; ++corner) {
+    int i = index_of(corner_base + ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1));
+    stored = stored && i >= 0;
+    value[corner] = i < 0 ? 0.0 : SOURCE[i];
+    lowest = corner == 0 ? value[corner] : min(lowest, value[corner]);
+    highest = corner == 0 ? value[corner] : max(highest, value[corner]);
+  }
+  float c00 = value[0] + (value[1] - value[0]) * t.x;
+  float c10 = value[2] + (value[3] - value[2]) * t.x;
+  float c01 = value[4] + (value[5] - value[4]) * t.x;
+  float c11 = value[6] + (value[7] - value[6]) * t.x;
+  float c0 = c00 + (c10 - c00) * t.y;
+  float c1 = c01 + (c11 - c01) * t.y;
+  RESULT[index] = c0 + (c1 - c0) * t.z;
+  bounds[2 * index] = stored ? lowest : 1.0;
+  bounds[2 * index + 1] = stored ? highest : 0.0;
 }

@@ -120,6 +120,8 @@ struct SparseGasGpu::Impl {
   std::size_t single_dispatch_cell_limit = 512;
   /** Per voxel: cell type and neighbor links, packed by the classify_links kernel. */
   Compute::Buffer links;
+  /** Per voxel, the lowest and highest value the last forward advection interpolated. */
+  Compute::Buffer bounds;
 
   sparse::Topology topology;
   Compute::Buffer table, coords, types, slot_map, flags, speeds;
@@ -164,7 +166,7 @@ struct SparseGasGpu::Impl {
 
   ~Impl()
   {
-    for (Compute::Buffer *buffer : {&table, &coords, &types, &slot_map, &flags, &speeds, &links,
+    for (Compute::Buffer *buffer : {&table, &coords, &types, &slot_map, &flags, &speeds, &links, &bounds,
                                     &dense_op,
                                     &dense_values, &dense_rhs, &dense_residual, &dense_table})
     {
@@ -215,6 +217,7 @@ struct SparseGasGpu::Impl {
     }
     ensure(types, next.voxel_count() * sizeof(std::uint32_t));
     ensure(links, next.voxel_count() * sizeof(std::uint32_t));
+    ensure(bounds, next.voxel_count() * 2 * sizeof(float));
 
     const std::vector<sparse::MultigridLevel> layout = sparse::multigrid_layout(next);
     bool same_shape = layout.size() == levels.size();
@@ -492,14 +495,15 @@ struct SparseGasGpu::Impl {
                const int c6 = -1,
                const int c7 = -1,
                const int c8 = -1,
-               const int c9 = -1)
+               const int c9 = -1,
+               const Compute::Buffer *c10 = nullptr)
   {
     const auto bind = [&](const int logical) { return logical < 0 ? nullptr : &channel(logical); };
     compute.dispatch(kernel,
                      &p,
                      sizeof(p),
                      {&table, &coords, &types, bind(c4), bind(c5), bind(c6), bind(c7), bind(c8),
-                      bind(c9)},
+                      bind(c9), c10},
                      groups_for(topology.voxel_count()),
                      label);
   }
@@ -794,9 +798,12 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
                                     const float step) {
       Params p = g.params(offsets[kind][0], offsets[kind][1], offsets[kind][2], step);
       p.flags[0] = settings.midpoint_trace ? 1 : 0;
-      g.stencil(g.advect, "advect", p, U, V, W, source, second_order ? forward : target);
+      /* The forward pass keeps the bounds of what it interpolated for the correction. */
+      p.flags[1] = second_order ? 1 : 0;
+      g.stencil(g.advect, "advect", p, U, V, W, source, second_order ? forward : target, -1,
+                &g.bounds);
       if (second_order) {
-        g.stencil(g.maccormack, "maccormack", p, U, V, W, source, forward, target);
+        g.stencil(g.maccormack, "maccormack", p, U, V, W, source, forward, target, &g.bounds);
       }
     };
     const auto add_forces = [&](const float step) {

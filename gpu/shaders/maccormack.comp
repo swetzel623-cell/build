@@ -10,6 +10,8 @@
 #define SOURCE b7
 #define FORWARD b8
 #define RESULT b9
+/* Written by the forward pass: lowest and highest of the values its trace interpolated. */
+layout(std430, binding = 10) readonly buffer Bounds { float bounds[]; };
 
 #define SAMPLE(name, channel) \
   float name##_at(ivec3 c) \
@@ -95,25 +97,16 @@ void main()
     }
   }
 
-  vec3 p = vec3(c) + offset;
-  float dt = P.a.w;
-  vec3 from = trace(p, -dt);
-  vec3 to = trace(p, dt);
-
-  /* The values the forward trace interpolated bound the result. If any has no storage, the
+  /* The values the forward trace interpolated bound the result. If any had no storage, the
    * trace left the active region: keep the first-order value. */
-  ivec3 base = ivec3(floor(from - offset));
-  float lowest = 0.0, highest = 0.0;
-  for (int corner = 0; corner < 8; ++corner) {
-    int i = index_of(base + ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1));
-    if (i < 0) {
-      return;
-    }
-    float value = SOURCE[i];
-    lowest = corner == 0 ? value : min(lowest, value);
-    highest = corner == 0 ? value : max(highest, value);
+  float lowest = bounds[2 * index], highest = bounds[2 * index + 1];
+  if (lowest > highest) {
+    return;
   }
 
+  vec3 p = vec3(c) + offset;
+  float dt = P.a.w;
+  vec3 to = trace(p, dt);
   float backward = sample_forward(to, offset);
   float corrected = forward + 0.5 * (SOURCE[index] - backward);
   RESULT[index] = min(max(corrected, lowest), highest);

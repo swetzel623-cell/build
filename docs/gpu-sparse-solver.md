@@ -401,7 +401,7 @@ substep:
   fixed cost that fewer dispatches avoid.
 - On the voxel level the merged restriction costs about 2.3 ms per frame on the same scale,
   against about 2.8 ms for the two passes it replaced; that part stays.
-- **The coarse levels are back to a separate residual pass** (about 590 dispatches per substep).
+- **The coarse levels are back to a separate residual pass** (about 600 dispatches per substep).
   This revert is verified on llvmpipe only and has not been timed on the RTX 3070.
 - One sweep before and two after on the coarse levels is 10% faster in the same session for a
   third more remaining divergence, in line with the CPU measurement: about even per digit of

@@ -45,7 +45,6 @@ layout(std430, binding = 10) readonly buffer Bounds { float bounds[]; };
 SAMPLE(sample_u, U)
 SAMPLE(sample_v, V)
 SAMPLE(sample_w, W)
-SAMPLE(sample_forward, FORWARD)
 
 vec3 velocity_at(vec3 p)
 {
@@ -97,8 +96,9 @@ void main()
     }
   }
 
-  /* The values the forward trace interpolated bound the result. If any had no storage, the
-   * trace left the active region: keep the first-order value. */
+  /* The values the forward trace interpolated bound the result. If any had no storage or was
+   * solid, keep the first-order value: solid cells hold zero, which would make the correction
+   * add smoke along every wall. */
   float lowest = bounds[2 * index], highest = bounds[2 * index + 1];
   if (lowest > highest) {
     return;
@@ -107,7 +107,28 @@ void main()
   vec3 p = vec3(c) + offset;
   float dt = P.a.w;
   vec3 to = trace(p, dt);
-  float backward = sample_forward(to, offset);
+
+  /* The interpolation of the SAMPLE macro, with the corners checked. The backward trace must stay clear of solids and
+   * of unstored voxels too. */
+  vec3 f = to - offset;
+  vec3 base = floor(f);
+  ivec3 corner_base = ivec3(base);
+  vec3 t = f - base;
+  float value[8];
+  for (int corner = 0; corner < 8; ++corner) {
+    int i = index_of(corner_base + ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1));
+    if (i < 0 || cell_type[i] == CELL_SOLID) {
+      return;
+    }
+    value[corner] = FORWARD[i];
+  }
+  float c00 = value[0] + (value[1] - value[0]) * t.x;
+  float c10 = value[2] + (value[3] - value[2]) * t.x;
+  float c01 = value[4] + (value[5] - value[4]) * t.x;
+  float c11 = value[6] + (value[7] - value[6]) * t.x;
+  float c0 = c00 + (c10 - c00) * t.y;
+  float c1 = c01 + (c11 - c01) * t.y;
+  float backward = c0 + (c1 - c0) * t.z;
   float corrected = forward + 0.5 * (SOURCE[index] - backward);
   RESULT[index] = min(max(corrected, lowest), highest);
 }

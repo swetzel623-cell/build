@@ -647,14 +647,58 @@ the defaults, as the largest density difference between mirrored voxels:
   not run on a real GPU.
 
 **Obstacles.** A CPU test puts a plate above a plume at 32×32×48: after 12 frames no smoke is
-inside the plate, no face of it carries flow, the plume still holds 257 units of mass,
+inside the plate, no face of it carries flow, the plume still holds 239 units of mass,
 and the space above the plate's middle holds none of the 70 units that reach it without the
 plate. On llvmpipe the device equals the CPU reference bit for bit on that scene with the
 multigrid and the Jacobi solver. Obstacles have not run on a real GPU.
 
-Smoke next to a solid, obstacle or wall, is interpolated against the zero stored inside the
-solid, so it thins there. Mantaflow extrapolates values into obstacles to avoid that; this
-solver does not yet.
+**First run with an obstacle on the RTX 3070: smoke was being created.** Free plume and plate
+scene at 192×192×288, centre slice and side view of each, from the build before the fix below:
+
+![Free plume and plate scene from the RTX 3070](images/gpu_plate_first_run.png)
+
+- **The symmetry fix works on the device**: the free plume is symmetric to the eye.
+- **The plate scene gained 58% mass** in 60 frames (91,410 against about 57,900 at the start; the free
+  plume gained 5% in 40). Bright sheets lie along the plate's faces and rise from its edges.
+- **The comparison with the CPU reference failed at frame 28 of 30** in the plate scene
+  (difference 1.8e-3 after 1.4e-5 the frame before). On llvmpipe the same 30 frames equal the
+  CPU reference, so the kernels agree; a real GPU rounds differently, and this flow amplifies
+  the difference once it turns turbulent. `--resync` now starts every frame of the comparison
+  from the CPU state, which checks each frame's kernels without that drift.
+
+**Where the smoke came from, on the CPU reference** (plate scene at 48×48×72, 60 frames, mass
+relative to the start):
+
+| Variant | Mass after 60 frames |
+|---|---|
+| As first run | 2.30 |
+| No correction next to solids (the fix) | 1.37 |
+| The fix, plain steps at CFL 4 | 1.03 |
+| The fix, no plate | 1.04 |
+| The fix, first-order advection | 0.67 |
+| The fix, CFL 2 / CFL 1 | 1.54 / 1.60 |
+| The fix, 20 multigrid cycles | 1.37 |
+| The fix, every brick active | 1.29 |
+| The fix, correction dropped where it overshoots (not clamped) | 1.05 (0.85 without the plate) |
+| The fix, scalars interpolated without the solid's zeros | 1.50 |
+
+- **Cause of most of it**: solid cells hold zero. The MacCormack correction compares the
+  source with the forward result traced back, and next to a solid that comparison sees the
+  zeros and adds smoke, up to the clamping bounds, along every solid face. As in Mantaflow,
+  the correction is now skipped where either trace touches a solid cell (or, for the backward
+  one, an unstored voxel); the first-order value is kept there. CPU reference and both
+  advection kernels changed together.
+- **What remains (1.37) needs reflection and an obstacle together.** It is not the step size
+  (smaller steps make it worse), not the pressure solver's accuracy, not the sparse layout, and
+  not the zeros inside the solid. In the run, a pocket of smoke stays under the plate and the
+  flow around it keeps carrying smoke away without the pocket emptying: the correction sharpens
+  the edge between the still pocket and the moving air, and what it adds on the moving side is
+  carried off. Plain steps smear that edge and gain only 3%.
+- Dropping the correction where it overshoots, as Mantaflow's default clamp mode does, limits
+  the gain to 5% but loses 15% of the free plume and lowers its peak density from 0.57 to
+  0.40; it is not adopted.
+- **Open**: the plate scene still gains mass with the default steps. Not yet re-measured on
+  the RTX 3070.
 
 ## Not verified, and known gaps
 

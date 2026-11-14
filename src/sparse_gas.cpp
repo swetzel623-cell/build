@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace manta_improve::sparse {
@@ -575,7 +576,9 @@ void advect_maccormack(const State &state,
     trace(state, px, py, pz, dt, midpoint, to);
 
     /* The values the forward trace interpolated bound the result. If any of them has no
-     * storage, the trace left the active region: keep the first-order value there. */
+     * storage, the trace left the active region: keep the first-order value there. The same
+     * holds next to a solid, as in Mantaflow: solid cells hold zero, which would make the
+     * correction add smoke along every wall. */
     const float bx = std::floor(from[0] - offset_x);
     const float by = std::floor(from[1] - offset_y);
     const float bz = std::floor(from[2] - offset_z);
@@ -584,7 +587,7 @@ void advect_maccormack(const State &state,
     for (int corner = 0; corner < 8; ++corner) {
       const std::int64_t i = topology.index_of(
           ix + (corner & 1), iy + ((corner >> 1) & 1), iz + ((corner >> 2) & 1));
-      if (i < 0) {
+      if (i < 0 || topology.cell_type[static_cast<std::size_t>(i)] == CellSolid) {
         return;
       }
       const float value = source[static_cast<std::size_t>(i)];
@@ -592,6 +595,17 @@ void advect_maccormack(const State &state,
       highest = corner == 0 ? value : std::max(highest, value);
     }
 
+    /* The backward trace must stay clear of solids and of unstored voxels too. */
+    const int tx = static_cast<int>(std::floor(to[0] - offset_x));
+    const int ty = static_cast<int>(std::floor(to[1] - offset_y));
+    const int tz = static_cast<int>(std::floor(to[2] - offset_z));
+    for (int corner = 0; corner < 8; ++corner) {
+      const std::int64_t i = topology.index_of(
+          tx + (corner & 1), ty + ((corner >> 1) & 1), tz + ((corner >> 2) & 1));
+      if (i < 0 || topology.cell_type[static_cast<std::size_t>(i)] == CellSolid) {
+        return;
+      }
+    }
     const float backward = sample(
         topology, forward, to[0], to[1], to[2], offset_x, offset_y, offset_z);
     const float corrected = forward[index] + 0.5f * (source[index] - backward);

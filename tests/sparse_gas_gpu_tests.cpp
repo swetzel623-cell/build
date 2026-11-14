@@ -24,6 +24,12 @@ using namespace manta_improve;
 
 /** Put a plate above the plume, as an obstacle. */
 bool with_obstacle = false;
+/**
+ * Start every frame of the comparison from the CPU reference's state. A real GPU rounds
+ * differently from the CPU, and a turbulent flow amplifies that over many frames; with this
+ * option each frame's kernels are still checked against the reference.
+ */
+bool resync = false;
 
 sparse::DenseFields blob(const sparse::Extent extent)
 {
@@ -281,6 +287,9 @@ int compare(gpu::SparseGasGpu &solver, const int resolution, const int steps)
       std::cout << "FAIL: device result differs from the CPU reference\n";
       return 1;
     }
+    if (resync) {
+      solver.upload(cpu);
+    }
   }
   if (!(max_abs(cpu.w) > 0.1f)) {
     std::cout << "FAIL: the test flow did not develop\n";
@@ -393,6 +402,9 @@ int main(int argc, char **argv)
     else if (std::string(argv[i]) == "--w-depth" && i + 1 < argc) {
       multigrid_w_depth = std::atoi(argv[++i]);
     }
+    else if (std::string(argv[i]) == "--resync") {
+      resync = true;
+    }
     else if (std::string(argv[i]) == "--obstacle") {
       with_obstacle = true;
     }
@@ -425,7 +437,8 @@ int main(int argc, char **argv)
             << (use_jacobi ? ", 60 Jacobi sweeps" : ", 6 multigrid cycles")
             << (first_order ? ", first-order advection" : ", MacCormack advection")
             << (test_settings(resolution).reflection ? ", advection-reflection" : ", plain steps")
-            << (with_obstacle ? ", plate obstacle" : "") << '\n';
+            << (with_obstacle ? ", plate obstacle" : "")
+            << (resync ? ", every frame started from the CPU state" : "") << '\n';
   std::cout << "Creating the Vulkan device...\n";
   std::unique_ptr<gpu::SparseGasGpu> solver;
   try {

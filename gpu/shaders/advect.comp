@@ -12,7 +12,7 @@
 #define SOURCE b7
 #define RESULT b8
 /* Two floats per voxel: lowest and highest. Lowest above highest marks a trace that read a
- * voxel without storage. */
+ * voxel that has no storage or is solid. */
 layout(std430, binding = 10) writeonly buffer Bounds { float bounds[]; };
 
 /* One brick-table lookup per corner; missing voxels read 0, as in the CPU reference. */
@@ -97,7 +97,8 @@ void main()
   float lowest = 0.0, highest = 0.0;
   for (int corner = 0; corner < 8; ++corner) {
     int i = index_of(corner_base + ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1));
-    stored = stored && i >= 0;
+    /* Solid cells hold zero; next to them the correction is not applied either. */
+    stored = stored && i >= 0 && cell_type[i] != CELL_SOLID;
     value[corner] = i < 0 ? 0.0 : SOURCE[i];
     lowest = corner == 0 ? value[corner] : min(lowest, value[corner]);
     highest = corner == 0 ? value[corner] : max(highest, value[corner]);

@@ -27,10 +27,14 @@ void main()
     if (is_wall(neighbor)) {
       continue;
     }
-    ++diagonal;
     /* One brick-table lookup: unstored neighbors are open air with pressure zero. */
     int neighbor_index = index_of(neighbor);
-    if (neighbor_index >= 0 && cell_type[neighbor_index] == CELL_FLUID) {
+    uint type = neighbor_index >= 0 ? cell_type[neighbor_index] : CELL_OPEN;
+    if (type == CELL_SOLID) {
+      continue;
+    }
+    ++diagonal;
+    if (type == CELL_FLUID) {
       sum += PRESSURE[neighbor_index];
     }
   }

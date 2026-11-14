@@ -114,6 +114,15 @@ buoyancy, project; reflect the velocity about its projection; advect the reflect
 the scalars through the projected field for the other half; add buoyancy and project again. With
 `reflection = false` a step is one advection, buoyancy, and one projection.
 
+**Obstacles.** `Topology::obstacle` is one bit per voxel of the domain, set where the voxel is
+solid and at rest (`DenseFields::obstacle` on the way in). A stored obstacle voxel is a solid
+cell, exactly like the domain wall: no pressure unknown, its faces are held at zero, and smoke
+is not advected into it. The mask is dense because bricks come and go, and every newly stored
+voxel has to be classified; at 192×192×288 it is 1.3 MB. On the device only the classify kernel
+reads it. An obstacle voxel without storage is open air like any other unstored voxel, which
+is safe because the active region extends at least a brick past the smoke. Obstacles do not
+move, and there is no inflow yet.
+
 **The device driver.** The state stays in device memory between steps; `upload()` and
 `download()` are the only full transfers. A step is two submissions. The first runs the activity
 kernel and downloads one flag per brick, 4 bytes per active brick. The CPU builds the next brick
@@ -636,6 +645,16 @@ the defaults, as the largest density difference between mirrored voxels:
   swaps the colors), so exact symmetry is not expected.
 - A CPU test requires a centred plume to stay symmetric to 2e-4 over five frames. The fix has
   not run on a real GPU.
+
+**Obstacles.** A CPU test puts a plate above a plume at 32×32×48: after 12 frames no smoke is
+inside the plate, no face of it carries flow, the plume still holds 257 units of mass,
+and the space above the plate's middle holds none of the 70 units that reach it without the
+plate. On llvmpipe the device equals the CPU reference bit for bit on that scene with the
+multigrid and the Jacobi solver. Obstacles have not run on a real GPU.
+
+Smoke next to a solid, obstacle or wall, is interpolated against the zero stored inside the
+solid, so it thins there. Mantaflow extrapolates values into obstacles to avoid that; this
+solver does not yet.
 
 ## Not verified, and known gaps
 

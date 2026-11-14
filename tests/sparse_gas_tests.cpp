@@ -489,6 +489,74 @@ void test_symmetric_scene_stays_symmetric()
   require(asymmetry < 2.0e-4f, "a symmetric plume lost its symmetry");
 }
 
+/** A plate above the plume must stay free of smoke and of flow through its faces. */
+void test_obstacle_blocks_the_plume()
+{
+  const Extent extent{32, 32, 48};
+  DenseFields initial = blob(extent, 16.0f, 16.0f, 12.0f, 4.0f);
+  const auto in_plate = [](const int x, const int y, const int z) {
+    return z >= 22 && z < 25 && x >= 9 && x < 23 && y >= 9 && y < 23;
+  };
+  Settings settings = plume_settings();
+  settings.pressure_solver = PressureSolver::Multigrid;
+  settings.pressure_iterations = 6;
+  State free_state = from_dense(initial, 8, settings.thresholds, settings.dilation);
+  initial.obstacle.assign(initial.density.size(), 0);
+  for (int z = 0; z < extent.z; ++z) {
+    for (int y = 0; y < extent.y; ++y) {
+      for (int x = 0; x < extent.x; ++x) {
+        initial.obstacle[dense_index(extent, x, y, z)] = in_plate(x, y, z);
+      }
+    }
+  }
+  State state = from_dense(initial, 8, settings.thresholds, settings.dilation);
+  float worst_divergence = 0.0f;
+  for (int i = 0; i < 12; ++i) {
+    const FrameInfo frame = advance(state, settings, 1.0f / 15.0f);
+    worst_divergence = std::max(worst_divergence, frame.last_step.max_divergence);
+    advance(free_state, settings, 1.0f / 15.0f);
+  }
+  require(state.topology.type_at(16, 16, 23) == CellSolid, "the plate must be stored as solid");
+  const DenseFields result = to_dense(state);
+  const DenseFields free_result = to_dense(free_state);
+  float inside = 0.0f, through = 0.0f;
+  double above = 0.0, free_above = 0.0, total = 0.0;
+  for (int z = 0; z < extent.z; ++z) {
+    for (int y = 0; y < extent.y; ++y) {
+      for (int x = 0; x < extent.x; ++x) {
+        const std::size_t i = dense_index(extent, x, y, z);
+        total += result.density[i];
+        if (z >= 25 && x >= 11 && x < 21 && y >= 11 && y < 21) {
+          above += result.density[i];
+          free_above += free_result.density[i];
+        }
+        const bool solid = in_plate(x, y, z);
+        if (solid) {
+          inside = std::max(inside, std::abs(result.density[i]));
+        }
+        /* Every face of a solid voxel is at rest. */
+        if (solid || in_plate(x - 1, y, z)) {
+          through = std::max(through, std::abs(result.u[i]));
+        }
+        if (solid || in_plate(x, y - 1, z)) {
+          through = std::max(through, std::abs(result.v[i]));
+        }
+        if (solid || in_plate(x, y, z - 1)) {
+          through = std::max(through, std::abs(result.w[i]));
+        }
+      }
+    }
+  }
+  std::cout << "  smoke inside the plate " << inside << ", flow through it " << through
+            << ", mass " << total << ", above its middle " << above << " (without plate "
+            << free_above << "), worst divergence " << worst_divergence << std::endl;
+  require(inside == 0.0f, "smoke entered the obstacle");
+  require(through == 0.0f, "flow crossed an obstacle face");
+  require(total > 100.0, "the plume lost its smoke at the obstacle");
+  require(free_above > 10.0 && above < 0.25 * free_above, "the plate did not shelter the space above it");
+  require(worst_divergence < 0.05f, "the projection failed next to the obstacle");
+}
+
 }  // namespace
 
 int main()
@@ -506,8 +574,13 @@ int main()
       {"advance takes CFL substeps", test_advance_takes_cfl_substeps},
       {"large steps keep mass", test_large_steps_keep_mass},
       {"symmetric scene stays symmetric", test_symmetric_scene_stays_symmetric},
+      {"obstacle blocks the plume", test_obstacle_blocks_the_plume},
   };
+  const char *only = std::getenv("SPARSE_GAS_TEST");
   for (const auto &[name, test] : tests) {
+    if (only && name != only) {
+      continue;
+    }
     test();
     std::cout << "PASS: " << name << std::endl;
   }

@@ -2,10 +2,22 @@
 // Classify every stored voxel. Mirrors build_topology in the CPU reference: the domain's outer
 // layer is solid, and a cell is fluid only if its six neighbors are stored or solid. The cells
 // above it must be, so that all six of its faces have storage; the cells below it are required
-// too so that the open boundary is the same on every side. The rest are open air.
+// too so that the open boundary is the same on every side. The rest are open air. With
+// P.flags.x set, voxels whose bit is set in the obstacle mask (one bit per voxel of the domain)
+// are solid as well.
 #version 450
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
+layout(std430, binding = 10) readonly buffer Obstacle { uint obstacle_bits[]; };
+
+bool is_obstacle(ivec3 c)
+{
+  if (P.flags.x == 0) {
+    return false;
+  }
+  int voxel = c.x + P.extent.x * (c.y + P.extent.y * c.z);
+  return ((obstacle_bits[voxel >> 5] >> (voxel & 31)) & 1u) != 0u;
+}
 
 bool stored_or_wall(ivec3 c)
 {
@@ -20,7 +32,7 @@ void main()
   }
   ivec3 c = coords_of(index);
   uint type = CELL_OPEN;
-  if (is_wall(c)) {
+  if (is_wall(c) || is_obstacle(c)) {
     type = CELL_SOLID;
   }
   else if (stored_or_wall(c + ivec3(1, 0, 0)) && stored_or_wall(c + ivec3(0, 1, 0)) &&

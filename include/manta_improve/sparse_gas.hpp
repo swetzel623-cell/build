@@ -50,6 +50,13 @@ struct Topology {
   std::vector<std::int32_t> neighbors;
   /** Per stored voxel: a #CellType. */
   std::vector<std::uint32_t> cell_type;
+  /**
+   * Obstacles: one bit per voxel of the domain (X-fastest, 32 voxels per word), set where the
+   * voxel is solid and at rest. Empty when there are none. Stored obstacle voxels are solid
+   * cells; an obstacle voxel without storage is open air like any other unstored voxel, which
+   * is safe because the active region always extends past the smoke.
+   */
+  std::vector<std::uint32_t> obstacle;
 
   std::size_t brick_count() const { return brick_coords.size() / 4; }
   std::size_t voxels_per_brick() const
@@ -62,6 +69,8 @@ struct Topology {
   std::int64_t index_of(int x, int y, int z) const;
   /** Cell type at any coordinates, stored or not. */
   CellType type_at(int x, int y, int z) const;
+  /** Whether the obstacle bit of a voxel inside the domain is set. */
+  bool is_obstacle(int x, int y, int z) const;
 };
 
 /**
@@ -73,7 +82,12 @@ Topology build_topology(Extent extent,
                         int brick_size,
                         const std::vector<std::uint8_t> &brick_active,
                         int dilation,
-                        bool classify_cells = true);
+                        bool classify_cells = true,
+                        std::vector<std::uint32_t> obstacle = {});
+
+/** Pack a dense X-fastest array, nonzero where a voxel is solid, into Topology::obstacle. */
+std::vector<std::uint32_t> pack_obstacle(const Extent &extent,
+                                         const std::vector<std::uint8_t> &solid);
 
 /** Staggered (MAC) gas state on a sparse topology. Velocity is in voxels per second. */
 struct State {
@@ -101,6 +115,8 @@ struct DenseFields {
   std::vector<float> density;
   std::vector<float> temperature;
   std::vector<float> u, v, w;
+  /** Nonzero where a voxel is a solid obstacle at rest; may be empty. */
+  std::vector<std::uint8_t> obstacle;
 };
 
 State from_dense(const DenseFields &dense,

@@ -22,6 +22,9 @@ namespace {
 
 using namespace manta_improve;
 
+/** Put a plate above the plume, as an obstacle. */
+bool with_obstacle = false;
+
 sparse::DenseFields blob(const sparse::Extent extent)
 {
   sparse::DenseFields dense;
@@ -39,6 +42,19 @@ sparse::DenseFields blob(const sparse::Extent extent)
           const std::size_t i = x + static_cast<std::size_t>(extent.x) * (y + extent.y * z);
           dense.density[i] = 1.0f;
           dense.temperature[i] = 1.0f;
+        }
+      }
+    }
+  }
+  if (with_obstacle) {
+    /* A square plate a little above the blob, wider than it. */
+    const int bottom = static_cast<int>(0.46f * extent.z), top = bottom + std::max(3, extent.x / 16);
+    const int half = extent.x * 7 / 32;
+    dense.obstacle.assign(count, 0);
+    for (int z = bottom; z < top; ++z) {
+      for (int y = extent.y / 2 - half; y < extent.y / 2 + half; ++y) {
+        for (int x = extent.x / 2 - half; x < extent.x / 2 + half; ++x) {
+          dense.obstacle[x + static_cast<std::size_t>(extent.x) * (y + extent.y * z)] = 1;
         }
       }
     }
@@ -377,6 +393,9 @@ int main(int argc, char **argv)
     else if (std::string(argv[i]) == "--w-depth" && i + 1 < argc) {
       multigrid_w_depth = std::atoi(argv[++i]);
     }
+    else if (std::string(argv[i]) == "--obstacle") {
+      with_obstacle = true;
+    }
     else if (std::string(argv[i]) == "--image" && i + 1 < argc) {
       image_name = argv[++i];
     }
@@ -406,7 +425,7 @@ int main(int argc, char **argv)
             << (use_jacobi ? ", 60 Jacobi sweeps" : ", 6 multigrid cycles")
             << (first_order ? ", first-order advection" : ", MacCormack advection")
             << (test_settings(resolution).reflection ? ", advection-reflection" : ", plain steps")
-            << '\n';
+            << (with_obstacle ? ", plate obstacle" : "") << '\n';
   std::cout << "Creating the Vulkan device...\n";
   std::unique_ptr<gpu::SparseGasGpu> solver;
   try {

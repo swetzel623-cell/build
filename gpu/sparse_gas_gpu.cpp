@@ -122,6 +122,8 @@ struct SparseGasGpu::Impl {
   Compute::Buffer links;
   /** Per voxel, the lowest and highest value the last forward advection interpolated. */
   Compute::Buffer bounds;
+  /** The topology's obstacle mask; one word when there are no obstacles. */
+  Compute::Buffer obstacle;
 
   sparse::Topology topology;
   Compute::Buffer table, coords, types, slot_map, flags, speeds;
@@ -166,7 +168,7 @@ struct SparseGasGpu::Impl {
 
   ~Impl()
   {
-    for (Compute::Buffer *buffer : {&table, &coords, &types, &slot_map, &flags, &speeds, &links, &bounds,
+    for (Compute::Buffer *buffer : {&table, &coords, &types, &slot_map, &flags, &speeds, &links, &bounds, &obstacle,
                                     &dense_op,
                                     &dense_values, &dense_rhs, &dense_residual, &dense_table})
     {
@@ -419,11 +421,13 @@ struct SparseGasGpu::Impl {
     compute.upload(coords,
                    topology.brick_coords.data(),
                    topology.brick_coords.size() * sizeof(std::int32_t));
-    const Params p = params(0, 0, 0, 0);
+    Params p = params(0, 0, 0, 0);
+    p.flags[0] = topology.obstacle.empty() ? 0 : 1;
     compute.dispatch(classify,
                      &p,
                      sizeof(p),
-                     {&table, &coords, &types, nullptr, nullptr, nullptr, nullptr, nullptr},
+                     {&table, &coords, &types, nullptr, nullptr, nullptr, nullptr, nullptr,
+                      nullptr, &obstacle},
                      groups_for(topology.voxel_count()),
                      "classify");
     compute.dispatch(classify_links,
@@ -562,8 +566,13 @@ void SparseGasGpu::upload(const sparse::State &state)
   }
   g.topology = state.topology;
   g.topology.cell_type.clear();
+  const std::vector<std::uint32_t> &mask = g.topology.obstacle;
+  g.ensure(g.obstacle, std::max<std::size_t>(1, mask.size()) * sizeof(std::uint32_t));
 
   g.compute.begin();
+  if (!mask.empty()) {
+    g.compute.upload(g.obstacle, mask.data(), mask.size() * sizeof(std::uint32_t));
+  }
   g.record_topology_upload();
   const std::vector<float> *channels[StateChannels] = {
       &state.density, &state.temperature, &state.u, &state.v, &state.w, &state.pressure};
@@ -702,7 +711,8 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
     }
   }
   sparse::Topology next = sparse::build_topology(
-      old_topology.extent, old_topology.brick_size, brick_flags, settings.dilation, false);
+      old_topology.extent, old_topology.brick_size, brick_flags, settings.dilation, false,
+      old_topology.obstacle);
   const bool changed = next.brick_table != old_topology.brick_table;
   std::vector<std::int32_t> old_slot_of;
   if (changed) {

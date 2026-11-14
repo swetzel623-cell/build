@@ -225,17 +225,48 @@ CellType Topology::type_at(const int x, const int y, const int z) const
   return index < 0 ? CellOpen : static_cast<CellType>(cell_type[static_cast<std::size_t>(index)]);
 }
 
+bool Topology::is_obstacle(const int x, const int y, const int z) const
+{
+  if (obstacle.empty()) {
+    return false;
+  }
+  const std::size_t voxel = dense_index(extent, x, y, z);
+  return (obstacle[voxel >> 5] >> (voxel & 31)) & 1u;
+}
+
+std::vector<std::uint32_t> pack_obstacle(const Extent &extent,
+                                         const std::vector<std::uint8_t> &solid)
+{
+  const std::size_t count = static_cast<std::size_t>(extent.x) * extent.y * extent.z;
+  if (solid.size() != count) {
+    throw std::invalid_argument("The obstacle array does not match the extent");
+  }
+  std::vector<std::uint32_t> bits((count + 31) / 32, 0u);
+  for (std::size_t i = 0; i < count; ++i) {
+    if (solid[i]) {
+      bits[i >> 5] |= 1u << (i & 31);
+    }
+  }
+  return bits;
+}
+
 Topology build_topology(const Extent extent,
                         const int brick_size,
                         const std::vector<std::uint8_t> &brick_active,
                         const int dilation,
-                        const bool classify_cells)
+                        const bool classify_cells,
+                        std::vector<std::uint32_t> obstacle)
 {
   if (extent.x < 4 || extent.y < 4 || extent.z < 4 || brick_size < 2 || dilation < 0) {
     throw std::invalid_argument("Invalid sparse topology parameters");
   }
+  const std::size_t voxels = static_cast<std::size_t>(extent.x) * extent.y * extent.z;
+  if (!obstacle.empty() && obstacle.size() != (voxels + 31) / 32) {
+    throw std::invalid_argument("The obstacle mask does not match the extent");
+  }
   Topology topology;
   topology.extent = extent;
+  topology.obstacle = std::move(obstacle);
   topology.brick_size = brick_size;
   topology.brick_extent = {ceil_div(extent.x, brick_size),
                            ceil_div(extent.y, brick_size),
@@ -297,7 +328,7 @@ Topology build_topology(const Extent extent,
     return is_wall(extent, x, y, z) || topology.index_of(x, y, z) >= 0;
   };
   for_each_voxel(topology, [&](const std::size_t index, const int x, const int y, const int z) {
-    if (is_wall(extent, x, y, z)) {
+    if (is_wall(extent, x, y, z) || topology.is_obstacle(x, y, z)) {
       topology.cell_type[index] = CellSolid;
     }
     else if (stored_or_wall(x + 1, y, z) && stored_or_wall(x, y + 1, z) &&
@@ -347,7 +378,10 @@ State from_dense(const DenseFields &dense,
   }
 
   State state;
-  state.topology = build_topology(extent, brick_size, flags, dilation);
+  state.topology = build_topology(
+      extent, brick_size, flags, dilation, true,
+      dense.obstacle.empty() ? std::vector<std::uint32_t>() :
+                               pack_obstacle(extent, dense.obstacle));
   resize_channels(state);
   for_each_voxel(state.topology, [&](const std::size_t index, int x, int y, int z) {
     if (x >= extent.x || y >= extent.y || z >= extent.z) {
@@ -396,7 +430,9 @@ void retopologize(State &state, const ActivityThresholds &thresholds, const int 
   Topology topology = build_topology(old_topology.extent,
                                      old_topology.brick_size,
                                      activity_flags(state, thresholds),
-                                     dilation);
+                                     dilation,
+                                     true,
+                                     old_topology.obstacle);
   if (topology.brick_table == old_topology.brick_table) {
     return;
   }

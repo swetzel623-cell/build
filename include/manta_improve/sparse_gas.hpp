@@ -152,11 +152,12 @@ struct Settings {
    * first advects, applies forces and projects; the velocity is then reflected about its
    * projection (twice the projected velocity minus the unprojected one) and advected through the
    * projected field for the second half, followed by forces and a second projection. Costs about
-   * two plain steps and keeps the rotation that a single projection per step removes.
+   * two plain steps and keeps the rotation that a single projection per step removes. Turn it
+   * off, with a CFL number of 4, for a faster and smoother result.
    */
-  bool reflection = false;
+  bool reflection = true;
   /** advance(): largest distance, in voxels, anything may travel in one step. */
-  float cfl = 4.0f;
+  float cfl = 6.0f;
   /** advance(): fail instead of taking more steps than this for one frame. */
   int max_substeps = 64;
   /** Acceleration in voxels per second squared. */

@@ -102,11 +102,12 @@ if(MANTA_IMPROVE_BUILD_GPU)
       # The deeper W-cycle and uneven coarse sweeps are not the defaults; keep them covered.
       add_test(NAME sparse_gas_gpu_wcycle_tests
                COMMAND sparse_gas_gpu_tests 32 6 --w-depth 2 --coarse-sweeps 1 2)
-      add_test(NAME sparse_gas_gpu_reflection_tests
-               COMMAND sparse_gas_gpu_tests 32 8 --reflection --cfl 0.5)
+      # Plain steps are not the default; keep them covered.
+      add_test(NAME sparse_gas_gpu_plain_step_tests
+               COMMAND sparse_gas_gpu_tests 32 8 --reflection 0 --cfl 0.5)
       set_tests_properties(
         sparse_gas_gpu_tests sparse_gas_gpu_jacobi_tests sparse_gas_gpu_substep_tests
-        sparse_gas_gpu_wcycle_tests sparse_gas_gpu_reflection_tests
+        sparse_gas_gpu_wcycle_tests sparse_gas_gpu_plain_step_tests
         PROPERTIES SKIP_RETURN_CODE 77
       )
     endif()

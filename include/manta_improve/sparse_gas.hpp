@@ -142,6 +142,11 @@ struct Settings {
   /** Time step of step(). advance() chooses its own steps and ignores this. */
   float dt = 1.0f / 30.0f;
   Advection advection = Advection::MacCormack;
+  /**
+   * Trace departure points with the velocity half way along the path (second order) instead of
+   * the velocity at the arrival point. Costs three more velocity samples per trace.
+   */
+  bool midpoint_trace = false;
   /** advance(): largest distance, in voxels, anything may travel in one step. */
   float cfl = 2.0f;
   /** advance(): fail instead of taking more steps than this for one frame. */
@@ -216,7 +221,8 @@ void advect(const State &state,
             float offset_y,
             float offset_z,
             float dt,
-            std::vector<float> &result);
+            std::vector<float> &result,
+            bool midpoint = false);
 
 /**
  * MacCormack correction of a forward-advected channel. `forward` must be advect() of `source`
@@ -229,7 +235,8 @@ void advect_maccormack(const State &state,
                        float offset_y,
                        float offset_z,
                        float dt,
-                       std::vector<float> &result);
+                       std::vector<float> &result,
+                       bool midpoint = false);
 
 /** Largest absolute velocity component of any stored face. */
 float max_speed(const State &state);

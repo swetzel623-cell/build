@@ -448,13 +448,41 @@ float sample(const Topology &topology,
   return lerp(lerp(c00, c10, ty), lerp(c01, c11, ty), tz);
 }
 
+namespace {
+
+/**
+ * Follow the velocity field from a point for `step` seconds (negative: backwards). With
+ * `midpoint`, the velocity is taken half way along a first, single-stage trace.
+ */
+void trace(const State &state, const float px, const float py, const float pz, const float step,
+           const bool midpoint, float end[3])
+{
+  const Topology &topology = state.topology;
+  float vx = sample(topology, state.u, px, py, pz, 0.0f, 0.5f, 0.5f);
+  float vy = sample(topology, state.v, px, py, pz, 0.5f, 0.0f, 0.5f);
+  float vz = sample(topology, state.w, px, py, pz, 0.5f, 0.5f, 0.0f);
+  if (midpoint) {
+    const float half = 0.5f * step;
+    const float mx = px + half * vx, my = py + half * vy, mz = pz + half * vz;
+    vx = sample(topology, state.u, mx, my, mz, 0.0f, 0.5f, 0.5f);
+    vy = sample(topology, state.v, mx, my, mz, 0.5f, 0.0f, 0.5f);
+    vz = sample(topology, state.w, mx, my, mz, 0.5f, 0.5f, 0.0f);
+  }
+  end[0] = px + step * vx;
+  end[1] = py + step * vy;
+  end[2] = pz + step * vz;
+}
+
+}  // namespace
+
 void advect(const State &state,
             const std::vector<float> &source,
             const float offset_x,
             const float offset_y,
             const float offset_z,
             const float dt,
-            std::vector<float> &result)
+            std::vector<float> &result,
+            const bool midpoint)
 {
   const Topology &topology = state.topology;
   result.assign(topology.voxel_count(), 0.0f);
@@ -465,16 +493,9 @@ void advect(const State &state,
     const float px = static_cast<float>(x) + offset_x;
     const float py = static_cast<float>(y) + offset_y;
     const float pz = static_cast<float>(z) + offset_z;
-    const float vx = sample(topology, state.u, px, py, pz, 0.0f, 0.5f, 0.5f);
-    const float vy = sample(topology, state.v, px, py, pz, 0.5f, 0.0f, 0.5f);
-    const float vz = sample(topology, state.w, px, py, pz, 0.5f, 0.5f, 0.0f);
-    result[index] = sample(topology,
-                           source,
-                           px - dt * vx,
-                           py - dt * vy,
-                           pz - dt * vz,
-                           offset_x,
-                           offset_y,
+    float from[3];
+    trace(state, px, py, pz, -dt, midpoint, from);
+    result[index] = sample(topology, source, from[0], from[1], from[2], offset_x, offset_y,
                            offset_z);
   });
 }
@@ -486,7 +507,8 @@ void advect_maccormack(const State &state,
                        const float offset_y,
                        const float offset_z,
                        const float dt,
-                       std::vector<float> &result)
+                       std::vector<float> &result,
+                       const bool midpoint)
 {
   const Topology &topology = state.topology;
   result.assign(topology.voxel_count(), 0.0f);
@@ -508,15 +530,15 @@ void advect_maccormack(const State &state,
     const float px = static_cast<float>(x) + offset_x;
     const float py = static_cast<float>(y) + offset_y;
     const float pz = static_cast<float>(z) + offset_z;
-    const float vx = sample(topology, state.u, px, py, pz, 0.0f, 0.5f, 0.5f);
-    const float vy = sample(topology, state.v, px, py, pz, 0.5f, 0.0f, 0.5f);
-    const float vz = sample(topology, state.w, px, py, pz, 0.5f, 0.5f, 0.0f);
+    float from[3], to[3];
+    trace(state, px, py, pz, -dt, midpoint, from);
+    trace(state, px, py, pz, dt, midpoint, to);
 
     /* The values the forward trace interpolated bound the result. If any of them has no
      * storage, the trace left the active region: keep the first-order value there. */
-    const float bx = std::floor(px - dt * vx - offset_x);
-    const float by = std::floor(py - dt * vy - offset_y);
-    const float bz = std::floor(pz - dt * vz - offset_z);
+    const float bx = std::floor(from[0] - offset_x);
+    const float by = std::floor(from[1] - offset_y);
+    const float bz = std::floor(from[2] - offset_z);
     const int ix = static_cast<int>(bx), iy = static_cast<int>(by), iz = static_cast<int>(bz);
     float lowest = 0.0f, highest = 0.0f;
     for (int corner = 0; corner < 8; ++corner) {
@@ -531,7 +553,7 @@ void advect_maccormack(const State &state,
     }
 
     const float backward = sample(
-        topology, forward, px + dt * vx, py + dt * vy, pz + dt * vz, offset_x, offset_y, offset_z);
+        topology, forward, to[0], to[1], to[2], offset_x, offset_y, offset_z);
     const float corrected = forward[index] + 0.5f * (source[index] - backward);
     result[index] = std::min(std::max(corrected, lowest), highest);
   });
@@ -714,11 +736,12 @@ StepInfo step(State &state, const Settings &settings)
   const auto advect_channel = [&](const std::vector<float> &source, const float ox, const float oy,
                                   const float oz, std::vector<float> &result) {
     if (settings.advection == Advection::MacCormack) {
-      advect(state, source, ox, oy, oz, settings.dt, forward);
-      advect_maccormack(state, source, forward, ox, oy, oz, settings.dt, result);
+      advect(state, source, ox, oy, oz, settings.dt, forward, settings.midpoint_trace);
+      advect_maccormack(state, source, forward, ox, oy, oz, settings.dt, result,
+                        settings.midpoint_trace);
     }
     else {
-      advect(state, source, ox, oy, oz, settings.dt, result);
+      advect(state, source, ox, oy, oz, settings.dt, result, settings.midpoint_trace);
     }
   };
   advect_channel(state.density, 0.5f, 0.5f, 0.5f, density);

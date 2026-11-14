@@ -417,19 +417,20 @@ void test_advance_takes_cfl_substeps()
 }
 
 /**
- * The default CFL number must keep most of a fast plume's smoke. Semi-Lagrangian tracing loses
- * mass when a step moves smoke several voxels through an accelerating flow, which is what limits
- * the step size; see "Fewer substeps" in docs/gpu-sparse-solver.md.
+ * The default CFL number must keep most of a fast plume's smoke. A single-stage backward trace
+ * loses mass when a step moves smoke several voxels through an accelerating flow; the midpoint
+ * trace is what makes the default step size usable. See "Fewer substeps" in
+ * docs/gpu-sparse-solver.md.
  */
 void test_default_cfl_keeps_mass()
 {
   const DenseFields initial = blob({32, 32, 48}, 16.0f, 16.0f, 8.0f, 4.0f);
   const double initial_mass = sum(initial.density);
-  const auto kept = [&](const float cfl) {
+  const auto kept = [&](const bool midpoint) {
     Settings settings = plume_settings();
     settings.pressure_solver = PressureSolver::Multigrid;
     settings.pressure_iterations = 6;
-    settings.cfl = cfl;
+    settings.midpoint_trace = midpoint;
     State state = from_dense(initial, 8, settings.thresholds, settings.dilation);
     int substeps = 0;
     for (int i = 0; i < 6; ++i) {
@@ -437,14 +438,15 @@ void test_default_cfl_keeps_mass()
       substeps += advance(state, settings, 1.0f / 8.0f).substeps;
     }
     const double fraction = sum(to_dense(state).density) / initial_mass;
-    std::cout << "  CFL " << cfl << ": " << substeps << " substeps, mass kept " << fraction << '\n';
+    std::cout << "  CFL " << settings.cfl << (midpoint ? ", midpoint" : ", single-stage")
+              << " trace: " << substeps << " substeps, mass kept " << fraction << '\n';
     return fraction;
   };
-  const double at_default = kept(Settings().cfl);
-  const double at_four = kept(4.0f);
+  const double at_default = kept(true);
+  const double single_stage = kept(false);
   require(at_default > 0.65, "the default CFL number lost too much smoke");
   require(at_default < 1.1, "the default CFL number created smoke");
-  require(at_four < at_default - 0.1, "a larger CFL number was expected to lose more smoke");
+  require(single_stage < at_default - 0.1, "the midpoint trace was expected to keep more smoke");
 }
 
 }  // namespace

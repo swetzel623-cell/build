@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // MacCormack correction of a forward-advected channel. Mirrors advect_maccormack in the CPU
-// reference. P.a = (offset of the advected channel, dt).
+// reference. P.a = (offset of the advected channel, dt); P.flags.x selects the midpoint trace.
 #version 450
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
@@ -45,6 +45,26 @@ SAMPLE(sample_v, V)
 SAMPLE(sample_w, W)
 SAMPLE(sample_forward, FORWARD)
 
+vec3 velocity_at(vec3 p)
+{
+  return vec3(sample_u(p, vec3(0.0, 0.5, 0.5)),
+              sample_v(p, vec3(0.5, 0.0, 0.5)),
+              sample_w(p, vec3(0.5, 0.5, 0.0)));
+}
+
+/* Follow the velocity from p for `step` seconds (negative: backwards). With P.flags.x set, use
+ * the velocity half way along a first, single-stage trace. Mirrors trace() in the CPU
+ * reference. */
+vec3 trace(vec3 p, float step)
+{
+  vec3 velocity = velocity_at(p);
+  if (P.flags.x != 0) {
+    float half_step = 0.5 * step;
+    velocity = velocity_at(p + half_step * velocity);
+  }
+  return p + step * velocity;
+}
+
 void main()
 {
   int index;
@@ -76,14 +96,13 @@ void main()
   }
 
   vec3 p = vec3(c) + offset;
-  vec3 velocity = vec3(sample_u(p, vec3(0.0, 0.5, 0.5)),
-                       sample_v(p, vec3(0.5, 0.0, 0.5)),
-                       sample_w(p, vec3(0.5, 0.5, 0.0)));
   float dt = P.a.w;
+  vec3 from = trace(p, -dt);
+  vec3 to = trace(p, dt);
 
   /* The values the forward trace interpolated bound the result. If any has no storage, the
    * trace left the active region: keep the first-order value. */
-  ivec3 base = ivec3(floor(p - dt * velocity - offset));
+  ivec3 base = ivec3(floor(from - offset));
   float lowest = 0.0, highest = 0.0;
   for (int corner = 0; corner < 8; ++corner) {
     int i = index_of(base + ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1));
@@ -95,7 +114,7 @@ void main()
     highest = corner == 0 ? value : max(highest, value);
   }
 
-  float backward = sample_forward(p + dt * velocity, offset);
+  float backward = sample_forward(to, offset);
   float corrected = forward + 0.5 * (SOURCE[index] - backward);
   RESULT[index] = min(max(corrected, lowest), highest);
 }

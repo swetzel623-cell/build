@@ -146,9 +146,9 @@ struct Settings {
    * Trace departure points with the velocity half way along the path (second order) instead of
    * the velocity at the arrival point. Costs three more velocity samples per trace.
    */
-  bool midpoint_trace = false;
+  bool midpoint_trace = true;
   /** advance(): largest distance, in voxels, anything may travel in one step. */
-  float cfl = 2.0f;
+  float cfl = 4.0f;
   /** advance(): fail instead of taking more steps than this for one frame. */
   int max_substeps = 64;
   /** Acceleration in voxels per second squared. */

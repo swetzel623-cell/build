@@ -42,6 +42,7 @@ struct Params {
   std::int32_t extent[4];
   std::int32_t bricks[4];
   float a[4];
+  std::int32_t flags[4];
 };
 
 struct ActivityParams {
@@ -474,7 +475,8 @@ struct SparseGasGpu::Impl {
              topology.brick_extent.y,
              topology.brick_extent.z,
              static_cast<std::int32_t>(topology.voxel_count())},
-            {a0, a1, a2, a3}};
+            {a0, a1, a2, a3},
+            {0, 0, 0, 0}};
   }
 
   /** Dispatch a stencil kernel with the topology tables at bindings 1-3 and channels after. */
@@ -785,7 +787,8 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
     const bool second_order = settings.advection == sparse::Advection::MacCormack;
     const int forward = StateChannels + 5;
     for (int i = 0; i < 5; ++i) {
-      const Params p = g.params(offsets[i][0], offsets[i][1], offsets[i][2], dt);
+      Params p = g.params(offsets[i][0], offsets[i][1], offsets[i][2], dt);
+      p.flags[0] = settings.midpoint_trace ? 1 : 0;
       g.stencil(g.advect, "advect", p, U, V, W, i, second_order ? forward : StateChannels + i);
       if (second_order) {
         g.stencil(g.maccormack, "maccormack", p, U, V, W, i, forward, StateChannels + i);

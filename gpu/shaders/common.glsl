@@ -9,6 +9,7 @@ layout(push_constant) uniform Params
   ivec4 extent; /* Domain size in voxels; w is the brick size. */
   ivec4 bricks; /* Brick grid size; w is the number of stored voxels. */
   vec4 a;       /* Kernel-specific. */
+  ivec4 flags;  /* Kernel-specific. */
 }
 P;
 layout(std430, binding = 1) readonly buffer BrickTable { int brick_table[]; };

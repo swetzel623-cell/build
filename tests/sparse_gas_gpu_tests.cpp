@@ -95,6 +95,7 @@ float cfl = -1.0f;
 constexpr float frame_time = 1.0f / 30.0f;
 int multigrid_w_depth = -1;
 int coarse_pre_sweeps = -1, coarse_post_sweeps = -1;
+int midpoint = -1;
 
 sparse::Settings test_settings(const int resolution)
 {
@@ -104,6 +105,9 @@ sparse::Settings test_settings(const int resolution)
   settings.density_buoyancy = 0.5f;
   if (cfl > 0.0f) {
     settings.cfl = cfl;
+  }
+  if (midpoint >= 0) {
+    settings.midpoint_trace = midpoint != 0;
   }
   if (first_order) {
     settings.advection = sparse::Advection::SemiLagrangian;
@@ -283,6 +287,9 @@ int main(int argc, char **argv)
     }
     else if (std::string(argv[i]) == "--w-depth" && i + 1 < argc) {
       multigrid_w_depth = std::atoi(argv[++i]);
+    }
+    else if (std::string(argv[i]) == "--midpoint" && i + 1 < argc) {
+      midpoint = std::atoi(argv[++i]);
     }
     else if (std::string(argv[i]) == "--coarse-sweeps" && i + 2 < argc) {
       coarse_pre_sweeps = std::atoi(argv[++i]);

@@ -200,6 +200,7 @@ int multigrid_w_depth = -1;
 int coarse_pre_sweeps = -1, coarse_post_sweeps = -1;
 int midpoint = -1;
 int reflection = -1;
+int conserve = -1;
 std::string image_name;
 
 sparse::Settings test_settings(const int resolution)
@@ -216,6 +217,9 @@ sparse::Settings test_settings(const int resolution)
   }
   if (midpoint >= 0) {
     settings.midpoint_trace = midpoint != 0;
+  }
+  if (conserve >= 0) {
+    settings.conserve_mass = conserve != 0;
   }
   if (first_order) {
     settings.advection = sparse::Advection::SemiLagrangian;
@@ -413,6 +417,9 @@ int main(int argc, char **argv)
     }
     else if (std::string(argv[i]) == "--reflection" && i + 1 < argc) {
       reflection = std::atoi(argv[++i]);
+    }
+    else if (std::string(argv[i]) == "--conserve" && i + 1 < argc) {
+      conserve = std::atoi(argv[++i]);
     }
     else if (std::string(argv[i]) == "--midpoint" && i + 1 < argc) {
       midpoint = std::atoi(argv[++i]);

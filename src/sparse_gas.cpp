@@ -613,6 +613,31 @@ void advect_maccormack(const State &state,
   });
 }
 
+void conserve_correction(const std::vector<float> &source,
+                         const std::vector<float> &forward,
+                         std::vector<float> &result)
+{
+  double before = 0.0, after = 0.0, added = 0.0, removed = 0.0;
+  for (std::size_t i = 0; i < source.size(); ++i) {
+    before += source[i];
+    after += result[i];
+    const double correction = static_cast<double>(result[i]) - forward[i];
+    (correction > 0.0 ? added : removed) += std::abs(correction);
+  }
+  const double excess = after - before;
+  const double pool = excess > 0.0 ? added : removed;
+  if (excess == 0.0 || pool == 0.0) {
+    return;
+  }
+  const float keep = static_cast<float>(std::max(0.0, 1.0 - std::abs(excess) / pool));
+  for (std::size_t i = 0; i < source.size(); ++i) {
+    const float correction = result[i] - forward[i];
+    if (excess > 0.0 ? correction > 0.0f : correction < 0.0f) {
+      result[i] = forward[i] + keep * correction;
+    }
+  }
+}
+
 float max_speed(const State &state)
 {
   float result = 0.0f;
@@ -791,18 +816,22 @@ StepInfo step(State &state, const Settings &settings)
                               const std::vector<float> &source_v,
                               const std::vector<float> &source_w) {
     const auto advect_channel = [&](const std::vector<float> &source, const float ox,
-                                    const float oy, const float oz, std::vector<float> &result) {
+                                    const float oy, const float oz, std::vector<float> &result,
+                                    const bool conserve = false) {
       if (settings.advection == Advection::MacCormack) {
         advect(state, source, ox, oy, oz, dt, forward, settings.midpoint_trace);
         advect_maccormack(state, source, forward, ox, oy, oz, dt, result,
                           settings.midpoint_trace);
+        if (conserve) {
+          conserve_correction(source, forward, result);
+        }
       }
       else {
         advect(state, source, ox, oy, oz, dt, result, settings.midpoint_trace);
       }
     };
-    advect_channel(state.density, 0.5f, 0.5f, 0.5f, density);
-    advect_channel(state.temperature, 0.5f, 0.5f, 0.5f, temperature);
+    advect_channel(state.density, 0.5f, 0.5f, 0.5f, density, settings.conserve_mass);
+    advect_channel(state.temperature, 0.5f, 0.5f, 0.5f, temperature, settings.conserve_mass);
     advect_channel(source_u, 0.0f, 0.5f, 0.5f, u);
     advect_channel(source_v, 0.5f, 0.0f, 0.5f, v);
     advect_channel(source_w, 0.5f, 0.5f, 0.0f, w);

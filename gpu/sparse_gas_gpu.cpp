@@ -11,6 +11,8 @@
 #include "mask_pressure.comp.h"
 #include "mg_smooth0.comp.h"
 #include "mg_restrict0.comp.h"
+#include "conserve_apply.comp.h"
+#include "conserve_reduce.comp.h"
 #include "copy3.comp.h"
 #include "reflect.comp.h"
 #include "mg_residual.comp.h"
@@ -100,6 +102,7 @@ struct SparseGasGpu::Impl {
   Compute compute;
   int advect, maccormack, buoyancy, walls, divergence, jacobi, gradient, activity, remap, classify;
   int classify_links, mask_pressure, mg_smooth0, mg_restrict0, mg_smooth, mg_residual, copy3, reflect;
+  int conserve_reduce, conserve_apply;
   int mg_restrict, mg_prolong0, mg_prolong, mg_build0, mg_build, mg_dense_cycle;
 
   /** One coarse multigrid level on the device. */
@@ -124,6 +127,8 @@ struct SparseGasGpu::Impl {
   Compute::Buffer bounds;
   /** The topology's obstacle mask; one word when there are no obstacles. */
   Compute::Buffer obstacle;
+  /** Sums of each MacCormack work group for conserve_mass, after the factor they produce. */
+  Compute::Buffer partials;
 
   sparse::Topology topology;
   Compute::Buffer table, coords, types, slot_map, flags, speeds;
@@ -155,6 +160,8 @@ struct SparseGasGpu::Impl {
     mg_restrict0 = KERNEL(mg_restrict0);
     copy3 = KERNEL(copy3);
     reflect = KERNEL(reflect);
+    conserve_reduce = KERNEL(conserve_reduce);
+    conserve_apply = KERNEL(conserve_apply);
     mg_residual = KERNEL(mg_residual);
     mg_smooth = KERNEL(mg_smooth);
     mg_restrict = KERNEL(mg_restrict);
@@ -168,7 +175,7 @@ struct SparseGasGpu::Impl {
 
   ~Impl()
   {
-    for (Compute::Buffer *buffer : {&table, &coords, &types, &slot_map, &flags, &speeds, &links, &bounds, &obstacle,
+    for (Compute::Buffer *buffer : {&table, &coords, &types, &slot_map, &flags, &speeds, &links, &bounds, &obstacle, &partials,
                                     &dense_op,
                                     &dense_values, &dense_rhs, &dense_residual, &dense_table})
     {
@@ -220,6 +227,7 @@ struct SparseGasGpu::Impl {
     ensure(types, next.voxel_count() * sizeof(std::uint32_t));
     ensure(links, next.voxel_count() * sizeof(std::uint32_t));
     ensure(bounds, next.voxel_count() * 2 * sizeof(float));
+    ensure(partials, (4 + 4 * groups_for(next.voxel_count())) * sizeof(float));
 
     const std::vector<sparse::MultigridLevel> layout = sparse::multigrid_layout(next);
     bool same_shape = layout.size() == levels.size();
@@ -500,15 +508,17 @@ struct SparseGasGpu::Impl {
                const int c7 = -1,
                const int c8 = -1,
                const int c9 = -1,
-               const Compute::Buffer *c10 = nullptr)
+               const Compute::Buffer *c10 = nullptr,
+               const Compute::Buffer *c11 = nullptr,
+               const std::uint32_t groups = 0)
   {
     const auto bind = [&](const int logical) { return logical < 0 ? nullptr : &channel(logical); };
     compute.dispatch(kernel,
                      &p,
                      sizeof(p),
                      {&table, &coords, &types, bind(c4), bind(c5), bind(c6), bind(c7), bind(c8),
-                      bind(c9), c10},
-                     groups_for(topology.voxel_count()),
+                      bind(c9), c10, c11},
+                     groups ? groups : groups_for(topology.voxel_count()),
                      label);
   }
 };
@@ -812,8 +822,21 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
       p.flags[1] = second_order ? 1 : 0;
       g.stencil(g.advect, "advect", p, U, V, W, source, second_order ? forward : target, -1,
                 &g.bounds);
-      if (second_order) {
-        g.stencil(g.maccormack, "maccormack", p, U, V, W, source, forward, target, &g.bounds);
+      if (!second_order) {
+        return;
+      }
+      /* The scalars keep their totals: see conserve_correction in the CPU reference. */
+      const bool conserve = settings.conserve_mass && (kind == Density || kind == Temperature);
+      p.flags[1] = conserve ? 1 : 0;
+      g.stencil(g.maccormack, "maccormack", p, U, V, W, source, forward, target, &g.bounds,
+                &g.partials);
+      if (conserve) {
+        Params reduce = g.params(0, 0, 0, 0);
+        reduce.flags[0] = static_cast<std::int32_t>(groups_for(g.topology.voxel_count()));
+        g.stencil(g.conserve_reduce, "conserve", reduce, -1, -1, -1, -1, -1, -1, nullptr,
+                  &g.partials, 1);
+        g.stencil(g.conserve_apply, "conserve", g.params(0, 0, 0, 0), -1, -1, -1, -1, forward,
+                  target, nullptr, &g.partials);
       }
     };
     const auto add_forces = [&](const float step) {

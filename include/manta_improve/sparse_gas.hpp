@@ -172,6 +172,15 @@ struct Settings {
    * off, with a CFL number of 4, for a faster and smoother result.
    */
   bool reflection = true;
+  /**
+   * MacCormack: keep advection from changing the total density and temperature. The correction
+   * is not conservative; next to obstacles its clamp adds smoke step after step (Mantaflow's own
+   * kernels gain 60% in 60 frames on the plate scene of the tests). After each scalar channel is
+   * corrected, the corrections of the sign that changed the total are scaled down uniformly
+   * until the total matches the channel before advection, or until they are gone. Every value
+   * stays between the first-order result and the clamped correction, so no new extremes appear.
+   */
+  bool conserve_mass = true;
   /** advance(): largest distance, in voxels, anything may travel in one step. */
   float cfl = 6.0f;
   /** advance(): fail instead of taking more steps than this for one frame. */
@@ -262,6 +271,16 @@ void advect_maccormack(const State &state,
                        float dt,
                        std::vector<float> &result,
                        bool midpoint = false);
+
+/**
+ * Scale down the corrections that `advect_maccormack` made (`result` minus `forward`) of one
+ * sign, uniformly, so that `result` totals as much as `source`. Corrections of the other sign
+ * are kept. If the corrections of that sign are too small, they are removed entirely and the
+ * remaining difference is left. Solid voxels hold zero in all three channels.
+ */
+void conserve_correction(const std::vector<float> &source,
+                         const std::vector<float> &forward,
+                         std::vector<float> &result);
 
 /** Largest absolute velocity component of any stored face. */
 float max_speed(const State &state);

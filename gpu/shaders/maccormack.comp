@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // MacCormack correction of a forward-advected channel. Mirrors advect_maccormack in the CPU
 // reference. P.a = (offset of the advected channel, dt); P.flags.x selects the midpoint trace.
+// With P.flags.y set, each work group also writes the sums conserve_correction needs to
+// `partials`: the change of the channel's total, and the added and removed corrections.
 #version 450
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
@@ -12,6 +14,8 @@
 #define RESULT b9
 /* Written by the forward pass: lowest and highest of the values its trace interpolated. */
 layout(std430, binding = 10) readonly buffer Bounds { float bounds[]; };
+/* Four floats per work group, after four for conserve_reduce. */
+layout(std430, binding = 11) writeonly buffer Partials { float partials[]; };
 
 #define SAMPLE(name, channel) \
   float name##_at(ivec3 c) \
@@ -66,19 +70,13 @@ vec3 trace(vec3 p, float step)
   return p + step * velocity;
 }
 
-void main()
+float corrected_value(int index)
 {
-  int index;
-  if (!voxel_in_range(index)) {
-    return;
-  }
   uint type = cell_type[index];
   if (type == CELL_SOLID) {
-    RESULT[index] = 0.0;
-    return;
+    return 0.0;
   }
   float forward = FORWARD[index];
-  RESULT[index] = forward;
 
   /* Only correct values that lie inside the fluid. A staggered component sits on the face
    * shared with the cell below it along its axis. */
@@ -86,13 +84,13 @@ void main()
   vec3 offset = P.a.xyz;
   int axis = offset.x == 0.0 ? 0 : offset.y == 0.0 ? 1 : offset.z == 0.0 ? 2 : -1;
   if (type != CELL_FLUID) {
-    return;
+    return forward;
   }
   if (axis >= 0) {
     ivec3 below = c;
     below[axis] -= 1;
     if (type_at(below) != CELL_FLUID) {
-      return;
+      return forward;
     }
   }
 
@@ -101,7 +99,7 @@ void main()
    * add smoke along every wall. */
   float lowest = bounds[2 * index], highest = bounds[2 * index + 1];
   if (lowest > highest) {
-    return;
+    return forward;
   }
 
   vec3 p = vec3(c) + offset;
@@ -118,7 +116,7 @@ void main()
   for (int corner = 0; corner < 8; ++corner) {
     int i = index_of(corner_base + ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1));
     if (i < 0 || cell_type[i] == CELL_SOLID) {
-      return;
+      return forward;
     }
     value[corner] = FORWARD[i];
   }
@@ -130,5 +128,40 @@ void main()
   float c1 = c01 + (c11 - c01) * t.y;
   float backward = c0 + (c1 - c0) * t.z;
   float corrected = forward + 0.5 * (SOURCE[index] - backward);
-  RESULT[index] = min(max(corrected, lowest), highest);
+  return min(max(corrected, lowest), highest);
+}
+
+shared float group_sums[3][64];
+
+void main()
+{
+  int index;
+  bool in_range = voxel_in_range(index);
+  float value = 0.0;
+  if (in_range) {
+    value = corrected_value(index);
+    RESULT[index] = value;
+  }
+  if (P.flags.y == 0) {
+    return;
+  }
+  uint l = gl_LocalInvocationID.x;
+  float correction = in_range ? value - FORWARD[index] : 0.0;
+  group_sums[0][l] = in_range ? value - SOURCE[index] : 0.0;
+  group_sums[1][l] = max(correction, 0.0);
+  group_sums[2][l] = max(-correction, 0.0);
+  for (uint width = 32u; width > 0u; width >>= 1) {
+    barrier();
+    if (l < width) {
+      for (int k = 0; k < 3; ++k) {
+        group_sums[k][l] += group_sums[k][l + width];
+      }
+    }
+  }
+  if (l == 0u) {
+    uint base = 4u + 4u * gl_WorkGroupID.x;
+    partials[base] = group_sums[0][0];
+    partials[base + 1u] = group_sums[1][0];
+    partials[base + 2u] = group_sums[2][0];
+  }
 }

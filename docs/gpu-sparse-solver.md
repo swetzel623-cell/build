@@ -101,8 +101,9 @@ its gradient. Buoyancy and the wall rule follow Mantaflow's operators.
 **Advection.** MacCormack by default: a forward and a backward semi-Lagrangian trace, the error
 estimate added back for values inside the fluid, and the result clamped to the eight values the
 forward trace interpolated. Where that trace reads a voxel without storage, the first-order value
-is kept. This is the scheme the Mantaflow node uses, but not the same code; the two have not been
-compared.
+is kept. This is the scheme the Mantaflow node uses, but not the same code. For density and
+temperature a limiter (`conserve_mass`, on by default) then scales back the corrections so that
+advection does not change either channel's total; see "Holding the total" below.
 
 **Frames.** `advance()` takes a frame in substeps of at most `cfl` voxels of travel, measured by
 the largest velocity component at the start of each substep, and fails past a substep limit. On
@@ -697,8 +698,53 @@ relative to the start):
 - Dropping the correction where it overshoots, as Mantaflow's default clamp mode does, limits
   the gain to 5% but loses 15% of the free plume and lowers its peak density from 0.57 to
   0.40; it is not adopted.
-- **Open**: the plate scene still gains mass with the default steps. Not yet re-measured on
-  the RTX 3070.
+
+**Mantaflow gains smoke on the same scene.** The plate scene, run through Blender's own
+Mantaflow kernels (the pinned commit's `extern/mantaflow`, dense closed domain, MacCormack,
+MIC-preconditioned pressure, plain steps at CFL 4) in a scratch program, 48×48×72, 60 frames:
+
+| Solver | Plate | No plate |
+|---|---|---|
+| Mantaflow, clamp mode 2 (the default, and what the node passes) | 1.60 | 0.79 |
+| Mantaflow, clamp mode 1 (hard clamp) | 2.68 | 1.04 |
+| Mantaflow, first-order advection | 0.44 | 0.39 |
+| This solver, defaults before the limiter | 1.37 | 1.04 |
+
+- The gain is a property of MacCormack advection next to an obstacle, not a defect of this port:
+  the reference gains more than this solver does.
+- A per-voxel record of the correction in this solver shows where it comes from: the
+  corrections before clamping add up to roughly nothing, but far more of them are raised to the
+  lower bound than lowered to the upper one, at every distance from the plate. Smoke spread
+  thin under the plate has many low values, and lifting each undershoot to its bound adds smoke.
+
+**Holding the total.** `conserve_mass` (default on) runs after each MacCormack correction of
+density and temperature: if the corrected channel totals more than the channel before
+advection, every positive correction (corrected minus first-order value) is scaled by the same
+factor until the totals match; if it totals less, the negative corrections are scaled instead.
+If the corrections of that sign are too small to cover the difference, they are removed and the
+rest of the difference is left. Every value stays between its first-order and its corrected
+value, so the limiter creates no new extremes and touches no voxel the correction left alone.
+Velocity is not limited.
+
+| 48×48×72, 60 frames, defaults | Mass after 60 frames | Peak density |
+|---|---|---|
+| Plate, no limiter | 1.37 | 0.47 |
+| Plate, limiter | 1.000 | 0.30 |
+| No plate, no limiter | 1.04 | 0.57 |
+| No plate, limiter | 1.000 | 0.53 |
+
+![Plate scene at 48×48×72 after 60 frames: centre slice and side view, without and with the limiter](images/plate_mass_limiter.png)
+
+- In each pair, left is without the limiter and right with it. The pictures barely differ; the
+  sheets along the plate are dimmer with the limiter, which is where the extra smoke sat.
+- On the device the correction kernel writes three sums per work group, one work group reduces
+  them to the factor, and a third kernel applies it: two more dispatches per scalar and half
+  step, eight per step with reflection. On llvmpipe the device matches the CPU reference to
+  8e-7 on the plate scene. Not yet timed on the RTX 3070.
+- This departs from Mantaflow, which has no such limiter. `conserve_mass = false` restores the
+  previous behaviour; the GPU test program takes `--conserve 0`.
+- The limiter holds the total of each advection. Sources, dissipation and open domain
+  boundaries, when they exist, must change mass in their own steps.
 
 ## Not verified, and known gaps
 
@@ -710,8 +756,9 @@ relative to the start):
 - **The driver is not tuned.** Every command is followed by a full barrier, kernels use 64-thread
   groups over a flat voxel range, neighbors are found through the brick table, and staging buffers
   are allocated per transfer. None of this has been profiled.
-- **Not compared with the Mantaflow engine.** The scheme now matches in kind (MacCormack
-  advection, CFL substeps, converged pressure), but nothing has been checked against it.
+- **Barely compared with the Mantaflow engine.** The scheme matches in kind (MacCormack
+  advection, CFL substeps, converged pressure). Only the total smoke of one scene has been
+  compared (above); shapes and speeds have not.
 - **Multigrid is dispatch-bound at these sizes.** About 1,000 dispatches per step, most of them
   on coarse levels with little work. Larger problems, where the work should dominate, have not
   been measured.
@@ -735,7 +782,9 @@ relative to the start):
 
 ## Next steps
 
-1. Advect density and temperature in one pass: they share their departure points.
+1. Inflow: continuous sources, then the Geometry Nodes integration (OpenVDB brick conversion,
+   own Vulkan device, wiring into the node with the CPU Mantaflow fallback).
+2. Advect density and temperature in one pass: they share their departure points.
 3. Measure multigrid at larger sizes, where dispatch overhead should matter less.
 4. Compare with the Mantaflow engine on a case where the active region covers the domain.
 5. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind

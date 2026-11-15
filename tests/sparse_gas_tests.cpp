@@ -444,11 +444,12 @@ void test_large_steps_keep_mass()
     return fraction;
   };
   const double at_default = kept("defaults", plume_settings());
-  require(at_default > 0.65, "the default settings lost too much smoke");
-  require(at_default < 1.1, "the default settings created smoke");
+  require(std::abs(at_default - 1.0) < 1.0e-3, "the default settings changed the amount of smoke");
 
+  /* Without the limiter, the trace alone decides how much smoke survives. */
   Settings plain = plume_settings();
   plain.reflection = false;
+  plain.conserve_mass = false;
   plain.cfl = 4.0f;
   const double midpoint = kept("plain steps, midpoint trace", plain);
   plain.midpoint_trace = false;
@@ -510,6 +511,7 @@ void test_obstacle_blocks_the_plume()
     }
   }
   State state = from_dense(initial, 8, settings.thresholds, settings.dilation);
+  const double initial_mass = sum(initial.density);
   float worst_divergence = 0.0f;
   for (int i = 0; i < 12; ++i) {
     const FrameInfo frame = advance(state, settings, 1.0f / 15.0f);
@@ -552,7 +554,8 @@ void test_obstacle_blocks_the_plume()
             << free_above << "), worst divergence " << worst_divergence << std::endl;
   require(inside == 0.0f, "smoke entered the obstacle");
   require(through == 0.0f, "flow crossed an obstacle face");
-  require(total > 100.0, "the plume lost its smoke at the obstacle");
+  /* Without conserve_mass, MacCormack adds smoke along the plate; the limiter holds the total. */
+  require(std::abs(total / initial_mass - 1.0) < 1.0e-3, "the obstacle changed the amount of smoke");
   require(free_above > 10.0 && above < 0.25 * free_above, "the plate did not shelter the space above it");
   require(worst_divergence < 0.05f, "the projection failed next to the obstacle");
 }

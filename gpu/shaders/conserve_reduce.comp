@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: MIT
+// Turn the per-group sums of a MacCormack pass into the factor of conserve_correction in the
+// CPU reference. Runs as one work group; P.flags.x is the number of groups that wrote sums.
+// Writes partials[0] = the factor that keeps a correction, partials[1] = the sign of the
+// corrections it applies to (1 for added smoke, -1 for removed).
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#define NO_FLOAT_CHANNELS
+#include "common.glsl"
+layout(std430, binding = 11) buffer Partials { float partials[]; };
+
+shared float group_sums[3][64];
+
+void main()
+{
+  uint l = gl_LocalInvocationID.x;
+  float sums[3] = float[3](0.0, 0.0, 0.0);
+  for (int g = int(l); g < P.flags.x; g += 64) {
+    for (int k = 0; k < 3; ++k) {
+      sums[k] += partials[4 + 4 * g + k];
+    }
+  }
+  for (int k = 0; k < 3; ++k) {
+    group_sums[k][l] = sums[k];
+  }
+  for (uint width = 32u; width > 0u; width >>= 1) {
+    barrier();
+    if (l < width) {
+      for (int k = 0; k < 3; ++k) {
+        group_sums[k][l] += group_sums[k][l + width];
+      }
+    }
+  }
+  if (l == 0u) {
+    float excess = group_sums[0][0];
+    float pool = excess > 0.0 ? group_sums[1][0] : group_sums[2][0];
+    partials[0] = excess == 0.0 || pool == 0.0 ? 1.0 : max(0.0, 1.0 - abs(excess) / pool);
+    partials[1] = excess > 0.0 ? 1.0 : -1.0;
+  }
+}

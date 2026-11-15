@@ -57,6 +57,13 @@ of Mantaflow (see `docs/gpu-sparse-solver.md`):
 - Without a usable Vulkan device, or in a build without the kernels, the node runs the solver's
   CPU reference instead (single-threaded and slow) and says so in a warning.
 
+`blender/tests/make_sparse_demo.py` writes a demo file with two plumes in their own zones, one
+rising into an `obstacle` plate:
+
+```sh
+blender -b --factory-startup --python blender/tests/make_sparse_demo.py -- sparse_gpu_demo.blend
+```
+
 The state still crosses OpenVDB as dense arrays every frame, which costs time at large
 resolutions; converting OpenVDB leaves to bricks directly is a later step.
 

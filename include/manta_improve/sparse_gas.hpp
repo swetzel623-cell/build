@@ -115,6 +115,8 @@ struct DenseFields {
   std::vector<float> density;
   std::vector<float> temperature;
   std::vector<float> u, v, w;
+  /** The last pressure, the first guess of the next solve; may be empty. */
+  std::vector<float> pressure;
   /** Nonzero where a voxel is a solid obstacle at rest; may be empty. */
   std::vector<std::uint8_t> obstacle;
 };

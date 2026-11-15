@@ -85,7 +85,9 @@ if(MANTA_IMPROVE_BUILD_GPU)
       PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/gpu"
       PRIVATE "${MANTA_IMPROVE_SHADER_DIR}"
     )
-    target_link_libraries(manta_improve_sparse_gpu PUBLIC manta_improve_sparse Vulkan::Vulkan)
+    # Only the headers: the loader is opened at run time (see vulkan_compute.cpp).
+    target_include_directories(manta_improve_sparse_gpu PRIVATE ${Vulkan_INCLUDE_DIRS})
+    target_link_libraries(manta_improve_sparse_gpu PUBLIC manta_improve_sparse ${CMAKE_DL_LIBS})
     if(NOT MSVC)
       target_compile_options(manta_improve_sparse_gpu PRIVATE -Wall -Wextra)
     endif()

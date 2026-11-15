@@ -381,6 +381,63 @@ def test_reruns_are_reproducible(_work):
         check(np.array_equal(whole[name], again[name]), f"{name} is not reproducible")
 
 
+def sparse_zone(prefix="", res=(32, 32, 48), obstacle=None, **params):
+    params.setdefault("Sparse GPU", True)
+    params.setdefault("CFL", 6.0)
+    zone = Zone(res, prefix=prefix, **params)
+    field = blob(zone, (res[0] / 2, res[1] / 2, res[2] / 4), 4.0)
+    lib.make_data_object((prefix or "sparse") + "_data", zone, density=field, temperature=field,
+                         obstacle=obstacle)
+    return zone
+
+
+def sparse_note(obj):
+    """Which device ran the sparse solver, for the log: a CPU fallback is a warning."""
+    notes = [message for kind, message in lib.warnings(obj) if kind != "ERROR"]
+    return notes[0] if notes else "GPU"
+
+
+def test_sparse_gpu_advances_and_rises(_work):
+    lib.reset_scene()
+    zone = sparse_zone()
+    obj = lib.build_object("sparse", [zone])
+    (start,), _ = lib.evaluate(obj, [zone], 1)
+    (end,), names = lib.run_frames(obj, [zone], 2, 16)
+    print(f"  sparse solver: {sparse_note(obj)}")
+    check(names == sorted(lib.GRID_NAMES), f"missing state grids: {names}")
+    check(not errors(obj), f"unexpected node errors: {errors(obj)}")
+    for name in lib.GRID_NAMES:
+        check(np.isfinite(end[name]).all(), f"{name} is not finite")
+    rise = center_of_mass_z(zone, end["density"]) - center_of_mass_z(zone, start["density"])
+    check(rise > 1.0, f"smoke rose only {rise:.3f} cells")
+    check(end["substeps"] >= 1 and end["max_velocity"] > 0.0, "diagnostics were not reported")
+    check(end["active_bricks"] >= 1, "no active bricks were reported")
+    # Advection holds the total; only values below the activity threshold are dropped.
+    mass_ratio = float(end["density"].sum() / start["density"].sum())
+    check(abs(mass_ratio - 1.0) < 1.0e-3, f"density mass changed by a factor of {mass_ratio:.5f}")
+    grid = lib.as_grid(zone, end["velocity"])
+    wall_normal = max(np.abs(grid[k, :, :, 2]).max() for k in (0, 1, zone.res[2] - 1))
+    check(wall_normal == 0.0, f"velocity {wall_normal} through a closed wall")
+
+
+def test_sparse_gpu_obstacle(_work):
+    lib.reset_scene()
+    res = (32, 32, 48)
+    plate = lambda x, y, z: ((z >= 22) & (z < 25) & (x >= 9) & (x < 23) & (y >= 9) & (y < 23)) * 1.0
+    probe = Zone(res)
+    solid = lib.dense(probe, plate).astype(bool)
+    zone = sparse_zone(obstacle=lib.dense(probe, plate))
+    obj = lib.build_object("plate", [zone])
+    (start,), _ = lib.evaluate(obj, [zone], 1)
+    (end,), names = lib.run_frames(obj, [zone], 2, 13)
+    print(f"  sparse solver: {sparse_note(obj)}")
+    check(names == sorted(lib.GRID_NAMES + ("obstacle",)), f"unexpected grids: {names}")
+    check(not errors(obj), f"unexpected node errors: {errors(obj)}")
+    check(np.abs(end["density"][solid]).max() == 0.0, "smoke entered the obstacle")
+    mass_ratio = float(end["density"].sum() / start["density"].sum())
+    check(abs(mass_ratio - 1.0) < 1.0e-3, f"density mass changed by a factor of {mass_ratio:.5f}")
+
+
 TESTS = [
     test_node_is_registered,
     test_zero_time_start_frame,
@@ -395,6 +452,8 @@ TESTS = [
     test_pressure_preconditioners_and_diagnostics,
     test_reruns_are_reproducible,
     test_matches_legacy_solver,
+    test_sparse_gpu_advances_and_rises,
+    test_sparse_gpu_obstacle,
 ]
 
 

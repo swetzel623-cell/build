@@ -1,13 +1,157 @@
 // SPDX-License-Identifier: MIT
 #include "vulkan_compute.hpp"
 
+/* The Vulkan loader is opened at run time rather than linked, so a program that embeds this
+ * code starts on machines without Vulkan, and these function pointers stay separate from any
+ * the host program loads for its own use of Vulkan (Blender's volk, for example). */
+#define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#else
+#  include <dlfcn.h>
+#endif
 
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
+
+namespace {
+
+#define MANTA_VK_INSTANCE_FUNCTIONS(X) \
+  X(vkAllocateCommandBuffers) \
+  X(vkAllocateDescriptorSets) \
+  X(vkAllocateMemory) \
+  X(vkBeginCommandBuffer) \
+  X(vkBindBufferMemory) \
+  X(vkCmdBindDescriptorSets) \
+  X(vkCmdBindPipeline) \
+  X(vkCmdCopyBuffer) \
+  X(vkCmdDispatch) \
+  X(vkCmdFillBuffer) \
+  X(vkCmdPipelineBarrier) \
+  X(vkCmdPushConstants) \
+  X(vkCmdResetQueryPool) \
+  X(vkCmdWriteTimestamp) \
+  X(vkCreateBuffer) \
+  X(vkCreateCommandPool) \
+  X(vkCreateComputePipelines) \
+  X(vkCreateDescriptorPool) \
+  X(vkCreateDescriptorSetLayout) \
+  X(vkCreateDevice) \
+  X(vkCreateFence) \
+  X(vkCreatePipelineLayout) \
+  X(vkCreateQueryPool) \
+  X(vkCreateShaderModule) \
+  X(vkDestroyBuffer) \
+  X(vkDestroyCommandPool) \
+  X(vkDestroyDescriptorPool) \
+  X(vkDestroyDescriptorSetLayout) \
+  X(vkDestroyDevice) \
+  X(vkDestroyFence) \
+  X(vkDestroyInstance) \
+  X(vkDestroyPipeline) \
+  X(vkDestroyPipelineLayout) \
+  X(vkDestroyQueryPool) \
+  X(vkDestroyShaderModule) \
+  X(vkDeviceWaitIdle) \
+  X(vkEndCommandBuffer) \
+  X(vkEnumeratePhysicalDevices) \
+  X(vkFreeMemory) \
+  X(vkGetBufferMemoryRequirements) \
+  X(vkGetDeviceQueue) \
+  X(vkGetPhysicalDeviceMemoryProperties) \
+  X(vkGetPhysicalDeviceProperties) \
+  X(vkGetPhysicalDeviceQueueFamilyProperties) \
+  X(vkGetQueryPoolResults) \
+  X(vkMapMemory) \
+  X(vkQueueSubmit) \
+  X(vkResetCommandBuffer) \
+  X(vkResetDescriptorPool) \
+  X(vkResetFences) \
+  X(vkUpdateDescriptorSets) \
+  X(vkWaitForFences)
+
+#define MANTA_VK_DECLARE(name) PFN_##name name = nullptr;
+PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
+PFN_vkCreateInstance vkCreateInstance = nullptr;
+MANTA_VK_INSTANCE_FUNCTIONS(MANTA_VK_DECLARE)
+#undef MANTA_VK_DECLARE
+
+std::mutex &loader_mutex()
+{
+  static std::mutex mutex;
+  return mutex;
+}
+
+/** Open the Vulkan loader once per process. The library is never closed. */
+void load_vulkan_loader()
+{
+  std::lock_guard<std::mutex> lock(loader_mutex());
+  if (vkGetInstanceProcAddr) {
+    return;
+  }
+  void *symbol = nullptr;
+#ifdef _WIN32
+  HMODULE library = LoadLibraryA("vulkan-1.dll");
+  if (library) {
+    symbol = reinterpret_cast<void *>(GetProcAddress(library, "vkGetInstanceProcAddr"));
+  }
+#else
+#  ifdef __APPLE__
+  const char *names[] = {"libvulkan.1.dylib", "libvulkan.dylib", "libMoltenVK.dylib"};
+#  else
+  const char *names[] = {"libvulkan.so.1", "libvulkan.so"};
+#  endif
+  for (const char *name : names) {
+    if (void *library = dlopen(name, RTLD_NOW | RTLD_LOCAL)) {
+      symbol = dlsym(library, "vkGetInstanceProcAddr");
+      if (symbol) {
+        break;
+      }
+    }
+  }
+#endif
+  if (!symbol) {
+    throw std::runtime_error("No Vulkan loader is installed (a graphics driver with Vulkan support "
+                             "provides it)");
+  }
+  vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(symbol);
+  vkCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(
+      vkGetInstanceProcAddr(nullptr, "vkCreateInstance"));
+  if (!vkCreateInstance) {
+    vkGetInstanceProcAddr = nullptr;
+    throw std::runtime_error("The Vulkan loader has no vkCreateInstance");
+  }
+}
+
+/**
+ * Load every other function through `instance`. The loader's entry points dispatch on the
+ * handle they are given, so the pointers stay valid for later instances too.
+ */
+void load_instance_functions(VkInstance instance)
+{
+  std::lock_guard<std::mutex> lock(loader_mutex());
+#define MANTA_VK_LOAD(name) \
+  name = reinterpret_cast<PFN_##name>(vkGetInstanceProcAddr(instance, #name)); \
+  if (!name) { \
+    throw std::runtime_error("The Vulkan loader has no " #name); \
+  }
+  MANTA_VK_INSTANCE_FUNCTIONS(MANTA_VK_LOAD)
+#undef MANTA_VK_LOAD
+}
+
+}  // namespace
 
 namespace manta_improve::gpu {
 namespace {
@@ -262,6 +406,7 @@ struct Compute::Impl {
 Compute::Compute() : impl_(std::make_unique<Impl>())
 {
   Impl &v = *impl_;
+  load_vulkan_loader();
 
   VkApplicationInfo app{};
   app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -271,6 +416,7 @@ Compute::Compute() : impl_(std::make_unique<Impl>())
   instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   instance_info.pApplicationInfo = &app;
   check(vkCreateInstance(&instance_info, nullptr, &v.instance), "vkCreateInstance");
+  load_instance_functions(v.instance);
 
   std::uint32_t count = 0;
   vkEnumeratePhysicalDevices(v.instance, &count, nullptr);

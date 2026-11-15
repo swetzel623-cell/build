@@ -357,6 +357,10 @@ State from_dense(const DenseFields &dense,
   {
     throw std::invalid_argument("Dense velocity fields do not match the extent");
   }
+  const bool has_pressure = !dense.pressure.empty();
+  if (has_pressure && dense.pressure.size() != count) {
+    throw std::invalid_argument("Dense pressure does not match the extent");
+  }
 
   const Extent bricks = {ceil_div(extent.x, brick_size),
                          ceil_div(extent.y, brick_size),
@@ -396,6 +400,9 @@ State from_dense(const DenseFields &dense,
       state.v[index] = dense.v[i];
       state.w[index] = dense.w[i];
     }
+    if (has_pressure) {
+      state.pressure[index] = dense.pressure[i];
+    }
   });
   return state;
 }
@@ -407,7 +414,7 @@ DenseFields to_dense(const State &state)
   DenseFields dense;
   dense.extent = extent;
   for (std::vector<float> *channel :
-       {&dense.density, &dense.temperature, &dense.u, &dense.v, &dense.w})
+       {&dense.density, &dense.temperature, &dense.u, &dense.v, &dense.w, &dense.pressure})
   {
     channel->assign(count, 0.0f);
   }
@@ -421,6 +428,7 @@ DenseFields to_dense(const State &state)
     dense.u[i] = state.u[index];
     dense.v[i] = state.v[index];
     dense.w[i] = state.w[index];
+    dense.pressure[i] = state.pressure[index];
   });
   return dense;
 }

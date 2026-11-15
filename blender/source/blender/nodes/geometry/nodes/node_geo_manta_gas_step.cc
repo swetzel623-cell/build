@@ -14,10 +14,17 @@
 #  include "manta_gas_layout.h"
 #  include "manta_gas_step_API.h"
 
+#  include "manta_improve/sparse_gas.hpp"
+#  ifdef WITH_SPARSE_GAS_GPU
+#    include "sparse_gas_gpu.hpp"
+#  endif
+
 #  include "openvdb/openvdb.h"
 
 #  include <chrono>
 #  include <cmath>
+#  include <memory>
+#  include <mutex>
 #  include <string>
 #  include <vector>
 #endif
@@ -95,6 +102,13 @@ static void node_declare(NodeDeclarationBuilder &b)
       .description(
           "Multiplier for the resolution-dependent pressure iteration limit of the MIC "
           "preconditioner. Unused with Multigrid");
+  b.add_input<decl::Bool>("Sparse GPU"_ustr)
+      .default_value(false)
+      .description(
+          "Use the sparse brick-grid solver on the GPU (Vulkan) instead of Mantaflow. Only "
+          "bricks near smoke are simulated; air elsewhere is open. A float grid named "
+          "'obstacle' marks solid voxels (value above 0.5). A CFL of 6 suits this solver. "
+          "Without a usable GPU it runs its slow CPU reference and warns");
 
   b.add_output<decl::Int>("Substeps"_ustr).description("Number of internal solver steps executed");
   b.add_output<decl::Float>("Max Velocity"_ustr)
@@ -109,6 +123,8 @@ static void node_declare(NodeDeclarationBuilder &b)
       .description("Largest pressure solver iteration count of any substep");
   b.add_output<decl::Float>("Pressure Residual"_ustr)
       .description("Largest final pressure solver residual of any substep");
+  b.add_output<decl::Int>("Active Bricks"_ustr)
+      .description("Sparse GPU only: bricks of 8x8x8 voxels simulated in the last substep");
 }
 
 #if defined(WITH_FLUID) && defined(WITH_OPENVDB)
@@ -120,8 +136,10 @@ static void set_diagnostics(GeoNodeExecParams &params,
                             const float solve_ms,
                             const float export_ms,
                             const int pressure_iterations = 0,
-                            const float pressure_residual = 0.0f)
+                            const float pressure_residual = 0.0f,
+                            const int active_bricks = 0)
 {
+  params.set_output("Active Bricks"_ustr, active_bricks);
   params.set_output("Pressure Iterations"_ustr, pressure_iterations);
   params.set_output("Pressure Residual"_ustr, pressure_residual);
   params.set_output("Substeps"_ustr, substeps);
@@ -304,6 +322,151 @@ static openvdb::Vec3SGrid::Ptr make_velocity_grid(const std::vector<MantaGasVec3
   return grid;
 }
 
+namespace sparse = manta_improve::sparse;
+
+struct SparseRun {
+  int substeps = 0;
+  /** Largest velocity component seen, in cells per second. */
+  float max_speed = 0.0f;
+  int active_bricks = 0;
+  /** Set when the GPU could not be used and the CPU reference ran instead. */
+  std::string fallback_reason;
+  std::string device_name;
+};
+
+#  ifdef WITH_SPARSE_GAS_GPU
+/**
+ * One Vulkan device for the whole process, created on first use. It holds compiled kernels and
+ * buffers, never simulation state: every evaluation uploads its own state and downloads the
+ * result while holding the lock, so independent zones do not share solver state. It is never
+ * destroyed, because tearing down Vulkan objects during process exit is unsafe with some
+ * drivers.
+ */
+struct SparseDevice {
+  std::mutex mutex;
+  manta_improve::gpu::SparseGasGpu *gpu = nullptr;
+  bool tried = false;
+  std::string error;
+};
+
+static SparseDevice &sparse_device()
+{
+  static SparseDevice device;
+  return device;
+}
+#  endif
+
+/**
+ * Advance the dense arrays in place with the sparse solver. Velocity is in cells per second and
+ * comes back staggered.
+ */
+static void run_sparse_step(const int3 &resolution,
+                            const MantaGasStepSettings &step_settings,
+                            std::vector<float> &density,
+                            std::vector<float> &temperature,
+                            std::vector<float> &pressure,
+                            std::vector<MantaGasVec3> &velocity,
+                            const MantaGasVelocityLayout velocity_layout,
+                            std::vector<std::uint8_t> obstacle,
+                            SparseRun &run)
+{
+  const int nx = resolution.x, ny = resolution.y, nz = resolution.z;
+  sparse::DenseFields fields;
+  fields.extent = {nx, ny, nz};
+  fields.density = density;
+  fields.temperature = temperature;
+  fields.pressure = pressure;
+  fields.obstacle = std::move(obstacle);
+  const std::size_t count = density.size();
+  fields.u.assign(count, 0.0f);
+  fields.v.assign(count, 0.0f);
+  fields.w.assign(count, 0.0f);
+  for (int z = 0; z < nz; ++z) {
+    for (int y = 0; y < ny; ++y) {
+      for (int x = 0; x < nx; ++x) {
+        const std::size_t i = manta_gas::grid_index(nx, ny, x, y, z);
+        if (velocity_layout == MantaGasVelocityLayout::Staggered) {
+          fields.u[i] = velocity[i].x;
+          fields.v[i] = velocity[i].y;
+          fields.w[i] = velocity[i].z;
+          continue;
+        }
+        /* Authored cell-centered input: average onto the lower faces once, as Mantaflow's
+         * resampleVec3ToMac does. */
+        if (x > 0) {
+          fields.u[i] = 0.5f * (velocity[manta_gas::grid_index(nx, ny, x - 1, y, z)].x +
+                                velocity[i].x);
+        }
+        if (y > 0) {
+          fields.v[i] = 0.5f * (velocity[manta_gas::grid_index(nx, ny, x, y - 1, z)].y +
+                                velocity[i].y);
+        }
+        if (z > 0) {
+          fields.w[i] = 0.5f * (velocity[manta_gas::grid_index(nx, ny, x, y, z - 1)].z +
+                                velocity[i].z);
+        }
+      }
+    }
+  }
+
+  sparse::Settings settings;
+  settings.cfl = step_settings.cfl;
+  settings.max_substeps = step_settings.max_substeps;
+  settings.gravity[0] = step_settings.gravity.x;
+  settings.gravity[1] = step_settings.gravity.y;
+  settings.gravity[2] = step_settings.gravity.z;
+  settings.density_buoyancy = step_settings.density_buoyancy;
+  settings.heat_buoyancy = step_settings.heat_buoyancy;
+  settings.pressure_solver = sparse::PressureSolver::Multigrid;
+  settings.pressure_iterations = 6;
+
+  sparse::State state = sparse::from_dense(fields, 8, settings.thresholds, settings.dilation);
+  fields = {};
+  sparse::FrameInfo frame;
+  bool done = false;
+#  ifdef WITH_SPARSE_GAS_GPU
+  {
+    SparseDevice &device = sparse_device();
+    std::lock_guard<std::mutex> lock(device.mutex);
+    if (!device.tried) {
+      device.tried = true;
+      try {
+        device.gpu = new manta_improve::gpu::SparseGasGpu();
+      }
+      catch (const std::exception &exception) {
+        device.error = exception.what();
+      }
+    }
+    if (device.gpu) {
+      device.gpu->upload(state);
+      frame = device.gpu->advance(settings, step_settings.delta_time);
+      device.gpu->download(state);
+      run.device_name = device.gpu->device_name();
+      done = true;
+    }
+    else {
+      run.fallback_reason = "no usable Vulkan device (" + device.error + ")";
+    }
+  }
+#  else
+  run.fallback_reason = "this Blender was built without the Vulkan kernels";
+#  endif
+  if (!done) {
+    frame = sparse::advance(state, settings, step_settings.delta_time);
+  }
+
+  run.substeps = frame.substeps;
+  run.max_speed = frame.max_speed;
+  run.active_bricks = static_cast<int>(state.topology.brick_count());
+  const sparse::DenseFields result = sparse::to_dense(state);
+  density = result.density;
+  temperature = result.temperature;
+  pressure = result.pressure;
+  for (std::size_t i = 0; i < count; ++i) {
+    velocity[i] = {result.u[i], result.v[i], result.w[i]};
+  }
+}
+
 static double milliseconds_since(const std::chrono::steady_clock::time_point &start)
 {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
@@ -376,6 +539,21 @@ static void node_geo_exec(GeoNodeExecParams params)
       fail(params, state, error);
       return;
     }
+    /* Optional solid voxels, read by the sparse solver and passed through unchanged. */
+    const bool sparse_gpu = params.extract_input<bool>("Sparse GPU"_ustr);
+    std::vector<float> obstacle_values;
+    const bke::VolumeGridData *obstacle_grid = input_volume ?
+                                                   BKE_volume_grid_find(input_volume, "obstacle") :
+                                                   nullptr;
+    if (obstacle_grid) {
+      obstacle_values.assign(cell_count, 0.0f);
+      if (!import_scalar_grid(
+              input_volume, "obstacle", *transform, resolution, obstacle_values.data(), error))
+      {
+        fail(params, state, error);
+        return;
+      }
+    }
     const float import_ms = static_cast<float>(milliseconds_since(import_start));
 
     MantaGasState manta_state;
@@ -401,13 +579,43 @@ static void node_geo_exec(GeoNodeExecParams params)
                                   MantaGasPreconditioner::MIC;
 
     MantaGasStepDiagnostics diagnostics;
+    SparseRun sparse_run;
     const auto solve_start = std::chrono::steady_clock::now();
-    const bool success = manta_gas_simulation_step(manta_state, settings, diagnostics, error);
-    const float solve_ms = static_cast<float>(milliseconds_since(solve_start));
-    if (!success) {
-      fail(params, state, error);
-      return;
+    if (sparse_gpu) {
+      std::vector<std::uint8_t> solid;
+      if (!obstacle_values.empty()) {
+        solid.resize(cell_count);
+        for (std::size_t i = 0; i < cell_count; ++i) {
+          solid[i] = obstacle_values[i] > 0.5f;
+        }
+      }
+      try {
+        run_sparse_step(resolution,
+                        settings,
+                        density,
+                        temperature,
+                        pressure,
+                        velocity,
+                        velocity_layout,
+                        std::move(solid),
+                        sparse_run);
+      }
+      catch (const std::exception &exception) {
+        fail(params, state, std::string("Sparse solver failed: ") + exception.what());
+        return;
+      }
+      diagnostics.substeps = sparse_run.substeps;
+      diagnostics.max_velocity = sparse_run.max_speed;
+      diagnostics.pressure_iterations = 6;
     }
+    else {
+      const bool success = manta_gas_simulation_step(manta_state, settings, diagnostics, error);
+      if (!success) {
+        fail(params, state, error);
+        return;
+      }
+    }
+    const float solve_ms = static_cast<float>(milliseconds_since(solve_start));
 
     const auto export_start = std::chrono::steady_clock::now();
     Volume *output_volume = BKE_id_new_nomain<Volume>("Gas Simulation Step State");
@@ -423,6 +631,11 @@ static void node_geo_exec(GeoNodeExecParams params)
     BKE_volume_grid_add_vdb(*output_volume,
                             "pressure",
                             make_scalar_grid(pressure, resolution, *transform, false));
+    if (!obstacle_values.empty()) {
+      BKE_volume_grid_add_vdb(*output_volume,
+                              "obstacle",
+                              make_scalar_grid(obstacle_values, resolution, *transform, false));
+    }
     const float export_ms = static_cast<float>(milliseconds_since(export_start));
 
     GeometrySet output_state = GeometrySet::from_volume(output_volume);
@@ -434,7 +647,21 @@ static void node_geo_exec(GeoNodeExecParams params)
                     solve_ms,
                     export_ms,
                     diagnostics.pressure_iterations,
-                    diagnostics.pressure_residual);
+                    diagnostics.pressure_residual,
+                    sparse_run.active_bricks);
+    if (sparse_gpu && !sparse_run.fallback_reason.empty()) {
+      params.error_message_add(NodeWarningType::Warning,
+                               "Sparse solver ran on the CPU, which is slow: " +
+                                   sparse_run.fallback_reason);
+    }
+    else if (sparse_gpu) {
+      params.error_message_add(NodeWarningType::Info,
+                               "Sparse solver ran on " + sparse_run.device_name);
+    }
+    if (!sparse_gpu && !obstacle_values.empty()) {
+      params.error_message_add(NodeWarningType::Warning,
+                               TIP_("The 'obstacle' grid is used only by the Sparse GPU solver"));
+    }
     if (!diagnostics.pressure_converged) {
       params.error_message_add(
           NodeWarningType::Warning,
@@ -470,8 +697,8 @@ static void node_register()
   geo_node_type_base(&ntype, "GeometryNodeMantaGasStep"_ustr);
   ntype.ui_name = "Gas Simulation Step";
   ntype.ui_description =
-      "Advance a closed-domain smoke state with compiled Mantaflow operators. Use inside a "
-      "Geometry Nodes Simulation Zone";
+      "Advance a closed-domain smoke state with compiled Mantaflow operators, or with the sparse "
+      "GPU solver. Use inside a Geometry Nodes Simulation Zone";
   ntype.nclass = NODE_CLASS_GEOMETRY;
   ntype.declare = node_declare;
   ntype.geometry_node_execute = node_geo_exec;

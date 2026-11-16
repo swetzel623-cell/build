@@ -566,6 +566,43 @@ def test_sparse_gpu_keeps_state(_work):
               f"{name} changed when another zone ran in between")
 
 
+def test_voxel_size_change_moves_the_state(_work):
+    """A simulation zone keeps its state when the voxel size changes part-way through. The node
+    moves its own state onto the new grid: the smoke's mass and upward momentum carry over, in
+    the Mantaflow path and the Sparse GPU path."""
+    old, new = 0.0625, 0.05
+    for sparse in (False, True):
+        lib.reset_scene()
+        zone = smoke_zone(prefix="s" if sparse else "d", **({"Sparse GPU": True, "CFL": 6.0}
+                                                         if sparse else {}))
+        obj = lib.build_object("refit", [zone])
+        lib.evaluate(obj, [zone], 1)
+        (before,), _ = lib.run_frames(obj, [zone], 2, 6)
+        gas = obj.modifiers[0].node_group.nodes[zone.prefix + "gas"]
+        gas.inputs["Voxel Size"].default_value = new
+        (after,), names = lib.evaluate(obj, [zone], 7)
+        notes = lib.warnings(obj)
+        label = "Sparse GPU" if sparse else "Mantaflow"
+        check(not errors(obj), f"{label}: unexpected node errors: {errors(obj)}")
+        check(any("moved onto the new grid" in message for _kind, message in notes),
+              f"{label}: the move was not reported: {notes}")
+        check(names == sorted(lib.GRID_NAMES), f"{label}: missing state grids: {names}")
+
+        mass = [float(before["density"].sum()) * old**3, float(after["density"].sum()) * new**3]
+        # In a closed box the air's total momentum is zero; the smoke's is what rises.
+        lift = [float((before["velocity"][:, 2] * before["density"]).sum()) * old**3,
+                float((after["velocity"][:, 2] * after["density"]).sum()) * new**3]
+        height = [center_of_mass_z(zone, before["density"]) * old,
+                  center_of_mass_z(zone, after["density"]) * new]
+        print(f"  {label}: mass {mass[0]:.5f} -> {mass[1]:.5f}, upward momentum "
+              f"{lift[0]:.5f} -> {lift[1]:.5f}, smoke height {height[0]:.3f} -> {height[1]:.3f}")
+        check(abs(mass[1] / mass[0] - 1.0) < 0.05, f"{label}: the smoke's mass changed")
+        check(lift[0] > 0.0 and 0.7 < lift[1] / lift[0] < 1.6,
+              f"{label}: the upward momentum did not carry over")
+        # One frame of rise, not a jump: within one old voxel of where it was.
+        check(0.0 <= height[1] - height[0] < old, f"{label}: the smoke moved on the new grid")
+
+
 TESTS = [
     test_node_is_registered,
     test_zero_time_start_frame,
@@ -586,6 +623,7 @@ TESTS = [
     test_sparse_gpu_sources,
     test_sparse_gpu_turbulence,
     test_sparse_gpu_keeps_state,
+    test_voxel_size_change_moves_the_state,
 ]
 
 

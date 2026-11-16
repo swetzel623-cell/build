@@ -94,14 +94,22 @@ def arrange(tree):
     for node in nodes:
         if node.bl_idname == "NodeGroupOutput":
             column[node] = last
-    # Constant sources (Self Object, Scene Time, Position, ...) next to their first user.
+    # Constant sources (Self Object, Scene Time, Position, ...) one column before their first
+    # user. Every user is at least in column 1, so this never shares a column with one.
     for node in nodes:
         if not feeds[node] and node.bl_idname != "NodeGroupInput" and users[node]:
-            column[node] = max(1, min(column[u] for u in users[node]) - 1)
+            column[node] = min(column[u] for u in users[node]) - 1
+
+    base_properties = {prop.identifier for prop in bpy.types.Node.bl_rna.properties}
 
     def height(node):
+        """An upper estimate of the node's drawn height: header, one row per socket and one per
+        property drawn in its body (operation, data type, clamp, node group, ...)."""
         sockets = [x for x in list(node.inputs) + list(node.outputs) if x.enabled and not x.hide]
-        return 60 + 22 * len(sockets)
+        properties = [prop for prop in node.bl_rna.properties
+                      if prop.identifier not in base_properties and not prop.is_readonly
+                      and not prop.identifier.startswith(("active_", "is_"))]
+        return 60 + 22 * len(sockets) + 28 * len(properties)
 
     by_column = {}
     for node in nodes:

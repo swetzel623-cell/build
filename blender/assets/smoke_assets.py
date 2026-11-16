@@ -63,6 +63,67 @@ class Builder:
         return node.outputs[0]
 
 
+def arrange(tree):
+    """Lay the nodes out left to right in columns by how far they are from the group input, so
+    every link is visible: each node sits one column after the furthest node that feeds it,
+    group outputs in the last column, and a node fed by nothing just before its first user."""
+    nodes = list(tree.nodes)
+    feeds = {node: set() for node in nodes}
+    users = {node: set() for node in nodes}
+    for link in tree.links:
+        feeds[link.to_node].add(link.from_node)
+        users[link.from_node].add(link.to_node)
+
+    column = {}
+
+    def depth(node, visiting=()):
+        if node in column:
+            return column[node]
+        if node in visiting:  # Not expected in a node tree; break any cycle.
+            return 0
+        if node.bl_idname == "NodeGroupInput":
+            column[node] = 0
+            return 0
+        value = max((depth(f, visiting + (node,)) + 1 for f in feeds[node]), default=0)
+        column[node] = value
+        return value
+
+    for node in nodes:
+        depth(node)
+    last = max(column.values(), default=0) + 1
+    for node in nodes:
+        if node.bl_idname == "NodeGroupOutput":
+            column[node] = last
+    # Constant sources (Self Object, Scene Time, Position, ...) next to their first user.
+    for node in nodes:
+        if not feeds[node] and node.bl_idname != "NodeGroupInput" and users[node]:
+            column[node] = max(1, min(column[u] for u in users[node]) - 1)
+
+    def height(node):
+        sockets = [x for x in list(node.inputs) + list(node.outputs) if x.enabled and not x.hide]
+        return 60 + 22 * len(sockets)
+
+    by_column = {}
+    for node in nodes:
+        by_column.setdefault(column[node], []).append(node)
+    x = 0.0
+    placed_y = {}
+    for index in sorted(by_column):
+        members = by_column[index]
+        # Order each column by where its feeding nodes sit, to keep links short and uncrossed.
+        def key(node):
+            ys = [placed_y[f] for f in feeds[node] if f in placed_y]
+            return -(sum(ys) / len(ys)) if ys else 0.0
+        members.sort(key=key)
+        total = sum(height(n) for n in members) + 40 * (len(members) - 1)
+        y = total / 2
+        for node in members:
+            node.location = (x, y)
+            placed_y[node] = y - height(node) / 2
+            y -= height(node) + 40
+        x += max(n.width for n in members) + 80
+
+
 def socket(tree, name, kind, in_out="INPUT", default=None, minimum=None, maximum=None,
            description="", parent=None, subtype=None):
     item = tree.interface.new_socket(name, in_out=in_out, socket_type=kind, parent=parent)
@@ -155,6 +216,7 @@ def build_source():
     b.link(volume, switch.inputs["False"])
     b.link(with_velocity, switch.inputs["True"])
     b.link(switch.outputs[0], group_out.inputs["Sources"])
+    arrange(tree)
     return tree
 
 
@@ -185,6 +247,7 @@ def build_collider():
                         velocity_grid(b, mesh, group_in.outputs["Velocity"], grid),
                         kind="VECTOR_FLOAT")
     b.link(volume, group_out.inputs["Colliders"])
+    arrange(tree)
     return tree
 
 
@@ -370,6 +433,7 @@ def build_modifier(source, collider, material):
     b.link(show.outputs[0], join.inputs[0])
     b.link(to_local.outputs[0], join.inputs[0])
     b.link(join.outputs[0], group_out.inputs["Geometry"])
+    arrange(tree)
     return tree
 
 

@@ -404,6 +404,10 @@ State from_dense(const DenseFields &dense,
       state.pressure[index] = dense.pressure[i];
     }
   });
+  if (!dense.obstacle_u.empty()) {
+    state.obstacle_velocity = brick_field_from_dense(
+        extent, brick_size, {&dense.obstacle_u, &dense.obstacle_v, &dense.obstacle_w});
+  }
   return state;
 }
 
@@ -433,12 +437,32 @@ DenseFields to_dense(const State &state)
   return dense;
 }
 
-void retopologize(State &state, const ActivityThresholds &thresholds, const int dilation)
+static void mark_source_bricks(const Sources *sources, std::vector<std::uint8_t> &flags)
+{
+  if (!sources || sources->field.empty()) {
+    return;
+  }
+  if (sources->field.table.size() != flags.size()) {
+    throw std::invalid_argument("The sources do not match the state's brick grid");
+  }
+  for (std::size_t brick = 0; brick < flags.size(); ++brick) {
+    if (sources->field.table[brick] >= 0) {
+      flags[brick] = 1;
+    }
+  }
+}
+
+void retopologize(State &state,
+                  const ActivityThresholds &thresholds,
+                  const int dilation,
+                  const Sources *sources)
 {
   const Topology &old_topology = state.topology;
+  std::vector<std::uint8_t> flags = activity_flags(state, thresholds);
+  mark_source_bricks(sources, flags);
   Topology topology = build_topology(old_topology.extent,
                                      old_topology.brick_size,
-                                     activity_flags(state, thresholds),
+                                     flags,
                                      dilation,
                                      true,
                                      old_topology.obstacle);
@@ -468,7 +492,143 @@ void retopologize(State &state, const ActivityThresholds &thresholds, const int 
     copy(state.w, moved.w);
     copy(state.pressure, moved.pressure);
   }
+  moved.obstacle_velocity = std::move(state.obstacle_velocity);
   state = std::move(moved);
+}
+
+void set_obstacles(State &state, std::vector<std::uint32_t> mask, BrickField velocity)
+{
+  const Topology &old_topology = state.topology;
+  std::vector<std::uint8_t> flags(old_topology.brick_table.size(), 0);
+  for (std::size_t slot = 0; slot < old_topology.brick_count(); ++slot) {
+    flags[static_cast<std::size_t>(old_topology.brick_coords[slot * 4 + 3])] = 1;
+  }
+  Topology topology = build_topology(
+      old_topology.extent, old_topology.brick_size, flags, 0, true, std::move(mask));
+  if (topology.brick_table != old_topology.brick_table) {
+    throw std::logic_error("Reclassifying the obstacles changed the bricks");
+  }
+  if (!velocity.empty() && velocity.table.size() != topology.brick_table.size()) {
+    throw std::invalid_argument("The obstacle velocity does not match the state's brick grid");
+  }
+  state.topology = std::move(topology);
+  state.obstacle_velocity = std::move(velocity);
+}
+
+void set_obstacles_from_dense(State &state, const DenseFields &dense)
+{
+  const Extent &extent = state.topology.extent;
+  std::vector<std::uint32_t> mask;
+  if (!dense.obstacle.empty()) {
+    mask = pack_obstacle(extent, dense.obstacle);
+  }
+  BrickField velocity;
+  if (!dense.obstacle_u.empty()) {
+    velocity = brick_field_from_dense(extent,
+                                      state.topology.brick_size,
+                                      {&dense.obstacle_u, &dense.obstacle_v, &dense.obstacle_w});
+  }
+  set_obstacles(state, std::move(mask), std::move(velocity));
+}
+
+std::size_t BrickField::slot_count() const
+{
+  return channels.empty() ? 0 :
+                            channels.front().size() /
+                                (static_cast<std::size_t>(brick_size) * brick_size * brick_size);
+}
+
+float BrickField::at(const std::size_t channel, const int x, const int y, const int z) const
+{
+  if (x < 0 || y < 0 || z < 0 || channel >= channels.size()) {
+    return 0.0f;
+  }
+  const int bx = x / brick_size, by = y / brick_size, bz = z / brick_size;
+  if (bx >= brick_extent.x || by >= brick_extent.y || bz >= brick_extent.z) {
+    return 0.0f;
+  }
+  const std::int32_t slot = table[static_cast<std::size_t>(bx) +
+                                  static_cast<std::size_t>(brick_extent.x) *
+                                      (by + static_cast<std::size_t>(brick_extent.y) * bz)];
+  if (slot < 0) {
+    return 0.0f;
+  }
+  const int lx = x - bx * brick_size, ly = y - by * brick_size, lz = z - bz * brick_size;
+  const std::size_t per_brick = static_cast<std::size_t>(brick_size) * brick_size * brick_size;
+  return channels[channel][static_cast<std::size_t>(slot) * per_brick + lx +
+                           static_cast<std::size_t>(brick_size) * (ly + brick_size * lz)];
+}
+
+BrickField brick_field_from_dense(const Extent &extent,
+                                  const int brick_size,
+                                  const std::vector<const std::vector<float> *> &channels)
+{
+  const std::size_t count = static_cast<std::size_t>(extent.x) * extent.y * extent.z;
+  for (const std::vector<float> *channel : channels) {
+    if (channel->size() != count) {
+      throw std::invalid_argument("A dense field does not match the extent");
+    }
+  }
+  BrickField field;
+  field.brick_size = brick_size;
+  field.brick_extent = {ceil_div(extent.x, brick_size),
+                        ceil_div(extent.y, brick_size),
+                        ceil_div(extent.z, brick_size)};
+  const Extent &bricks = field.brick_extent;
+  field.table.assign(static_cast<std::size_t>(bricks.x) * bricks.y * bricks.z, -1);
+  for (int z = 0; z < extent.z; ++z) {
+    for (int y = 0; y < extent.y; ++y) {
+      for (int x = 0; x < extent.x; ++x) {
+        const std::size_t i = dense_index(extent, x, y, z);
+        for (const std::vector<float> *channel : channels) {
+          if ((*channel)[i] != 0.0f) {
+            field.table[dense_index(bricks, x / brick_size, y / brick_size, z / brick_size)] = 0;
+            break;
+          }
+        }
+      }
+    }
+  }
+  std::int32_t slots = 0;
+  for (std::int32_t &slot : field.table) {
+    if (slot >= 0) {
+      slot = slots++;
+    }
+  }
+  const std::size_t per_brick = static_cast<std::size_t>(brick_size) * brick_size * brick_size;
+  field.channels.assign(channels.size(), std::vector<float>(per_brick * slots, 0.0f));
+  for (int z = 0; z < extent.z; ++z) {
+    for (int y = 0; y < extent.y; ++y) {
+      for (int x = 0; x < extent.x; ++x) {
+        const std::int32_t slot =
+            field.table[dense_index(bricks, x / brick_size, y / brick_size, z / brick_size)];
+        if (slot < 0) {
+          continue;
+        }
+        const std::size_t local = static_cast<std::size_t>(x % brick_size) +
+                                  static_cast<std::size_t>(brick_size) *
+                                      (y % brick_size + static_cast<std::size_t>(brick_size) *
+                                                            (z % brick_size));
+        for (std::size_t c = 0; c < channels.size(); ++c) {
+          field.channels[c][static_cast<std::size_t>(slot) * per_brick + local] =
+              (*channels[c])[dense_index(extent, x, y, z)];
+        }
+      }
+    }
+  }
+  return field;
+}
+
+Sources sources_from_dense(const DenseFields &dense, const int brick_size, const SourceMode mode)
+{
+  Sources sources;
+  sources.mode = mode;
+  std::vector<const std::vector<float> *> channels = {&dense.density, &dense.temperature};
+  if (!dense.u.empty()) {
+    channels.insert(channels.end(), {&dense.u, &dense.v, &dense.w});
+  }
+  sources.field = brick_field_from_dense(dense.extent, brick_size, channels);
+  return sources;
 }
 
 float sample(const Topology &topology,
@@ -693,13 +853,74 @@ void add_buoyancy(State &state,
 void enforce_walls(State &state)
 {
   const Topology &topology = state.topology;
+  const BrickField &motion = state.obstacle_velocity;
+  /* Velocity component `axis` of a solid cell: the domain's outer wall is at rest. */
+  const auto solid_velocity = [&](const int axis, const int x, const int y, const int z) {
+    if (motion.empty() || is_wall(topology.extent, x, y, z)) {
+      return 0.0f;
+    }
+    return motion.at(static_cast<std::size_t>(axis), x, y, z);
+  };
   std::vector<float> *faces[3] = {&state.u, &state.v, &state.w};
   for_each_voxel(topology, [&](const std::size_t index, const int x, const int y, const int z) {
+    const bool here = topology.cell_type[index] == CellSolid;
     for (int axis = 0; axis < 3; ++axis) {
       const int nx = x - (axis == 0), ny = y - (axis == 1), nz = z - (axis == 2);
-      if (topology.cell_type[index] == CellSolid || topology.type_at(nx, ny, nz) == CellSolid) {
-        (*faces[axis])[index] = 0.0f;
+      const bool below = topology.type_at(nx, ny, nz) == CellSolid;
+      if (!here && !below) {
+        continue;
       }
+      /* The same arithmetic as walls.comp. */
+      float sum = 0.0f;
+      float sides = 0.0f;
+      if (here) {
+        sum += solid_velocity(axis, x, y, z);
+        sides += 1.0f;
+      }
+      if (below) {
+        sum += solid_velocity(axis, nx, ny, nz);
+        sides += 1.0f;
+      }
+      (*faces[axis])[index] = sum / sides;
+    }
+  });
+}
+
+void inject(State &state, const Sources *sources, const float dt)
+{
+  const Topology &topology = state.topology;
+  const bool emit = sources && !sources->field.empty();
+  if (emit && sources->field.table.size() != topology.brick_table.size()) {
+    throw std::invalid_argument("The sources do not match the state's brick grid");
+  }
+  const bool with_velocity = emit && sources->field.channels.size() >= 5;
+  for_each_voxel(topology, [&](const std::size_t index, const int x, const int y, const int z) {
+    if (topology.cell_type[index] == CellSolid) {
+      state.density[index] = 0.0f;
+      state.temperature[index] = 0.0f;
+      return;
+    }
+    if (!emit) {
+      return;
+    }
+    const float density = sources->field.at(0, x, y, z);
+    const float temperature = sources->field.at(1, x, y, z);
+    if (sources->mode == SourceMode::Raise) {
+      if (density != 0.0f) {
+        state.density[index] = std::max(state.density[index], density);
+      }
+      if (temperature != 0.0f) {
+        state.temperature[index] = std::max(state.temperature[index], temperature);
+      }
+    }
+    else {
+      state.density[index] += density * dt;
+      state.temperature[index] += temperature * dt;
+    }
+    if (with_velocity && (density != 0.0f || temperature != 0.0f)) {
+      state.u[index] = sources->field.at(2, x, y, z);
+      state.v[index] = sources->field.at(3, x, y, z);
+      state.w[index] = sources->field.at(4, x, y, z);
     }
   });
 }
@@ -756,10 +977,11 @@ void subtract_gradient(State &state)
     for (int axis = 0; axis < 3; ++axis) {
       const int nx = x - (axis == 0), ny = y - (axis == 1), nz = z - (axis == 2);
       const CellType below = topology.type_at(nx, ny, nz);
+      /* Faces touching a solid keep the obstacle velocity enforce_walls gave them. */
       if (here == CellSolid || below == CellSolid) {
-        (*faces[axis])[index] = 0.0f;
+        continue;
       }
-      else if (here == CellFluid || below == CellFluid) {
+      if (here == CellFluid || below == CellFluid) {
         const float upper = here == CellFluid ? state.pressure[index] : 0.0f;
         (*faces[axis])[index] -= upper - pressure_at(topology, state.pressure, nx, ny, nz);
       }
@@ -811,12 +1033,13 @@ StepInfo project(State &state, const Settings &settings)
   return info;
 }
 
-StepInfo step(State &state, const Settings &settings)
+StepInfo step(State &state, const Settings &settings, const Sources *sources)
 {
-  retopologize(state, settings.thresholds, settings.dilation);
+  retopologize(state, settings.thresholds, settings.dilation, sources);
   if (state.topology.voxel_count() == 0) {
     return {};
   }
+  inject(state, sources, settings.dt);
 
   /* Advect the scalars and a velocity (`sources`) through the state's velocity for `dt`. */
   std::vector<float> density, temperature, u, v, w, forward;
@@ -889,7 +1112,10 @@ StepInfo step(State &state, const Settings &settings)
   return info;
 }
 
-FrameInfo advance(State &state, const Settings &settings, const float frame_time)
+FrameInfo advance(State &state,
+                  const Settings &settings,
+                  const float frame_time,
+                  const Sources *sources)
 {
   FrameInfo frame;
   float remaining = frame_time;
@@ -901,7 +1127,7 @@ FrameInfo advance(State &state, const Settings &settings, const float frame_time
     const float speed = max_speed(state);
     frame.max_speed = std::max(frame.max_speed, speed);
     substep.dt = cfl_time_step(remaining, settings.cfl, speed);
-    frame.last_step = step(state, substep);
+    frame.last_step = step(state, substep, sources);
     frame.last_step.dt = substep.dt;
     remaining -= substep.dt;
     ++frame.substeps;

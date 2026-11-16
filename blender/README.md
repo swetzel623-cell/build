@@ -46,8 +46,16 @@ of Mantaflow (see `docs/gpu-sparse-solver.md`):
 - Advection-reflection steps, MacCormack advection with a midpoint trace, and six multigrid
   cycles per projection. Advection keeps the totals of density and temperature. A `CFL` of 6
   suits it; the Mantaflow default of 2 works but costs three times as many substeps.
-- A float grid named `obstacle` in the state marks static solid voxels (values above 0.5). It is
-  passed through to the output state unchanged. Mantaflow mode ignores it and warns.
+- `Sources` takes a volume whose float grids `density` and `temperature` are emitted every
+  step, for example made with Mesh to Density Grid and Store Named Grid. By default density and
+  temperature are raised to the source's values; `Add Sources` adds them per second instead. An
+  optional vector grid `velocity` (world units per second) is set where they emit.
+- `Colliders` takes a volume whose float grid `obstacle` marks solid voxels (above 0.5) and an
+  optional vector grid `velocity` (world units per second) for their motion. It is read every
+  frame, so an animated collider moves; smoke inside voxels that become solid is dropped.
+- Grids in `Sources` and `Colliders` may use any transform: each active voxel goes to the
+  nearest domain voxel, so a voxel size equal to the domain's gives the cleanest result. In
+  Mantaflow mode both inputs are ignored with a warning.
 - `Pressure Accuracy`, `Multigrid` and `Pressure Iteration Factor` are unused; `Pressure
   Iterations` reports the six cycles and `Active Bricks` the bricks of the last substep.
 - The first evaluation creates one Vulkan device for the process, which compiled kernels and
@@ -58,7 +66,7 @@ of Mantaflow (see `docs/gpu-sparse-solver.md`):
   CPU reference instead (single-threaded and slow) and says so in a warning.
 
 `blender/tests/make_sparse_demo.py` writes a demo file with two plumes in their own zones, one
-rising into an `obstacle` plate:
+rising into a plate given through `Colliders`:
 
 ```sh
 blender -b --factory-startup --python blender/tests/make_sparse_demo.py -- sparse_gpu_demo.blend
@@ -185,7 +193,7 @@ blender -b --factory-startup --python blender/tests/gas_node_legacy_compare.py -
 blender -b --factory-startup --python blender/tests/gas_node_timings.py -- --res 32 64 96 128 --legacy
 ```
 
-`gas_node_runtime_tests.py` runs fifteen tests and exits non-zero on failure:
+`gas_node_runtime_tests.py` runs seventeen tests and exits non-zero on failure:
 
 | Test | What it establishes |
 | --- | --- |
@@ -203,7 +211,9 @@ blender -b --factory-startup --python blender/tests/gas_node_timings.py -- --res
 | reruns are reproducible | Restarting the zone reproduces the state bit for bit. |
 | matches legacy solver | See the next section; asserts relative errors below 1e-3 after 1 frame and 1e-2 after 6. |
 | sparse gpu advances and rises | Sparse GPU mode for 15 frames: finite grids, smoke rises, active bricks reported, density total held to 1e-3, no flow through the closed walls. Logs whether the GPU or the CPU fallback ran. |
-| sparse gpu obstacle | An `obstacle` plate above the smoke: no smoke enters it, the grid is passed through, the density total is held. |
+| sparse gpu obstacle | A plate in `Colliders` above the smoke: no smoke enters it, it shelters the space above, the density total is held. |
+| sparse gpu moving collider | A plate animated by the frame number rises through the smoke: no smoke inside it, its faces move at its velocity, the smoke is pushed up. |
+| sparse gpu sources | A sphere in `Sources` emits into an empty scene: raised values equal the source exactly, and with `Add Sources` the total matches the rate. |
 
 ## Validation performed
 

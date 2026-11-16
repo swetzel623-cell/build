@@ -61,7 +61,7 @@ if(MANTA_IMPROVE_BUILD_GPU)
     file(MAKE_DIRECTORY "${MANTA_IMPROVE_SHADER_DIR}")
     set(MANTA_IMPROVE_SHADER_HEADERS)
     foreach(KERNEL advect maccormack buoyancy walls divergence jacobi gradient activity remap classify
-            classify_links mask_pressure mg_smooth0 mg_restrict0 mg_smooth mg_residual mg_restrict copy3 reflect conserve_reduce conserve_apply mg_prolong0 mg_prolong mg_build0 mg_build mg_dense_cycle)
+            classify_links mask_pressure mg_smooth0 mg_restrict0 mg_smooth mg_residual mg_restrict copy3 reflect conserve_reduce conserve_apply inject mg_prolong0 mg_prolong mg_build0 mg_build mg_dense_cycle)
       set(SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/${KERNEL}.comp")
       set(SHADER_HEADER "${MANTA_IMPROVE_SHADER_DIR}/${KERNEL}.comp.h")
       add_custom_command(
@@ -110,10 +110,17 @@ if(MANTA_IMPROVE_BUILD_GPU)
       # Plain steps are not the default; keep them covered.
       add_test(NAME sparse_gas_gpu_plain_step_tests
                COMMAND sparse_gas_gpu_tests 32 8 --reflection 0 --cfl 0.5)
+      add_test(NAME sparse_gas_gpu_sources_tests
+               COMMAND sparse_gas_gpu_tests 32 10 --empty --sources raise)
+      add_test(NAME sparse_gas_gpu_add_sources_tests
+               COMMAND sparse_gas_gpu_tests 32 8 --sources add --first-order)
+      add_test(NAME sparse_gas_gpu_moving_tests
+               COMMAND sparse_gas_gpu_tests 32 10 --moving --sources raise)
       set_tests_properties(
         sparse_gas_gpu_tests sparse_gas_gpu_jacobi_tests sparse_gas_gpu_substep_tests
         sparse_gas_gpu_wcycle_tests sparse_gas_gpu_plain_step_tests
         sparse_gas_gpu_obstacle_tests sparse_gas_gpu_obstacle_jacobi_tests
+        sparse_gas_gpu_sources_tests sparse_gas_gpu_add_sources_tests sparse_gas_gpu_moving_tests
         PROPERTIES SKIP_RETURN_CODE 77
       )
     endif()

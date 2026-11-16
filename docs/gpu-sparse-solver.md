@@ -746,6 +746,29 @@ Velocity is not limited.
 - The limiter holds the total of each advection. Sources, dissipation and open domain
   boundaries, when they exist, must change mass in their own steps.
 
+**Sources and moving obstacles.** Stage 1 of the plan for using the solver in Blender.
+
+- **Sources** (`Sources`, passed to `step` and `advance`): density, temperature and an
+  optional velocity on a sparse set of bricks (`BrickField`). At the start of every step,
+  after the bricks are chosen, `inject` clears the scalars of solid cells and applies the
+  sources. By default it raises density and temperature to the source's value, as Blender's
+  emitters do; `SourceMode::Add` adds the value per second instead. A source velocity is set on
+  the lower faces of every emitting voxel, as Mantaflow sets an emitter's initial velocity.
+  Bricks holding a source are always active, so a scene may start empty.
+- **Moving obstacles**: `set_obstacles` replaces the obstacle mask between frames and classifies
+  the cells of the current bricks again. `State::obstacle_velocity` moves the obstacle faces: a
+  face between a solid and any other cell takes the obstacle's velocity (the mean of both sides
+  if both are solid), and the projection no longer zeroes faces touching a solid, so it leaves
+  that velocity in place. Smoke inside voxels that become solid is dropped.
+- **Verified on the CPU reference**: raised values sit exactly at the source's level, adding
+  matches the rate to 1e-4, a source velocity carries the smoke, and a plate rising one voxel
+  per frame keeps its faces at its own velocity, holds no smoke and pushes the smoke above it.
+- **Verified on llvmpipe**: the device matches the CPU reference to 1.4e-6 or better with a
+  raising source, an adding source, a scene that starts empty, the moving plate, and the plate
+  with a source.
+- **In Blender**: `Sources` and `Colliders` inputs on the node (see `blender/README.md`); four
+  in-Blender tests pass on llvmpipe, including a collider animated by the frame number.
+
 ## Not verified, and known gaps
 
 - **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.
@@ -782,8 +805,9 @@ Velocity is not limited.
 
 ## Next steps
 
-1. Inflow: continuous sources, then the Geometry Nodes integration (OpenVDB brick conversion,
-   own Vulkan device, wiring into the node with the CPU Mantaflow fallback).
+1. The plan agreed for Blender: turbulence noise, a Smoke Simulation modifier with separate
+   Smoke nodes, copying only the blocks with smoke between OpenVDB and the bricks while keeping
+   the state on the GPU between frames, then detail (upres) noise.
 2. Advect density and temperature in one pass: they share their departure points.
 3. Measure multigrid at larger sizes, where dispatch overhead should matter less.
 4. Compare with the Mantaflow engine on a case where the active region covers the domain.

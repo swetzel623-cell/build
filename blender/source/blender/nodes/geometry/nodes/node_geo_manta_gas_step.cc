@@ -20,6 +20,7 @@
 #  endif
 
 #  include "openvdb/openvdb.h"
+#  include "openvdb/tools/Interpolation.h"
 
 #  include <chrono>
 #  include <cmath>
@@ -106,9 +107,25 @@ static void node_declare(NodeDeclarationBuilder &b)
       .default_value(false)
       .description(
           "Use the sparse brick-grid solver on the GPU (Vulkan) instead of Mantaflow. Only "
-          "bricks near smoke are simulated; air elsewhere is open. A float grid named "
-          "'obstacle' marks solid voxels (value above 0.5). A CFL of 6 suits this solver. "
-          "Without a usable GPU it runs its slow CPU reference and warns");
+          "bricks near smoke are simulated; air elsewhere is open. A CFL of 6 suits this "
+          "solver. Without a usable GPU it runs its slow CPU reference and warns");
+  b.add_input<decl::Geometry>("Sources"_ustr)
+      .description(
+          "Sparse GPU only. Volume whose float grids 'density' and 'temperature' are emitted "
+          "every step, for example from Mesh to Density Grid. An optional vector grid "
+          "'velocity' (world units per second) is set where they emit. Grids may use any "
+          "transform; each active voxel goes to the nearest domain voxel");
+  b.add_input<decl::Bool>("Add Sources"_ustr)
+      .default_value(false)
+      .description(
+          "Add the sources' values per second instead of raising density and temperature to "
+          "them");
+  b.add_input<decl::Geometry>("Colliders"_ustr)
+      .description(
+          "Sparse GPU only. Volume whose float grid 'obstacle' marks solid voxels (value above "
+          "0.5), for example from Mesh to Density Grid, evaluated every frame so colliders may "
+          "move. An optional vector grid 'velocity' (world units per second) moves the "
+          "collider's faces");
 
   b.add_output<decl::Int>("Substeps"_ustr).description("Number of internal solver steps executed");
   b.add_output<decl::Float>("Max Velocity"_ustr)
@@ -356,6 +373,97 @@ static SparseDevice &sparse_device()
 }
 #  endif
 
+/** Float grid `name` of a geometry's volume, or null. Throws if it has another type. */
+static const openvdb::FloatGrid *find_float_grid(const Volume *volume,
+                                                 const char *name,
+                                                 bke::VolumeTreeAccessToken &token)
+{
+  const bke::VolumeGridData *data = volume ? BKE_volume_grid_find(volume, name) : nullptr;
+  if (!data) {
+    return nullptr;
+  }
+  if (data->grid_type() != VOLUME_GRID_FLOAT) {
+    throw std::runtime_error(std::string("Grid '") + name + "' must be a float grid");
+  }
+  return &static_cast<const openvdb::FloatGrid &>(data->grid(token));
+}
+
+static const openvdb::Vec3SGrid *find_vector_grid(const Volume *volume,
+                                                  const char *name,
+                                                  bke::VolumeTreeAccessToken &token)
+{
+  const bke::VolumeGridData *data = volume ? BKE_volume_grid_find(volume, name) : nullptr;
+  if (!data) {
+    return nullptr;
+  }
+  if (data->grid_type() != VOLUME_GRID_VECTOR_FLOAT) {
+    throw std::runtime_error(std::string("Grid '") + name + "' must be a float vector grid");
+  }
+  return &static_cast<const openvdb::Vec3SGrid &>(data->grid(token));
+}
+
+/**
+ * Write the active values of a grid with any transform into a dense domain array: each active
+ * voxel goes to the nearest domain voxel, and where several land on one, the largest wins.
+ */
+static void rasterize(const openvdb::FloatGrid &grid,
+                      const openvdb::math::Transform &domain,
+                      const int3 &resolution,
+                      std::vector<float> &output)
+{
+  for (openvdb::FloatGrid::ValueOnCIter iter = grid.cbeginValueOn(); iter; ++iter) {
+    const float value = *iter;
+    if (value == 0.0f) {
+      continue;
+    }
+    openvdb::CoordBBox box;
+    iter.getBoundingBox(box);
+    for (auto coord = box.begin(); coord; ++coord) {
+      const openvdb::Vec3d index = domain.worldToIndex(grid.transform().indexToWorld(*coord));
+      const int x = int(std::lround(index.x())), y = int(std::lround(index.y())),
+                z = int(std::lround(index.z()));
+      if (x < 0 || y < 0 || z < 0 || x >= resolution.x || y >= resolution.y ||
+          z >= resolution.z)
+      {
+        continue;
+      }
+      float &target = output[manta_gas::grid_index(resolution.x, resolution.y, x, y, z)];
+      target = std::max(target, value);
+    }
+  }
+}
+
+/** Sample a world-space velocity grid at the domain voxels where `mask` is set, in cells/s. */
+static void sample_velocity(const openvdb::Vec3SGrid &grid,
+                            const openvdb::math::Transform &domain,
+                            const int3 &resolution,
+                            const float voxel_size,
+                            const std::vector<bool> &mask,
+                            std::vector<float> &u,
+                            std::vector<float> &v,
+                            std::vector<float> &w)
+{
+  const std::size_t count = mask.size();
+  u.assign(count, 0.0f);
+  v.assign(count, 0.0f);
+  w.assign(count, 0.0f);
+  openvdb::tools::GridSampler<openvdb::Vec3SGrid, openvdb::tools::BoxSampler> sampler(grid);
+  for (int z = 0; z < resolution.z; ++z) {
+    for (int y = 0; y < resolution.y; ++y) {
+      for (int x = 0; x < resolution.x; ++x) {
+        const std::size_t i = manta_gas::grid_index(resolution.x, resolution.y, x, y, z);
+        if (!mask[i]) {
+          continue;
+        }
+        const openvdb::Vec3f value = sampler.wsSample(domain.indexToWorld(openvdb::Vec3d(x, y, z)));
+        u[i] = value[0] / voxel_size;
+        v[i] = value[1] / voxel_size;
+        w[i] = value[2] / voxel_size;
+      }
+    }
+  }
+}
+
 /**
  * Advance the dense arrays in place with the sparse solver. Velocity is in cells per second and
  * comes back staggered.
@@ -367,7 +475,11 @@ static void run_sparse_step(const int3 &resolution,
                             std::vector<float> &pressure,
                             std::vector<MantaGasVec3> &velocity,
                             const MantaGasVelocityLayout velocity_layout,
+                            const sparse::Sources &sources,
                             std::vector<std::uint8_t> obstacle,
+                            std::vector<float> obstacle_u,
+                            std::vector<float> obstacle_v,
+                            std::vector<float> obstacle_w,
                             SparseRun &run)
 {
   const int nx = resolution.x, ny = resolution.y, nz = resolution.z;
@@ -377,6 +489,9 @@ static void run_sparse_step(const int3 &resolution,
   fields.temperature = temperature;
   fields.pressure = pressure;
   fields.obstacle = std::move(obstacle);
+  fields.obstacle_u = std::move(obstacle_u);
+  fields.obstacle_v = std::move(obstacle_v);
+  fields.obstacle_w = std::move(obstacle_w);
   const std::size_t count = density.size();
   fields.u.assign(count, 0.0f);
   fields.v.assign(count, 0.0f);
@@ -439,7 +554,7 @@ static void run_sparse_step(const int3 &resolution,
     }
     if (device.gpu) {
       device.gpu->upload(state);
-      frame = device.gpu->advance(settings, step_settings.delta_time);
+      frame = device.gpu->advance(settings, step_settings.delta_time, &sources);
       device.gpu->download(state);
       run.device_name = device.gpu->device_name();
       done = true;
@@ -452,7 +567,7 @@ static void run_sparse_step(const int3 &resolution,
   run.fallback_reason = "this Blender was built without the Vulkan kernels";
 #  endif
   if (!done) {
-    frame = sparse::advance(state, settings, step_settings.delta_time);
+    frame = sparse::advance(state, settings, step_settings.delta_time, &sources);
   }
 
   run.substeps = frame.substeps;
@@ -539,20 +654,66 @@ static void node_geo_exec(GeoNodeExecParams params)
       fail(params, state, error);
       return;
     }
-    /* Optional solid voxels, read by the sparse solver and passed through unchanged. */
+    /* Sources and colliders, evaluated every frame, so they may be animated. */
     const bool sparse_gpu = params.extract_input<bool>("Sparse GPU"_ustr);
-    std::vector<float> obstacle_values;
-    const bke::VolumeGridData *obstacle_grid = input_volume ?
-                                                   BKE_volume_grid_find(input_volume, "obstacle") :
-                                                   nullptr;
-    if (obstacle_grid) {
-      obstacle_values.assign(cell_count, 0.0f);
-      if (!import_scalar_grid(
-              input_volume, "obstacle", *transform, resolution, obstacle_values.data(), error))
-      {
-        fail(params, state, error);
-        return;
+    const GeometrySet source_geometry = params.extract_input<GeometrySet>("Sources"_ustr);
+    const bool add_sources = params.extract_input<bool>("Add Sources"_ustr);
+    const GeometrySet collider_geometry = params.extract_input<GeometrySet>("Colliders"_ustr);
+    const Volume *source_volume = source_geometry.get_volume();
+    const Volume *collider_volume = collider_geometry.get_volume();
+    sparse::DenseFields emit;
+    std::vector<std::uint8_t> solid;
+    std::vector<float> obstacle_u, obstacle_v, obstacle_w;
+    bool has_sources = false, has_colliders = false;
+    try {
+      bke::VolumeTreeAccessToken token;
+      const openvdb::FloatGrid *source_density = find_float_grid(source_volume, "density", token);
+      const openvdb::FloatGrid *source_temperature = find_float_grid(
+          source_volume, "temperature", token);
+      const openvdb::Vec3SGrid *source_velocity = find_vector_grid(
+          source_volume, "velocity", token);
+      const openvdb::FloatGrid *collider = find_float_grid(collider_volume, "obstacle", token);
+      const openvdb::Vec3SGrid *collider_velocity = find_vector_grid(
+          collider_volume, "velocity", token);
+      has_sources = source_density || source_temperature;
+      has_colliders = collider != nullptr;
+      if (sparse_gpu && has_sources) {
+        emit.extent = {resolution.x, resolution.y, resolution.z};
+        emit.density.assign(cell_count, 0.0f);
+        emit.temperature.assign(cell_count, 0.0f);
+        if (source_density) {
+          rasterize(*source_density, *transform, resolution, emit.density);
+        }
+        if (source_temperature) {
+          rasterize(*source_temperature, *transform, resolution, emit.temperature);
+        }
+        if (source_velocity) {
+          std::vector<bool> emitting(cell_count);
+          for (std::size_t i = 0; i < cell_count; ++i) {
+            emitting[i] = emit.density[i] != 0.0f || emit.temperature[i] != 0.0f;
+          }
+          sample_velocity(*source_velocity, *transform, resolution, voxel_size, emitting,
+                          emit.u, emit.v, emit.w);
+        }
       }
+      if (sparse_gpu && has_colliders) {
+        std::vector<float> values(cell_count, 0.0f);
+        rasterize(*collider, *transform, resolution, values);
+        solid.resize(cell_count);
+        std::vector<bool> mask(cell_count);
+        for (std::size_t i = 0; i < cell_count; ++i) {
+          solid[i] = values[i] > 0.5f;
+          mask[i] = solid[i];
+        }
+        if (collider_velocity) {
+          sample_velocity(*collider_velocity, *transform, resolution, voxel_size, mask,
+                          obstacle_u, obstacle_v, obstacle_w);
+        }
+      }
+    }
+    catch (const std::exception &exception) {
+      fail(params, state, exception.what());
+      return;
     }
     const float import_ms = static_cast<float>(milliseconds_since(import_start));
 
@@ -582,14 +743,12 @@ static void node_geo_exec(GeoNodeExecParams params)
     SparseRun sparse_run;
     const auto solve_start = std::chrono::steady_clock::now();
     if (sparse_gpu) {
-      std::vector<std::uint8_t> solid;
-      if (!obstacle_values.empty()) {
-        solid.resize(cell_count);
-        for (std::size_t i = 0; i < cell_count; ++i) {
-          solid[i] = obstacle_values[i] > 0.5f;
-        }
-      }
       try {
+        sparse::Sources sources;
+        sources.mode = add_sources ? sparse::SourceMode::Add : sparse::SourceMode::Raise;
+        if (has_sources) {
+          sources = sparse::sources_from_dense(emit, 8, sources.mode);
+        }
         run_sparse_step(resolution,
                         settings,
                         density,
@@ -597,7 +756,11 @@ static void node_geo_exec(GeoNodeExecParams params)
                         pressure,
                         velocity,
                         velocity_layout,
+                        sources,
                         std::move(solid),
+                        std::move(obstacle_u),
+                        std::move(obstacle_v),
+                        std::move(obstacle_w),
                         sparse_run);
       }
       catch (const std::exception &exception) {
@@ -631,11 +794,6 @@ static void node_geo_exec(GeoNodeExecParams params)
     BKE_volume_grid_add_vdb(*output_volume,
                             "pressure",
                             make_scalar_grid(pressure, resolution, *transform, false));
-    if (!obstacle_values.empty()) {
-      BKE_volume_grid_add_vdb(*output_volume,
-                              "obstacle",
-                              make_scalar_grid(obstacle_values, resolution, *transform, false));
-    }
     const float export_ms = static_cast<float>(milliseconds_since(export_start));
 
     GeometrySet output_state = GeometrySet::from_volume(output_volume);
@@ -658,9 +816,9 @@ static void node_geo_exec(GeoNodeExecParams params)
       params.error_message_add(NodeWarningType::Info,
                                "Sparse solver ran on " + sparse_run.device_name);
     }
-    if (!sparse_gpu && !obstacle_values.empty()) {
+    if (!sparse_gpu && (has_sources || has_colliders)) {
       params.error_message_add(NodeWarningType::Warning,
-                               TIP_("The 'obstacle' grid is used only by the Sparse GPU solver"));
+                               TIP_("Sources and Colliders are used only by the Sparse GPU solver"));
     }
     if (!diagnostics.pressure_converged) {
       params.error_message_add(

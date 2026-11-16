@@ -50,8 +50,13 @@ class SparseGasGpu {
    */
   void set_single_dispatch_cell_limit(std::size_t cells);
 
-  /** Replace the device state with `state`. */
+  /** Replace the device state with `state`, including its obstacles and their velocity. */
   void upload(const sparse::State &state);
+  /**
+   * Replace the obstacles of the device state, as sparse::set_obstacles does: the bricks stay,
+   * their cells are classified again, and `velocity` moves the obstacle faces.
+   */
+  void set_obstacles(std::vector<std::uint32_t> mask, sparse::BrickField velocity = {});
   /** Copy the device state, including its topology, into `state`. */
   void download(sparse::State &state);
 
@@ -59,17 +64,21 @@ class SparseGasGpu {
    * Advance the device state by one step. StepInfo::max_divergence is not measured on this path
    * and is reported as NaN.
    */
-  sparse::StepInfo step(const sparse::Settings &settings);
+  sparse::StepInfo step(const sparse::Settings &settings, const sparse::Sources *sources = nullptr);
   /**
    * Advance by `frame_time` in CFL-limited substeps, like sparse::advance. The speed that limits
    * each substep comes back with the activity flags, so this adds no transfers.
    */
-  sparse::FrameInfo advance(const sparse::Settings &settings, float frame_time);
+  sparse::FrameInfo advance(const sparse::Settings &settings,
+                            float frame_time,
+                            const sparse::Sources *sources = nullptr);
   /** Timing of the last step(), or the sum over the substeps of the last advance(). */
   const Timing &last_timing() const;
 
  private:
   sparse::StepInfo impl_step(const sparse::Settings &settings, const float *remaining);
+  /** Upload the sources the next steps apply; null for none. */
+  void use_sources(const sparse::Sources *sources);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

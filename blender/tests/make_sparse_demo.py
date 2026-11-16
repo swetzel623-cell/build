@@ -29,7 +29,15 @@ def plate_mask(res):
 
 
 def build(name, res, origin, voxel, with_plate):
-    zone = Zone(res, origin=origin, voxel=voxel, prefix=name + "_", **{
+    colliders = None
+    if with_plate:
+        _mask, (bottom, top, lo, hi) = plate_mask(res)
+
+        def colliders(b, zone):
+            box = lib.box_field(b, zone, (float(lo), float(lo), float(bottom)),
+                                (float(hi), float(hi), float(top)))
+            return lib.grid_volume(b, zone, [("obstacle", "FLOAT", box)])
+    zone = Zone(res, origin=origin, voxel=voxel, prefix=name + "_", colliders=colliders, **{
         "Sparse GPU": True,
         "CFL": 6.0,
         "Max Substeps": 64,
@@ -40,19 +48,16 @@ def build(name, res, origin, voxel, with_plate):
     radius = nx / 8.0
     field = lib.dense(zone, lambda x, y, z: (((x + 0.5 - nx / 2) ** 2 + (y + 0.5 - ny / 2) ** 2 +
                                               (z + 0.5 - nz / 4) ** 2) <= radius ** 2) * 1.0)
-    obstacle = None
     if with_plate:
-        mask, (bottom, top, lo, hi) = plate_mask(res)
-        obstacle = lib.dense(zone, mask)
-        # A visible stand-in for the plate; the solver only sees the grid.
+        _mask, (bottom, top, lo, hi) = plate_mask(res)
+        # A visible stand-in for the plate; the solver only sees the Colliders grid.
         bpy.ops.mesh.primitive_cube_add()
         cube = bpy.context.active_object
         cube.name = name + "_plate"
         cube.scale = ((hi - lo) * voxel / 2, (hi - lo) * voxel / 2, (top - bottom) * voxel / 2)
         cube.location = (origin[0] + (lo + hi) * voxel / 2, origin[1] + (lo + hi) * voxel / 2,
                          origin[2] + (bottom + top) * voxel / 2)
-    data = lib.make_data_object(name + "_initial_state", zone, density=field, temperature=field,
-                                obstacle=obstacle)
+    data = lib.make_data_object(name + "_initial_state", zone, density=field, temperature=field)
     data.hide_set(True)
     data.hide_render = True
 

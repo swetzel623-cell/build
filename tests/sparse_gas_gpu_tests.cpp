@@ -24,6 +24,12 @@ using namespace manta_improve;
 
 /** Put a plate above the plume, as an obstacle. */
 bool with_obstacle = false;
+/** A plate that starts above the plume and moves down one voxel per frame. */
+bool with_moving = false;
+/** A sphere emitting smoke and heat under the plume: 0 none, 1 raising, 2 adding. */
+int source_kind = 0;
+/** Start without the blob: only the sources put smoke in. */
+bool empty_start = false;
 /**
  * Start every frame of the comparison from the CPU reference's state. A real GPU rounds
  * differently from the CPU, and a turbulent flow amplifies that over many frames; with this
@@ -44,7 +50,7 @@ sparse::DenseFields blob(const sparse::Extent extent)
     for (int y = 0; y < extent.y; ++y) {
       for (int x = 0; x < extent.x; ++x) {
         const float dx = x + 0.5f - cx, dy = y + 0.5f - cy, dz = z + 0.5f - cz;
-        if (dx * dx + dy * dy + dz * dz <= radius * radius) {
+        if (!empty_start && dx * dx + dy * dy + dz * dz <= radius * radius) {
           const std::size_t i = x + static_cast<std::size_t>(extent.x) * (y + extent.y * z);
           dense.density[i] = 1.0f;
           dense.temperature[i] = 1.0f;
@@ -62,6 +68,58 @@ sparse::DenseFields blob(const sparse::Extent extent)
         for (int x = extent.x / 2 - half; x < extent.x / 2 + half; ++x) {
           dense.obstacle[x + static_cast<std::size_t>(extent.x) * (y + extent.y * z)] = 1;
         }
+      }
+    }
+  }
+  return dense;
+}
+
+/** Sources of the scene, if any: a sphere below the blob. */
+sparse::Sources scene_sources(const sparse::Extent extent)
+{
+  sparse::DenseFields emit;
+  emit.extent = extent;
+  const std::size_t count = static_cast<std::size_t>(extent.x) * extent.y * extent.z;
+  emit.density.assign(count, 0.0f);
+  emit.temperature.assign(count, 0.0f);
+  const float cx = extent.x / 2.0f, cy = extent.y / 2.0f, cz = extent.z / 8.0f;
+  const float radius = std::max(2.0f, extent.x / 12.0f);
+  const float level = source_kind == 2 ? 6.0f : 0.8f;
+  for (int z = 0; z < extent.z; ++z) {
+    for (int y = 0; y < extent.y; ++y) {
+      for (int x = 0; x < extent.x; ++x) {
+        const float dx = x + 0.5f - cx, dy = y + 0.5f - cy, dz = z + 0.5f - cz;
+        if (dx * dx + dy * dy + dz * dz <= radius * radius) {
+          const std::size_t i = x + static_cast<std::size_t>(extent.x) * (y + extent.y * z);
+          emit.density[i] = level;
+          emit.temperature[i] = level;
+        }
+      }
+    }
+  }
+  return sparse::sources_from_dense(
+      emit, 8, source_kind == 2 ? sparse::SourceMode::Add : sparse::SourceMode::Raise);
+}
+
+/** The moving plate in `frame`: it starts at 0.6 of the height and sinks a voxel per frame. */
+sparse::DenseFields moving_plate(const sparse::Extent extent, const int frame, const float speed)
+{
+  sparse::DenseFields dense;
+  dense.extent = extent;
+  const std::size_t count = static_cast<std::size_t>(extent.x) * extent.y * extent.z;
+  dense.obstacle.assign(count, 0);
+  dense.obstacle_u.assign(count, 0.0f);
+  dense.obstacle_v.assign(count, 0.0f);
+  dense.obstacle_w.assign(count, 0.0f);
+  const int bottom = std::max(2, static_cast<int>(0.6f * extent.z) - frame);
+  const int top = bottom + std::max(3, extent.x / 16);
+  const int half = extent.x * 7 / 32;
+  for (int z = bottom; z < top; ++z) {
+    for (int y = extent.y / 2 - half; y < extent.y / 2 + half; ++y) {
+      for (int x = extent.x / 2 - half; x < extent.x / 2 + half; ++x) {
+        const std::size_t i = x + static_cast<std::size_t>(extent.x) * (y + extent.y * z);
+        dense.obstacle[i] = 1;
+        dense.obstacle_w[i] = -speed;
       }
     }
   }
@@ -250,15 +308,21 @@ int compare(gpu::SparseGasGpu &solver, const int resolution, const int steps)
   sparse::State cpu = sparse::from_dense(blob(extent), 8, settings.thresholds, settings.dilation);
   solver.upload(cpu);
   sparse::State device;
+  const sparse::Sources sources = scene_sources(extent);
+  const sparse::Sources *emit = source_kind ? &sources : nullptr;
 
   double cpu_seconds = 0.0, device_seconds = 0.0;
   for (int i = 0; i < steps; ++i) {
     std::cout << "step " << i << ": running...\n";
+    if (with_moving) {
+      sparse::set_obstacles_from_dense(cpu, moving_plate(extent, i, 1.0f / frame_time));
+      solver.set_obstacles(cpu.topology.obstacle, cpu.obstacle_velocity);
+    }
     auto start = std::chrono::steady_clock::now();
-    const sparse::FrameInfo cpu_frame = sparse::advance(cpu, settings, frame_time);
+    const sparse::FrameInfo cpu_frame = sparse::advance(cpu, settings, frame_time, emit);
     cpu_seconds += seconds_since(start);
     start = std::chrono::steady_clock::now();
-    const sparse::FrameInfo frame = solver.advance(settings, frame_time);
+    const sparse::FrameInfo frame = solver.advance(settings, frame_time, emit);
     const sparse::StepInfo &info = frame.last_step;
     device_seconds += seconds_since(start);
     if (cpu_frame.substeps != frame.substeps) {
@@ -315,12 +379,20 @@ int benchmark(gpu::SparseGasGpu &solver, const int resolution, const int steps, 
   sparse::State state = sparse::from_dense(blob(extent), 8, settings.thresholds, settings.dilation);
   const std::size_t total_bricks = state.topology.brick_table.size();
   solver.upload(state);
+  const sparse::Sources sources = scene_sources(extent);
+  const sparse::Sources *emit = source_kind ? &sources : nullptr;
 
   std::vector<double> wall, gpu_time, topology;
   std::size_t peak_bricks = 0;
   int changes = 0, substeps = 0;
   for (int i = 0; i < steps; ++i) {
-    const sparse::FrameInfo frame = solver.advance(settings, frame_time);
+    if (with_moving) {
+      const sparse::DenseFields plate = moving_plate(extent, i, 1.0f / frame_time);
+      solver.set_obstacles(sparse::pack_obstacle(extent, plate.obstacle),
+                           sparse::brick_field_from_dense(
+                               extent, 8, {&plate.obstacle_u, &plate.obstacle_v, &plate.obstacle_w}));
+    }
+    const sparse::FrameInfo frame = solver.advance(settings, frame_time, emit);
     const sparse::StepInfo &info = frame.last_step;
     substeps += frame.substeps;
     const gpu::SparseGasGpu::Timing &timing = solver.last_timing();
@@ -412,6 +484,16 @@ int main(int argc, char **argv)
     else if (std::string(argv[i]) == "--obstacle") {
       with_obstacle = true;
     }
+    else if (std::string(argv[i]) == "--empty") {
+      empty_start = true;
+    }
+    else if (std::string(argv[i]) == "--moving") {
+      with_moving = true;
+    }
+    else if (std::string(argv[i]) == "--sources" && i + 1 < argc) {
+      const std::string kind = argv[++i];
+      source_kind = kind == "add" ? 2 : 1;
+    }
     else if (std::string(argv[i]) == "--image" && i + 1 < argc) {
       image_name = argv[++i];
     }
@@ -445,6 +527,8 @@ int main(int argc, char **argv)
             << (first_order ? ", first-order advection" : ", MacCormack advection")
             << (test_settings(resolution).reflection ? ", advection-reflection" : ", plain steps")
             << (with_obstacle ? ", plate obstacle" : "")
+            << (with_moving ? ", moving plate" : "")
+            << (source_kind == 1 ? ", raising source" : source_kind == 2 ? ", adding source" : "")
             << (resync ? ", every frame started from the CPU state" : "") << '\n';
   std::cout << "Creating the Vulkan device...\n";
   std::unique_ptr<gpu::SparseGasGpu> solver;

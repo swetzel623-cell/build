@@ -1,11 +1,55 @@
 // SPDX-License-Identifier: MIT
-// Zero every face that touches a solid cell.
+// Set every face that touches a solid cell to the obstacle's velocity. Mirrors enforce_walls
+// in the CPU reference. P.flags.x is 1 if the obstacles move; P.flags.y = values per channel.
 #version 450
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
 #define U b4
 #define V b5
 #define W b6
+/* Per brick of the domain: the slot of the obstacle velocity, or -1. */
+layout(std430, binding = 10) readonly buffer MotionTable { int motion_table[]; };
+layout(std430, binding = 11) readonly buffer MotionValues { float motion[]; };
+
+/* Component `axis` of the velocity of the solid cell at c. The outer wall is at rest. */
+float solid_velocity(ivec3 c, int axis)
+{
+  if (P.flags.x == 0 || is_wall(c)) {
+    return 0.0;
+  }
+  int size = P.extent.w;
+  ivec3 b = c / size;
+  if (any(greaterThanEqual(b, P.bricks.xyz))) {
+    return 0.0;
+  }
+  int slot = motion_table[b.x + P.bricks.x * (b.y + P.bricks.y * b.z)];
+  if (slot < 0) {
+    return 0.0;
+  }
+  ivec3 l = c - b * size;
+  return motion[axis * P.flags.y + slot * size * size * size + l.x + size * (l.y + size * l.z)];
+}
+
+float face(ivec3 c, bool here, int axis, float value)
+{
+  ivec3 below_c = c;
+  below_c[axis] -= 1;
+  bool below = type_at(below_c) == CELL_SOLID;
+  if (!here && !below) {
+    return value;
+  }
+  float sum = 0.0;
+  float sides = 0.0;
+  if (here) {
+    sum += solid_velocity(c, axis);
+    sides += 1.0;
+  }
+  if (below) {
+    sum += solid_velocity(below_c, axis);
+    sides += 1.0;
+  }
+  return sum / sides;
+}
 
 void main()
 {
@@ -14,14 +58,8 @@ void main()
     return;
   }
   ivec3 c = coords_of(index);
-  bool solid = cell_type[index] == CELL_SOLID;
-  if (solid || type_at(c - ivec3(1, 0, 0)) == CELL_SOLID) {
-    U[index] = 0.0;
-  }
-  if (solid || type_at(c - ivec3(0, 1, 0)) == CELL_SOLID) {
-    V[index] = 0.0;
-  }
-  if (solid || type_at(c - ivec3(0, 0, 1)) == CELL_SOLID) {
-    W[index] = 0.0;
-  }
+  bool here = cell_type[index] == CELL_SOLID;
+  U[index] = face(c, here, 0, U[index]);
+  V[index] = face(c, here, 1, V[index]);
+  W[index] = face(c, here, 2, W[index]);
 }

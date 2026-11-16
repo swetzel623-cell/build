@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: MIT
+// Move one channel onto a new topology. Bricks that are new start at zero.
+#version 450
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Params
+{
+  int voxels_per_brick;
+  int count;
+}
+P;
+layout(std430, binding = 1) readonly buffer SlotMap { int old_slot[]; };
+layout(std430, binding = 2) readonly buffer Source { float source[]; };
+layout(std430, binding = 3) writeonly buffer Target { float target[]; };
+
+void main()
+{
+  int i = int(gl_GlobalInvocationID.x);
+  if (i >= P.count) {
+    return;
+  }
+  int slot = i / P.voxels_per_brick;
+  int previous = old_slot[slot];
+  target[i] = previous < 0 ? 0.0 :
+                             source[previous * P.voxels_per_brick + (i - slot * P.voxels_per_brick)];
+}

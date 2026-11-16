@@ -50,6 +50,16 @@ jobs:
           rm -rf .git/lfs/objects
           df -h /c
 
+      # glslangValidator compiles the sparse solver's GPU kernels. Blender's own libraries supply
+      # the Vulkan headers; the Vulkan loader is opened at run time.
+      - name: Install the Vulkan SDK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe" -OutFile "$env:RUNNER_TEMP\vulkan_sdk.exe"
+          $install = Start-Process -FilePath "$env:RUNNER_TEMP\vulkan_sdk.exe" -Wait -PassThru -ArgumentList "--root","C:\VulkanSDK\sdk","--accept-licenses","--default-answer","--confirm-command","install"
+          if ($install.ExitCode -ne 0) { throw "Vulkan SDK installer exited with $($install.ExitCode)" }
+          "VULKAN_SDK=C:\VulkanSDK\sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Apply the gas-step overlay
         shell: bash
         run: |
@@ -68,6 +78,7 @@ jobs:
             -DWITH_GTESTS=OFF ^
             -DWITH_BUILDINFO=OFF ^
             -DWITH_WINDOWS_RELEASE_PDB=OFF || exit /b 1
+          findstr /C:"SPARSE_GAS_GLSLANG:FILEPATH=C:" %BUILD_DIR%\CMakeCache.txt || (echo The sparse solver's GPU kernels were not enabled & exit /b 1)
           cmake --build %BUILD_DIR% --target install || exit /b 1
           dir %DIST_DIR%
 

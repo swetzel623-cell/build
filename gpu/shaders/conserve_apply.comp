@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: MIT
+// Scale the MacCormack corrections of one sign by the factor conserve_reduce wrote. Mirrors the
+// last loop of conserve_correction in the CPU reference. b8 holds the first-order result, b9 the
+// corrected one.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+layout(std430, binding = 11) readonly buffer Partials { float partials[]; };
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index)) {
+    return;
+  }
+  float keep = partials[0];
+  if (keep == 1.0) {
+    return;
+  }
+  float forward = b8[index];
+  float correction = b9[index] - forward;
+  if (partials[1] > 0.0 ? correction > 0.0 : correction < 0.0) {
+    b9[index] = forward + keep * correction;
+  }
+}

@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: MIT
+// Cells that are not fluid have no pressure unknown; clear what a topology change left there.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#define PRESSURE b4
+
+void main()
+{
+  int index;
+  if (voxel_in_range(index) && cell_type[index] != CELL_FLUID) {
+    PRESSURE[index] = 0.0;
+  }
+}

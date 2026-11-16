@@ -14,7 +14,7 @@ import numpy as np
 GAS_NODE = "GeometryNodeMantaGasStep"
 GRID_NAMES = ("density", "temperature", "velocity", "pressure")
 DIAG_NAMES = ("substeps", "max_velocity", "import_ms", "solve_ms", "export_ms",
-              "pressure_iterations", "pressure_residual")
+              "pressure_iterations", "pressure_residual", "active_bricks")
 
 
 class Zone:
@@ -53,15 +53,20 @@ def reset_scene(fps=30, frame_end=250):
     return scene
 
 
-def make_data_object(name, zone, density=None, temperature=None, velocity=None):
-    """Create a mesh whose vertices carry one dense initial-state sample per voxel (X fastest)."""
+def make_data_object(name, zone, density=None, temperature=None, velocity=None, obstacle=None):
+    """Create a mesh whose vertices carry one dense initial-state sample per voxel (X fastest).
+
+    With `obstacle`, the initial state also gets a float grid named "obstacle".
+    """
     count = zone.cells
     mesh = bpy.data.meshes.new(name)
     mesh.vertices.add(count)
+    zone.has_obstacle = obstacle is not None
     for attr, kind, values, width in (
         ("density", "FLOAT", density, 1),
         ("temperature", "FLOAT", temperature, 1),
         ("velocity", "FLOAT_VECTOR", velocity, 3),
+        ("obstacle", "FLOAT", obstacle, 1),
     ):
         layer = mesh.attributes.new(attr, kind, "POINT")
         array = np.zeros(count * width, dtype=np.float32)
@@ -149,7 +154,10 @@ def _initial_state(b, zone):
     index = b.voxel_index(position, o, v, r)
 
     volume = None
-    for name in ("density", "temperature", "velocity"):
+    names = ["density", "temperature", "velocity"]
+    if getattr(zone, "has_obstacle", False):
+        names.append("obstacle")
+    for name in names:
         vector = name == "velocity"
         kind = "FLOAT_VECTOR" if vector else "FLOAT"
         sock = "VECTOR" if vector else "FLOAT"
@@ -199,7 +207,7 @@ def _zone(b, zone, initial):
 
     diag = b.new("GeometryNodePoints").outputs[0]
     outputs = ("Substeps", "Max Velocity", "Import Time", "Solve Time", "Export Time",
-               "Pressure Iterations", "Pressure Residual")
+               "Pressure Iterations", "Pressure Residual", "Active Bricks")
     for name, socket in zip(DIAG_NAMES, outputs):
         store = b.new("GeometryNodeStoreNamedAttribute", data_type="FLOAT", domain="POINT")
         store.inputs["Name"].default_value = name

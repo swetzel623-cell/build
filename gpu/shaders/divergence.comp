@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: MIT
+// Divergence of fluid cells, scaled by P.a.x (-1 gives the pressure right-hand side).
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#define U b4
+#define V b5
+#define W b6
+#define RESULT b7
+
+float fetch_u(ivec3 c) { int i = index_of(c); return i < 0 ? 0.0 : U[i]; }
+float fetch_v(ivec3 c) { int i = index_of(c); return i < 0 ? 0.0 : V[i]; }
+float fetch_w(ivec3 c) { int i = index_of(c); return i < 0 ? 0.0 : W[i]; }
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index)) {
+    return;
+  }
+  if (cell_type[index] != CELL_FLUID) {
+    RESULT[index] = 0.0;
+    return;
+  }
+  ivec3 c = coords_of(index);
+  float divergence = fetch_u(c + ivec3(1, 0, 0)) - U[index] + fetch_v(c + ivec3(0, 1, 0)) -
+                     V[index] + fetch_w(c + ivec3(0, 0, 1)) - W[index];
+  RESULT[index] = P.a.x * divergence;
+}

@@ -17,7 +17,32 @@ OVERLAY_FILES = (
     "intern/mantaflow/intern/manta_gas_step_driver.h",
     "intern/mantaflow/intern/manta_gas_step_API.cpp",
     "source/blender/nodes/geometry/nodes/node_geo_manta_gas_step.cc",
+    "intern/sparse_gas/CMakeLists.txt",
 )
+
+# The sparse solver's sources, copied from the repository root into intern/sparse_gas.
+SPARSE_DESTINATION = "intern/sparse_gas"
+SPARSE_FILES = (
+    "include/manta_improve/sparse_gas.hpp",
+    "src/sparse_gas.cpp",
+    "src/sparse_multigrid.cpp",
+    "gpu/vulkan_compute.hpp",
+    "gpu/vulkan_compute.cpp",
+    "gpu/sparse_gas_gpu.hpp",
+    "gpu/sparse_gas_gpu.cpp",
+)
+SPARSE_SHADER_DIR = "gpu/shaders"
+
+INTERN_LIST = "intern/CMakeLists.txt"
+INTERN_LIST_OLD = """if(WITH_MOD_FLUID)
+  add_subdirectory(mantaflow)
+endif()
+"""
+INTERN_LIST_NEW = """if(WITH_MOD_FLUID)
+  add_subdirectory(mantaflow)
+  add_subdirectory(sparse_gas)
+endif()
+"""
 
 INTERN_CMAKE = "intern/mantaflow/CMakeLists.txt"
 GEOMETRY_CMAKE = "source/blender/nodes/geometry/CMakeLists.txt"
@@ -70,6 +95,7 @@ if(WITH_MOD_FLUID AND WITH_OPENVDB)
   )
   list(APPEND LIB
     PRIVATE bf_intern_mantaflow
+    PRIVATE bf_intern_sparse_gas
   )
 endif()
 
@@ -125,12 +151,26 @@ def main() -> int:
     args = parser.parse_args()
 
     overlay_root = Path(__file__).resolve().parent
+    repository_root = overlay_root.parent
     blender_root = args.blender_root.resolve()
     try:
         verify_commit(blender_root, args.allow_unpinned)
         for relative in OVERLAY_FILES:
             if not (overlay_root / relative).is_file():
                 raise RuntimeError(f"Missing overlay source: {relative}")
+        sparse_sources = [repository_root / relative for relative in SPARSE_FILES]
+        shader_dir = repository_root / SPARSE_SHADER_DIR
+        sparse_sources += sorted(shader_dir.glob("*.comp")) + sorted(shader_dir.glob("*.glsl"))
+        for source in sparse_sources:
+            if not source.is_file():
+                raise RuntimeError(f"Missing sparse solver source: {source}")
+        if (blender_root / SPARSE_DESTINATION / "src").exists():
+            raise RuntimeError(f"{SPARSE_DESTINATION} already holds solver sources")
+
+        intern_list_path = blender_root / INTERN_LIST
+        intern_list_text = replace_once(
+            intern_list_path.read_text(), INTERN_LIST_OLD, INTERN_LIST_NEW, INTERN_LIST
+        )
 
         intern_path = blender_root / INTERN_CMAKE
         geometry_path = blender_root / GEOMETRY_CMAKE
@@ -159,6 +199,11 @@ def main() -> int:
             destination = blender_root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes((overlay_root / relative).read_bytes())
+        for source in sparse_sources:
+            destination = blender_root / SPARSE_DESTINATION / source.relative_to(repository_root)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source.read_bytes())
+        intern_list_path.write_text(intern_list_text)
         intern_path.write_text(intern_text)
         geometry_path.write_text(geometry_text)
         rna_path.write_text(rna_text)

@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: MIT
+// Galerkin coarse operator for piecewise-constant aggregation of 2x2x2 finer cells.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "mg_common.glsl"
+layout(std430, binding = 3) readonly buffer FineOperator { vec4 fine_op[]; };
+layout(std430, binding = 4) writeonly buffer CoarseOperator { vec4 coarse_op[]; };
+
+void main()
+{
+  int index;
+  if (!cell_in_range(P.lb, index)) {
+    return;
+  }
+  ivec3 c = level_coords(P.lb, index);
+  float diagonal = 0.0;
+  vec3 weights = vec3(0.0);
+  for (int child = 0; child < 8; ++child) {
+    ivec3 offset = ivec3(child & 1, (child >> 1) & 1, (child >> 2) & 1);
+    int i = level_index(P.la, 2 * c + offset);
+    if (i < 0) {
+      continue;
+    }
+    vec4 entry = fine_op[i];
+    diagonal += entry.x;
+    for (int axis = 0; axis < 3; ++axis) {
+      float weight = entry[1 + axis];
+      if (offset[axis] != 0) {
+        /* Coupling inside the aggregate: it leaves the off-diagonals of both its cells. */
+        diagonal -= 2.0 * weight;
+      }
+      else {
+        weights[axis] += weight;
+      }
+    }
+  }
+  coarse_op[index] = vec4(diagonal, weights);
+}

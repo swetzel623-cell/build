@@ -15,18 +15,57 @@ python3 /path/to/repository/blender/apply_integration.py /path/to/blender
 The installer verifies the checked-out commit and expected source anchors before writing. Use
 `--allow-unpinned` only when intentionally porting the overlay to another revision.
 
-It copies five source files (mirrored under `blender/intern` and `blender/source` for review) and
-edits four upstream files:
+It copies six source files (mirrored under `blender/intern` and `blender/source` for review),
+copies the sparse solver's sources from this repository's `include`, `src` and `gpu` directories
+into `intern/sparse_gas`, and edits five upstream files:
 
 | Upstream file | Edit |
 | --- | --- |
+| `intern/CMakeLists.txt` | Adds `intern/sparse_gas` next to `intern/mantaflow` (both with `WITH_MOD_FLUID`). |
 | `intern/mantaflow/CMakeLists.txt` | Adds the engine sources and defines `TBB=1` for the engine source, which includes Mantaflow's kernel headers. |
-| `source/blender/nodes/geometry/CMakeLists.txt` | Adds the node source; with `WITH_MOD_FLUID` and `WITH_OPENVDB`, defines `WITH_FLUID` and links `bf_intern_mantaflow`. |
+| `source/blender/nodes/geometry/CMakeLists.txt` | Adds the node source; with `WITH_MOD_FLUID` and `WITH_OPENVDB`, defines `WITH_FLUID` and links `bf_intern_mantaflow` and `bf_intern_sparse_gas`. |
 | `source/blender/makesrna/intern/rna_nodes_geometry.cc` | Defines the node's RNA struct. Built-in node registration asserts without it. |
 | `scripts/startup/bl_ui/node_add_menu_geometry.py` | Adds the node to Add > Simulation. |
 
 Build Blender with `WITH_MOD_FLUID=ON` and `WITH_OPENVDB=ON`. The node type is registered in every
 configuration; without Mantaflow or OpenVDB it reports an error and passes its input through.
+
+The sparse solver's GPU kernels are compiled when CMake finds the Vulkan headers (Blender's own
+`lib/<platform>/vulkan`, or the Vulkan SDK) and `glslangValidator` (the Vulkan SDK; set
+`VULKAN_SDK` or put it on `PATH`). Configure prints `Sparse gas solver: Vulkan kernels enabled`
+when it found both. Blender links no Vulkan library for them: the loader (`vulkan-1.dll`,
+`libvulkan.so.1`) is opened when the node first needs a device.
+
+## Sparse GPU mode
+
+With the `Sparse GPU` input on, the node runs this repository's sparse brick-grid solver instead
+of Mantaflow (see `docs/gpu-sparse-solver.md`):
+
+- Only bricks of 8×8×8 voxels near smoke or heat are simulated. Air elsewhere is open (pressure
+  zero), not part of a closed box; the outermost voxel layer of the domain is still a wall.
+- Advection-reflection steps, MacCormack advection with a midpoint trace, and six multigrid
+  cycles per projection. Advection keeps the totals of density and temperature. A `CFL` of 6
+  suits it; the Mantaflow default of 2 works but costs three times as many substeps.
+- A float grid named `obstacle` in the state marks static solid voxels (values above 0.5). It is
+  passed through to the output state unchanged. Mantaflow mode ignores it and warns.
+- `Pressure Accuracy`, `Multigrid` and `Pressure Iteration Factor` are unused; `Pressure
+  Iterations` reports the six cycles and `Active Bricks` the bricks of the last substep.
+- The first evaluation creates one Vulkan device for the process, which compiled kernels and
+  buffers live on; it holds no simulation state between evaluations. Each evaluation uploads its
+  state, advances it and downloads the result while holding a lock, so zones stay independent
+  and run one at a time on the GPU.
+- Without a usable Vulkan device, or in a build without the kernels, the node runs the solver's
+  CPU reference instead (single-threaded and slow) and says so in a warning.
+
+`blender/tests/make_sparse_demo.py` writes a demo file with two plumes in their own zones, one
+rising into an `obstacle` plate:
+
+```sh
+blender -b --factory-startup --python blender/tests/make_sparse_demo.py -- sparse_gpu_demo.blend
+```
+
+The state still crosses OpenVDB as dense arrays every frame, which costs time at large
+resolutions; converting OpenVDB leaves to bricks directly is a later step.
 
 ## Node contract
 
@@ -146,7 +185,7 @@ blender -b --factory-startup --python blender/tests/gas_node_legacy_compare.py -
 blender -b --factory-startup --python blender/tests/gas_node_timings.py -- --res 32 64 96 128 --legacy
 ```
 
-`gas_node_runtime_tests.py` runs thirteen tests and exits non-zero on failure:
+`gas_node_runtime_tests.py` runs fifteen tests and exits non-zero on failure:
 
 | Test | What it establishes |
 | --- | --- |
@@ -163,6 +202,8 @@ blender -b --factory-startup --python blender/tests/gas_node_timings.py -- --res
 | pressure preconditioners and diagnostics | Multigrid and MIC agree to 1e-3 of peak velocity and both report iterations and a converged residual; multigrid needs fewer iterations; a starved MIC solve advances the state and raises the convergence warning. |
 | reruns are reproducible | Restarting the zone reproduces the state bit for bit. |
 | matches legacy solver | See the next section; asserts relative errors below 1e-3 after 1 frame and 1e-2 after 6. |
+| sparse gpu advances and rises | Sparse GPU mode for 15 frames: finite grids, smoke rises, active bricks reported, density total held to 1e-3, no flow through the closed walls. Logs whether the GPU or the CPU fallback ran. |
+| sparse gpu obstacle | An `obstacle` plate above the smoke: no smoke enters it, the grid is passed through, the density total is held. |
 
 ## Validation performed
 

@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: MIT
+// MacCormack correction of a forward-advected channel. Mirrors advect_maccormack in the CPU
+// reference. P.a = (offset of the advected channel, dt); P.flags.x selects the midpoint trace.
+// With P.flags.y set, each work group also writes the sums conserve_correction needs to
+// `partials`: the change of the channel's total, and the added and removed corrections.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#define U b4
+#define V b5
+#define W b6
+#define SOURCE b7
+#define FORWARD b8
+#define RESULT b9
+/* Written by the forward pass: lowest and highest of the values its trace interpolated. */
+layout(std430, binding = 10) readonly buffer Bounds { float bounds[]; };
+/* Four floats per work group, after four for conserve_reduce. */
+layout(std430, binding = 11) writeonly buffer Partials { float partials[]; };
+
+#define SAMPLE(name, channel) \
+  float name##_at(ivec3 c) \
+  { \
+    int i = index_of(c); \
+    return i < 0 ? 0.0 : channel[i]; \
+  } \
+  float name(vec3 p, vec3 offset) \
+  { \
+    vec3 f = p - offset; \
+    vec3 base = floor(f); \
+    ivec3 i = ivec3(base); \
+    vec3 t = f - base; \
+    float f000 = name##_at(i); \
+    float f100 = name##_at(i + ivec3(1, 0, 0)); \
+    float f010 = name##_at(i + ivec3(0, 1, 0)); \
+    float f110 = name##_at(i + ivec3(1, 1, 0)); \
+    float f001 = name##_at(i + ivec3(0, 0, 1)); \
+    float f101 = name##_at(i + ivec3(1, 0, 1)); \
+    float f011 = name##_at(i + ivec3(0, 1, 1)); \
+    float f111 = name##_at(i + ivec3(1, 1, 1)); \
+    float c00 = f000 + (f100 - f000) * t.x; \
+    float c10 = f010 + (f110 - f010) * t.x; \
+    float c01 = f001 + (f101 - f001) * t.x; \
+    float c11 = f011 + (f111 - f011) * t.x; \
+    float c0 = c00 + (c10 - c00) * t.y; \
+    float c1 = c01 + (c11 - c01) * t.y; \
+    return c0 + (c1 - c0) * t.z; \
+  }
+
+SAMPLE(sample_u, U)
+SAMPLE(sample_v, V)
+SAMPLE(sample_w, W)
+
+vec3 velocity_at(vec3 p)
+{
+  return vec3(sample_u(p, vec3(0.0, 0.5, 0.5)),
+              sample_v(p, vec3(0.5, 0.0, 0.5)),
+              sample_w(p, vec3(0.5, 0.5, 0.0)));
+}
+
+/* Follow the velocity from p for `step` seconds (negative: backwards). With P.flags.x set, use
+ * the velocity half way along a first, single-stage trace. Mirrors trace() in the CPU
+ * reference. */
+vec3 trace(vec3 p, float step)
+{
+  vec3 velocity = velocity_at(p);
+  if (P.flags.x != 0) {
+    float half_step = 0.5 * step;
+    velocity = velocity_at(p + half_step * velocity);
+  }
+  return p + step * velocity;
+}
+
+float corrected_value(int index)
+{
+  uint type = cell_type[index];
+  if (type == CELL_SOLID) {
+    return 0.0;
+  }
+  float forward = FORWARD[index];
+
+  /* Only correct values that lie inside the fluid. A staggered component sits on the face
+   * shared with the cell below it along its axis. */
+  ivec3 c = coords_of(index);
+  vec3 offset = P.a.xyz;
+  int axis = offset.x == 0.0 ? 0 : offset.y == 0.0 ? 1 : offset.z == 0.0 ? 2 : -1;
+  if (type != CELL_FLUID) {
+    return forward;
+  }
+  if (axis >= 0) {
+    ivec3 below = c;
+    below[axis] -= 1;
+    if (type_at(below) != CELL_FLUID) {
+      return forward;
+    }
+  }
+
+  /* The values the forward trace interpolated bound the result. If any had no storage or was
+   * solid, keep the first-order value: solid cells hold zero, which would make the correction
+   * add smoke along every wall. */
+  float lowest = bounds[2 * index], highest = bounds[2 * index + 1];
+  if (lowest > highest) {
+    return forward;
+  }
+
+  vec3 p = vec3(c) + offset;
+  float dt = P.a.w;
+  vec3 to = trace(p, dt);
+
+  /* The interpolation of the SAMPLE macro, with the corners checked. The backward trace must stay clear of solids and
+   * of unstored voxels too. */
+  vec3 f = to - offset;
+  vec3 base = floor(f);
+  ivec3 corner_base = ivec3(base);
+  vec3 t = f - base;
+  float value[8];
+  for (int corner = 0; corner < 8; ++corner) {
+    int i = index_of(corner_base + ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1));
+    if (i < 0 || cell_type[i] == CELL_SOLID) {
+      return forward;
+    }
+    value[corner] = FORWARD[i];
+  }
+  float c00 = value[0] + (value[1] - value[0]) * t.x;
+  float c10 = value[2] + (value[3] - value[2]) * t.x;
+  float c01 = value[4] + (value[5] - value[4]) * t.x;
+  float c11 = value[6] + (value[7] - value[6]) * t.x;
+  float c0 = c00 + (c10 - c00) * t.y;
+  float c1 = c01 + (c11 - c01) * t.y;
+  float backward = c0 + (c1 - c0) * t.z;
+  float corrected = forward + 0.5 * (SOURCE[index] - backward);
+  return min(max(corrected, lowest), highest);
+}
+
+shared float group_sums[3][64];
+
+void main()
+{
+  int index;
+  bool in_range = voxel_in_range(index);
+  float value = 0.0;
+  if (in_range) {
+    value = corrected_value(index);
+    RESULT[index] = value;
+  }
+  if (P.flags.y == 0) {
+    return;
+  }
+  uint l = gl_LocalInvocationID.x;
+  float correction = in_range ? value - FORWARD[index] : 0.0;
+  group_sums[0][l] = in_range ? value - SOURCE[index] : 0.0;
+  group_sums[1][l] = max(correction, 0.0);
+  group_sums[2][l] = max(-correction, 0.0);
+  for (uint width = 32u; width > 0u; width >>= 1) {
+    barrier();
+    if (l < width) {
+      for (int k = 0; k < 3; ++k) {
+        group_sums[k][l] += group_sums[k][l + width];
+      }
+    }
+  }
+  if (l == 0u) {
+    uint base = 4u + 4u * gl_WorkGroupID.x;
+    partials[base] = group_sums[0][0];
+    partials[base + 1u] = group_sums[1][0];
+    partials[base + 2u] = group_sums[2][0];
+  }
+}

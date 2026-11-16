@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: MIT
+// Add the coarse correction to every unknown of the finer level.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "mg_common.glsl"
+layout(std430, binding = 3) readonly buffer Operator { vec4 op[]; };
+layout(std430, binding = 4) readonly buffer CoarseValues { float coarse_x[]; };
+layout(std430, binding = 5) buffer Values { float x[]; };
+
+void main()
+{
+  int index;
+  if (!cell_in_range(P.la, index)) {
+    return;
+  }
+  if (!(op[index].x > 0.0)) {
+    return;
+  }
+  int parent = level_index(P.lb, level_coords(P.la, index) >> 1);
+  x[index] += P.scale * (parent < 0 ? 0.0 : coarse_x[parent]);
+}

@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: MIT
+// Advection-reflection: replace the unprojected velocity (bindings 7-9) by its reflection about
+// the projected velocity (bindings 4-6), twice the projected minus the unprojected.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index)) {
+    return;
+  }
+  b7[index] = 2.0 * b4[index] - b7[index];
+  b8[index] = 2.0 * b5[index] - b8[index];
+  b9[index] = 2.0 * b6[index] - b9[index];
+}

@@ -536,6 +536,36 @@ def test_sparse_gpu_turbulence(_work):
     check(abs(mass_ratio - 1.0) < 1.0e-3, f"density mass changed by a factor of {mass_ratio:.5f}")
 
 
+def test_sparse_gpu_keeps_state(_work):
+    def run(zones, last):
+        notes = []
+        obj = lib.build_object("kept", zones)
+        lib.evaluate(obj, zones, 1)
+        result = None
+        for frame in range(2, last + 1):
+            result, _ = lib.evaluate(obj, zones, frame)
+            notes.append([m for k, m in lib.warnings(obj) if k != "ERROR"])
+        check(not errors(obj), f"unexpected node errors: {errors(obj)}")
+        return result, notes
+
+    lib.reset_scene()
+    alone, notes = run([sparse_zone(prefix="a_")], 10)
+    print(f"  frame 2: {notes[0]}; frame 10: {notes[-1]}")
+    if any("ran on the CPU" in m for m in notes[-1]):
+        print("  no Vulkan device: nothing is kept on a GPU")
+        return
+    check(all("state uploaded" in m for m in notes[0]), "the first step should upload")
+    check(all(any("kept on the GPU" in m for m in frame) for frame in notes[1:]),
+          "the state was not kept on the GPU between frames")
+
+    # A second zone with another resolution runs in between, on its own solver.
+    lib.reset_scene()
+    together, _ = run([sparse_zone(prefix="a_"), sparse_zone(prefix="b_", res=(24, 24, 40))], 10)
+    for name in lib.GRID_NAMES:
+        check(np.array_equal(together[0][name], alone[0][name]),
+              f"{name} changed when another zone ran in between")
+
+
 TESTS = [
     test_node_is_registered,
     test_zero_time_start_frame,
@@ -555,6 +585,7 @@ TESTS = [
     test_sparse_gpu_moving_collider,
     test_sparse_gpu_sources,
     test_sparse_gpu_turbulence,
+    test_sparse_gpu_keeps_state,
 ]
 
 

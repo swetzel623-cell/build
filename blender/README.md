@@ -101,10 +101,7 @@ of Mantaflow (see `docs/gpu-sparse-solver.md`):
   Mantaflow mode both inputs are ignored with a warning.
 - `Pressure Accuracy`, `Multigrid` and `Pressure Iteration Factor` are unused; `Pressure
   Iterations` reports the six cycles and `Active Bricks` the bricks of the last substep.
-- The first evaluation creates one Vulkan device for the process, which compiled kernels and
-  buffers live on; it holds no simulation state between evaluations. Each evaluation uploads its
-  state, advances it and downloads the result while holding a lock, so zones stay independent
-  and run one at a time on the GPU.
+- GPU work holds a lock, so zones run one at a time on the GPU and never share state.
 - Without a usable Vulkan device, or in a build without the kernels, the node runs the solver's
   CPU reference instead (single-threaded and slow) and says so in a warning.
 
@@ -115,8 +112,12 @@ under a plate, both with the Smoke Simulation modifier:
 blender -b --factory-startup --python blender/tests/make_sparse_demo.py -- sparse_gpu_demo.blend
 ```
 
-The state still crosses OpenVDB as dense arrays every frame, which costs time at large
-resolutions; converting OpenVDB leaves to bricks directly is a later step.
+Only the blocks with smoke cross OpenVDB: the state is read and written brick by brick (8³, like
+OpenVDB's leaves), and sources and colliders go straight into bricks. Up to four GPU solvers
+live for the whole process; when a node's input is exactly the state one of them wrote last
+(tagged with an id in the density grid's metadata, same grid trees, same resolution), that
+solver continues without an upload. The info line says "state kept on the GPU" or "state
+uploaded". The output still holds the whole state, so display and baking are unchanged.
 
 ## Node contract
 
@@ -236,7 +237,7 @@ blender -b --factory-startup --python blender/tests/gas_node_legacy_compare.py -
 blender -b --factory-startup --python blender/tests/gas_node_timings.py -- --res 32 64 96 128 --legacy
 ```
 
-`gas_node_runtime_tests.py` runs eighteen tests and exits non-zero on failure:
+`gas_node_runtime_tests.py` runs nineteen tests and exits non-zero on failure:
 
 | Test | What it establishes |
 | --- | --- |
@@ -258,6 +259,7 @@ blender -b --factory-startup --python blender/tests/gas_node_timings.py -- --res
 | sparse gpu moving collider | A plate animated by the frame number rises through the smoke: no smoke inside it, its faces move at its velocity, the smoke is pushed up. |
 | sparse gpu sources | A sphere in `Sources` emits into an empty scene: raised values equal the source exactly, and with `Add Sources` the total matches the rate. |
 | sparse gpu turbulence | Turbulence visibly changes the plume (relative L2 above 0.05) and the density total is held. |
+| sparse gpu keeps state | The first step uploads, later ones keep the state on the GPU; a second zone with another resolution in between leaves the first zone's result bit for bit the same. |
 
 ## Validation performed
 

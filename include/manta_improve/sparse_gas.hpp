@@ -105,7 +105,15 @@ struct BrickField {
   bool empty() const { return slot_count() == 0; }
   /** Value of a channel at domain coordinates; zero outside the stored bricks. */
   float at(std::size_t channel, int x, int y, int z) const;
+  /**
+   * The value of a channel at domain coordinates inside the domain's bricks, storing the brick
+   * (zero-filled, in every channel) first if it has no storage yet.
+   */
+  float &touch(std::size_t channel, int x, int y, int z);
 };
+
+/** An empty field over the bricks of `extent`, with `channel_count` channels. */
+BrickField make_brick_field(const Extent &extent, int brick_size, std::size_t channel_count);
 
 /**
  * Keep the bricks of dense X-fastest arrays (each covering `extent`) where any of them is
@@ -176,6 +184,9 @@ struct DenseFields {
   /** Cell-centered velocity of the obstacles in voxels per second; empty when at rest. */
   std::vector<float> obstacle_u, obstacle_v, obstacle_w;
 };
+
+/** A state on `topology` with every channel zero. */
+State make_state(Topology topology);
 
 State from_dense(const DenseFields &dense,
                  int brick_size,

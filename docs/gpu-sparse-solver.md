@@ -807,6 +807,31 @@ installed into the build's Essentials asset library (see `blender/README.md`). I
 on llvmpipe: smoke rises from an emitter, a moving emitter leaves a trail in world space, and a
 plate in the Colliders collection holds the smoke's top at 0.70 against 1.00 without it.
 
+**Fast transfer and state kept on the GPU.** Stage 4.
+
+- **Only the blocks with smoke cross OpenVDB.** The node's Sparse GPU path no longer builds
+  dense arrays: it marks the bricks under the active values of the input grids, builds the
+  topology from them, and reads each stored voxel; it writes the result brick by brick.
+  OpenVDB's leaves are 8³ like the bricks. Sources and colliders are rasterized straight into
+  bricks and an obstacle bitmask.
+- **The state stays on the GPU between frames.** Up to four GPU solvers live for the whole
+  process. The node tags its output with an id (metadata on the density grid) and remembers the
+  grid trees it wrote; when the next input carries that id and those same trees, at the same
+  resolution, the solver continues without an upload. Anything else (an edited state, a bake
+  read from disk, a jump in time, another zone) is uploaded in full. The download stays: the
+  output must hold the whole state, for display and for baking.
+- 128×128×192, about 200 bricks of smoke, per frame on this machine:
+
+| | Read in | Write out |
+|---|---|---|
+| Dense conversion (still used by Mantaflow mode) | 58 to 63 ms | 45 to 46 ms |
+| Sparse, state kept on the GPU | 0.3 to 0.4 ms | 2.1 to 2.6 ms |
+
+- In-Blender tests: from the second simulated frame on the state is kept on the GPU, and a
+  second zone with another resolution running in between leaves the first zone's result bit for
+  bit the same. Every sparse test passes again with no Vulkan driver (the CPU fallback, which
+  keeps nothing). Not yet timed on a real GPU.
+
 ## Not verified, and known gaps
 
 - **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.
@@ -843,8 +868,7 @@ plate in the Colliders collection holds the smoke's top at 0.70 against 1.00 wit
 
 ## Next steps
 
-1. Stage 4 of the plan agreed for Blender: copy only the blocks with smoke between OpenVDB and
-   the bricks, and keep the state on the GPU between frames.
+1. Time the whole frame inside Blender on the RTX 3070, with the modifier.
 2. Stage 5: detail (upres) noise. Stage 6: compare with Mantaflow, defaults, a user guide and a
    GitHub Release.
 3. Advect density and temperature in one pass: they share their departure points.

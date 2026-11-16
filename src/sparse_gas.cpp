@@ -559,6 +559,51 @@ float BrickField::at(const std::size_t channel, const int x, const int y, const 
                            static_cast<std::size_t>(brick_size) * (ly + brick_size * lz)];
 }
 
+float &BrickField::touch(const std::size_t channel, const int x, const int y, const int z)
+{
+  const int bx = x / brick_size, by = y / brick_size, bz = z / brick_size;
+  if (x < 0 || y < 0 || z < 0 || bx >= brick_extent.x || by >= brick_extent.y ||
+      bz >= brick_extent.z || channel >= channels.size())
+  {
+    throw std::out_of_range("BrickField::touch outside the domain");
+  }
+  const std::size_t brick = static_cast<std::size_t>(bx) +
+                            static_cast<std::size_t>(brick_extent.x) *
+                                (by + static_cast<std::size_t>(brick_extent.y) * bz);
+  const std::size_t per_brick = static_cast<std::size_t>(brick_size) * brick_size * brick_size;
+  if (table[brick] < 0) {
+    table[brick] = static_cast<std::int32_t>(slot_count());
+    for (std::vector<float> &values : channels) {
+      values.resize(values.size() + per_brick, 0.0f);
+    }
+  }
+  const int lx = x - bx * brick_size, ly = y - by * brick_size, lz = z - bz * brick_size;
+  return channels[channel][static_cast<std::size_t>(table[brick]) * per_brick + lx +
+                           static_cast<std::size_t>(brick_size) * (ly + brick_size * lz)];
+}
+
+BrickField make_brick_field(const Extent &extent, const int brick_size, const std::size_t count)
+{
+  BrickField field;
+  field.brick_size = brick_size;
+  field.brick_extent = {ceil_div(extent.x, brick_size),
+                        ceil_div(extent.y, brick_size),
+                        ceil_div(extent.z, brick_size)};
+  field.table.assign(static_cast<std::size_t>(field.brick_extent.x) * field.brick_extent.y *
+                         field.brick_extent.z,
+                     -1);
+  field.channels.assign(count, {});
+  return field;
+}
+
+State make_state(Topology topology)
+{
+  State state;
+  state.topology = std::move(topology);
+  resize_channels(state);
+  return state;
+}
+
 BrickField brick_field_from_dense(const Extent &extent,
                                   const int brick_size,
                                   const std::vector<const std::vector<float> *> &channels)

@@ -191,11 +191,37 @@ def test_assets_install():
           "the asset lacks the modifier trait")
 
 
+def test_settings_changed_mid_simulation():
+    """Blender keeps a simulation's state when an input changes part-way through; the node then
+    moves the smoke onto the new grid instead of stopping with a transform error."""
+    reset()
+    emitter, modifier = smoke_emitter(**{"Voxel Size": 0.0625})
+    before = run_until(emitter, 8)
+    set_input(modifier, "Voxel Size", 0.05)
+    notes = []
+    for frame in range(9, 13):
+        after = Smoke(emitter, frame)
+        notes += after.warnings
+        check(not [w for w in after.warnings if w[0] == "ERROR"],
+              f"frame {frame}: {after.warnings}")
+    print(f"  smoke top: frame 8 {before.top:.3f}, frame 12 {after.top:.3f}")
+    check(any("moved onto the new grid" in w[1] for w in notes),
+          "the node did not report moving the smoke")
+    check(after.top >= before.top - 0.1, "the smoke was lost when the voxel size changed")
+
+    set_input(modifier, "Domain Size", (1.0, 1.0, 1.0))
+    smaller = Smoke(emitter, 13)
+    check(not [w for w in smaller.warnings if w[0] == "ERROR"], f"{smaller.warnings}")
+    check(smaller.grids == ["density", "pressure", "temperature", "velocity"],
+          f"unexpected grids after shrinking the domain: {smaller.grids}")
+
+
 TESTS = [
     test_assets_install,
     test_modifier_emits_and_rises,
     test_moving_emitter_leaves_a_trail,
     test_collider_shelters,
+    test_settings_changed_mid_simulation,
 ]
 
 

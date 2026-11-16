@@ -20,6 +20,7 @@
 #  endif
 
 #  include "openvdb/openvdb.h"
+#  include "openvdb/tools/GridTransformer.h"
 #  include "openvdb/tools/Interpolation.h"
 
 #  include <algorithm>
@@ -418,6 +419,9 @@ static SparseDevice &sparse_device()
 
 /** Metadata on the density grid that names the solver state a node wrote. */
 static constexpr const char *sparse_state_key = "gas_step_state_id";
+/** Metadata on the density grid of every state this node wrote. Only such a state is moved onto
+ * a changed domain; an authored initial state must match the domain exactly. */
+static constexpr const char *output_key = "gas_step_output";
 
 static std::int64_t next_state_id()
 {
@@ -743,6 +747,7 @@ static Volume *export_sparse_state(const sparse::State &state,
   velocity->setTransform(transform.copy());
   velocity->setGridClass(openvdb::GRID_STAGGERED);
   density->insertMeta(sparse_state_key, openvdb::Int64Metadata(state_id));
+  density->insertMeta(output_key, openvdb::BoolMetadata(true));
 
   {
     openvdb::FloatGrid::Accessor density_access = density->getAccessor();
@@ -1052,6 +1057,101 @@ static void exec_sparse(GeoNodeExecParams &params,
   }
 }
 
+/** A copy of `grid` on `transform`, resampled if it was on another one, and without values
+ * outside the domain. */
+template<typename GridT>
+static openvdb::GridBase::Ptr fit_grid(const GridT &grid,
+                                       const openvdb::math::Transform &transform,
+                                       const int3 &resolution)
+{
+  typename GridT::Ptr result;
+  if (grid.transform() == transform) {
+    result = grid.deepCopy();
+  }
+  else {
+    result = GridT::create(grid.background());
+    result->setTransform(transform.copy());
+    openvdb::tools::resampleToMatch<openvdb::tools::BoxSampler>(grid, *result);
+    result->setGridClass(grid.getGridClass());
+    result->setVectorType(grid.getVectorType());
+  }
+  result->removeMeta(sparse_state_key);
+  result->tree().clip(openvdb::CoordBBox(
+      openvdb::Coord(0), openvdb::Coord(resolution.x - 1, resolution.y - 1, resolution.z - 1)));
+  return result;
+}
+
+/**
+ * A simulation zone keeps its state when the domain's settings change part-way through, so the
+ * state can arrive on another voxel size or origin, or reach past a smaller domain. Moves such
+ * a state, if this node wrote it, onto the requested domain. Returns true if anything was
+ * moved.
+ */
+static bool fit_state_to_domain(GeometrySet &state,
+                                const openvdb::math::Transform &transform,
+                                const int3 &resolution)
+{
+  static constexpr const char *names[] = {"density", "temperature", "velocity", "pressure"};
+  const Volume *volume = state.get_volume();
+  if (!volume) {
+    return false;
+  }
+  if (const bke::VolumeGridData *density = BKE_volume_grid_find(volume, "density")) {
+    bke::VolumeTreeAccessToken token;
+    const openvdb::GridBase &grid = density->grid(token);
+    const auto tag = grid.getMetadata<openvdb::BoolMetadata>(output_key);
+    if (!tag || !tag->value()) {
+      return false;
+    }
+  }
+  else {
+    return false;
+  }
+  bool needed = false;
+  for (const char *name : names) {
+    const bke::VolumeGridData *grid_data = BKE_volume_grid_find(volume, name);
+    if (!grid_data || !ELEM(grid_data->grid_type(), VOLUME_GRID_FLOAT, VOLUME_GRID_VECTOR_FLOAT))
+    {
+      continue;
+    }
+    bke::VolumeTreeAccessToken token;
+    const openvdb::GridBase &grid = grid_data->grid(token);
+    std::string unused;
+    if (!(grid.transform() == transform) ||
+        !active_values_fit_domain(grid, resolution, name, unused))
+    {
+      needed = true;
+    }
+  }
+  if (!needed) {
+    return false;
+  }
+
+  Volume *edit = state.get_volume_for_write();
+  for (const char *name : names) {
+    const bke::VolumeGridData *grid_data = BKE_volume_grid_find(edit, name);
+    if (!grid_data) {
+      continue;
+    }
+    openvdb::GridBase::Ptr fitted;
+    {
+      bke::VolumeTreeAccessToken token;
+      const openvdb::GridBase &grid = grid_data->grid(token);
+      if (grid_data->grid_type() == VOLUME_GRID_FLOAT) {
+        fitted = fit_grid(static_cast<const openvdb::FloatGrid &>(grid), transform, resolution);
+      }
+      else if (grid_data->grid_type() == VOLUME_GRID_VECTOR_FLOAT) {
+        fitted = fit_grid(static_cast<const openvdb::Vec3SGrid &>(grid), transform, resolution);
+      }
+    }
+    if (fitted) {
+      BKE_volume_grid_remove(edit, grid_data);
+      BKE_volume_grid_add_vdb(*edit, name, std::move(fitted));
+    }
+  }
+  return true;
+}
+
 static void node_geo_exec(GeoNodeExecParams params)
 {
   GeometrySet state = params.extract_input<GeometrySet>("State"_ustr);
@@ -1089,6 +1189,13 @@ static void node_geo_exec(GeoNodeExecParams params)
     openvdb::math::Transform::Ptr transform = openvdb::math::Transform::createLinearTransform(
         voxel_size);
     transform->postTranslate(openvdb::math::Vec3<double>(origin.x, origin.y, origin.z));
+
+    if (fit_state_to_domain(state, *transform, resolution)) {
+      params.error_message_add(NodeWarningType::Info,
+                               TIP_("The voxel size or domain changed during the simulation, so "
+                                    "the smoke was moved onto the new grid. Go back to the start "
+                                    "frame for a clean restart"));
+    }
 
     if (params.extract_input<bool>("Sparse GPU"_ustr)) {
       exec_sparse(params, state, resolution, *transform, voxel_size, gravity, delta_time);
@@ -1162,9 +1269,10 @@ static void node_geo_exec(GeoNodeExecParams params)
 
     const auto export_start = std::chrono::steady_clock::now();
     Volume *output_volume = BKE_id_new_nomain<Volume>("Gas Simulation Step State");
-    BKE_volume_grid_add_vdb(*output_volume,
-                            "density",
-                            make_scalar_grid(density, resolution, *transform, true));
+    openvdb::FloatGrid::Ptr density_grid = make_scalar_grid(
+        density, resolution, *transform, true);
+    density_grid->insertMeta(output_key, openvdb::BoolMetadata(true));
+    BKE_volume_grid_add_vdb(*output_volume, "density", std::move(density_grid));
     BKE_volume_grid_add_vdb(*output_volume,
                             "temperature",
                             make_scalar_grid(temperature, resolution, *transform, true));

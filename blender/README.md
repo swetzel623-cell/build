@@ -36,6 +36,44 @@ The sparse solver's GPU kernels are compiled when CMake finds the Vulkan headers
 when it found both. Blender links no Vulkan library for them: the loader (`vulkan-1.dll`,
 `libvulkan.so.1`) is opened when the node first needs a device.
 
+## Smoke Simulation modifier
+
+`blender/assets/smoke_assets.py` builds three node-group assets and installs them into a Blender
+build's own Essentials library (`datafiles/assets/nodes/smoke_simulation_assets.blend`, plus two
+catalogs in `blender_assets.cats.txt`):
+
+```sh
+blender -b --factory-startup --python blender/assets/smoke_assets.py
+```
+
+The Windows build workflow runs it, so its zip already has them.
+
+- **Add Modifier > Physics > Smoke Simulation** turns the selected mesh into a smoke emitter.
+  Its panels: Emission (density, temperature, adding instead of raising, an optional velocity),
+  Domain (voxel size, domain size, a Colliders collection), Forces (buoyancy, gravity),
+  Turbulence, Solver (GPU on or off, CFL, substeps) and Display (keep the emitter visible).
+  - The simulation runs in world space. The domain is centred on the emitter on the first frame
+    of the simulation, its floor a tenth of its height below the emitter, and stays there: give
+    a moving emitter a domain that covers its path. Only bricks with smoke cost anything.
+  - Colliders may be animated: their velocity comes from how far their points moved since the
+    previous frame.
+  - Turning the GPU off runs Mantaflow, which does not support emission, colliders or
+    turbulence, so nothing appears.
+- **Add > Simulation > Smoke Source** and **Smoke Collider** (node editor) turn a mesh into the
+  `Sources` and `Colliders` volumes of the Gas Simulation Step node, for setups built by hand.
+  Open the Smoke Simulation group (Tab) to see how they are wired.
+
+`blender/tests/smoke_modifier_tests.py` checks the installed assets (catalogs once, the modifier
+trait that Add Modifier filters on), smoke rising from an emitter, a moving emitter leaving a
+trail in world space, and a collider collection holding the smoke back:
+
+```sh
+blender -b --factory-startup --python blender/tests/smoke_modifier_tests.py
+```
+
+Adding the modifier from the menu cannot be exercised in background mode, where the asset
+library does not load; the test checks the metadata the menu reads instead.
+
 ## Sparse GPU mode
 
 With the `Sparse GPU` input on, the node runs this repository's sparse brick-grid solver instead
@@ -46,26 +84,40 @@ of Mantaflow (see `docs/gpu-sparse-solver.md`):
 - Advection-reflection steps, MacCormack advection with a midpoint trace, and six multigrid
   cycles per projection. Advection keeps the totals of density and temperature. A `CFL` of 6
   suits it; the Mantaflow default of 2 works but costs three times as many substeps.
-- A float grid named `obstacle` in the state marks static solid voxels (values above 0.5). It is
-  passed through to the output state unchanged. Mantaflow mode ignores it and warns.
+- `Sources` takes a volume whose float grids `density` and `temperature` are emitted every
+  step, for example made with Mesh to Density Grid and Store Named Grid. By default density and
+  temperature are raised to the source's values; `Add Sources` adds them per second instead. An
+  optional vector grid `velocity` (world units per second) is set where they emit.
+- `Colliders` takes a volume whose float grid `obstacle` marks solid voxels (above 0.5) and an
+  optional vector grid `velocity` (world units per second) for their motion. It is read every
+  frame, so an animated collider moves; smoke inside voxels that become solid is dropped.
+- `Turbulence` adds a swirling noise force (world units per second squared; compare it with
+  gravity times the buoyancy), with `Turbulence Scale` (swirl size), `Turbulence Speed`
+  (pattern changes per second), `Turbulence Seed`, and `Turbulence Mask`, the density at which it
+  reaches full strength (0 stirs all simulated air, which spreads the smoke through the domain).
+  Connect Scene Time's Seconds to `Time` so the pattern moves.
+- Grids in `Sources` and `Colliders` may use any transform: each active voxel goes to the
+  nearest domain voxel, so a voxel size equal to the domain's gives the cleanest result. In
+  Mantaflow mode both inputs are ignored with a warning.
 - `Pressure Accuracy`, `Multigrid` and `Pressure Iteration Factor` are unused; `Pressure
   Iterations` reports the six cycles and `Active Bricks` the bricks of the last substep.
-- The first evaluation creates one Vulkan device for the process, which compiled kernels and
-  buffers live on; it holds no simulation state between evaluations. Each evaluation uploads its
-  state, advances it and downloads the result while holding a lock, so zones stay independent
-  and run one at a time on the GPU.
+- GPU work holds a lock, so zones run one at a time on the GPU and never share state.
 - Without a usable Vulkan device, or in a build without the kernels, the node runs the solver's
   CPU reference instead (single-threaded and slow) and says so in a warning.
 
 `blender/tests/make_sparse_demo.py` writes a demo file with two plumes in their own zones, one
-rising into an `obstacle` plate:
+under a plate, both with the Smoke Simulation modifier:
 
 ```sh
 blender -b --factory-startup --python blender/tests/make_sparse_demo.py -- sparse_gpu_demo.blend
 ```
 
-The state still crosses OpenVDB as dense arrays every frame, which costs time at large
-resolutions; converting OpenVDB leaves to bricks directly is a later step.
+Only the blocks with smoke cross OpenVDB: the state is read and written brick by brick (8³, like
+OpenVDB's leaves), and sources and colliders go straight into bricks. Up to four GPU solvers
+live for the whole process; when a node's input is exactly the state one of them wrote last
+(tagged with an id in the density grid's metadata, same grid trees, same resolution), that
+solver continues without an upload. The info line says "state kept on the GPU" or "state
+uploaded". The output still holds the whole state, so display and baking are unchanged.
 
 ## Node contract
 
@@ -185,7 +237,7 @@ blender -b --factory-startup --python blender/tests/gas_node_legacy_compare.py -
 blender -b --factory-startup --python blender/tests/gas_node_timings.py -- --res 32 64 96 128 --legacy
 ```
 
-`gas_node_runtime_tests.py` runs fifteen tests and exits non-zero on failure:
+`gas_node_runtime_tests.py` runs nineteen tests and exits non-zero on failure:
 
 | Test | What it establishes |
 | --- | --- |
@@ -203,7 +255,11 @@ blender -b --factory-startup --python blender/tests/gas_node_timings.py -- --res
 | reruns are reproducible | Restarting the zone reproduces the state bit for bit. |
 | matches legacy solver | See the next section; asserts relative errors below 1e-3 after 1 frame and 1e-2 after 6. |
 | sparse gpu advances and rises | Sparse GPU mode for 15 frames: finite grids, smoke rises, active bricks reported, density total held to 1e-3, no flow through the closed walls. Logs whether the GPU or the CPU fallback ran. |
-| sparse gpu obstacle | An `obstacle` plate above the smoke: no smoke enters it, the grid is passed through, the density total is held. |
+| sparse gpu obstacle | A plate in `Colliders` above the smoke: no smoke enters it, it shelters the space above, the density total is held. |
+| sparse gpu moving collider | A plate animated by the frame number rises through the smoke: no smoke inside it, its faces move at its velocity, the smoke is pushed up. |
+| sparse gpu sources | A sphere in `Sources` emits into an empty scene: raised values equal the source exactly, and with `Add Sources` the total matches the rate. |
+| sparse gpu turbulence | Turbulence visibly changes the plume (relative L2 above 0.05) and the density total is held. |
+| sparse gpu keeps state | The first step uploads, later ones keep the state on the GPU; a second zone with another resolution in between leaves the first zone's result bit for bit the same. |
 
 ## Validation performed
 

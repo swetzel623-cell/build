@@ -560,6 +560,239 @@ void test_obstacle_blocks_the_plume()
   require(worst_divergence < 0.05f, "the projection failed next to the obstacle");
 }
 
+/** Sources raise or add smoke and heat, keep their bricks active, and set their velocity. */
+void test_sources_emit()
+{
+  const Extent extent{32, 32, 48};
+  const DenseFields shape = blob(extent, 16.0f, 16.0f, 12.0f, 3.0f);
+  DenseFields emit = shape;
+  for (float &value : emit.density) {
+    value *= 0.8f;
+  }
+  for (float &value : emit.temperature) {
+    value *= 0.5f;
+  }
+  const double voxels = sum(shape.density);
+
+  DenseFields empty = shape;
+  std::fill(empty.density.begin(), empty.density.end(), 0.0f);
+  std::fill(empty.temperature.begin(), empty.temperature.end(), 0.0f);
+  Settings still;
+  still.heat_buoyancy = 0.0f;
+  still.density_buoyancy = 0.0f;
+  still.pressure_solver = PressureSolver::Multigrid;
+  still.pressure_iterations = 6;
+
+  /* Nothing moves, so raised values sit exactly at the source's level. */
+  State state = from_dense(empty, 8, still.thresholds, still.dilation);
+  require(state.topology.brick_count() == 0, "an empty state has no bricks");
+  const Sources raise = sources_from_dense(emit, 8, SourceMode::Raise);
+  for (int frame = 0; frame < 3; ++frame) {
+    advance(state, still, 1.0f / 30.0f, &raise);
+  }
+  DenseFields result = to_dense(state);
+  double worst = 0.0;
+  for (std::size_t i = 0; i < result.density.size(); ++i) {
+    worst = std::max(worst, static_cast<double>(std::abs(result.density[i] - emit.density[i])));
+    worst = std::max(worst,
+                     static_cast<double>(std::abs(result.temperature[i] - emit.temperature[i])));
+  }
+  std::cout << "  raise: " << state.topology.brick_count() << " bricks, largest difference "
+            << worst << std::endl;
+  require(state.topology.brick_count() > 0, "the source did not activate its bricks");
+  require(worst == 0.0, "raising did not reach the source's level exactly");
+
+  /* Adding accumulates the source's rate. */
+  state = from_dense(empty, 8, still.thresholds, still.dilation);
+  const Sources add = sources_from_dense(emit, 8, SourceMode::Add);
+  for (int frame = 0; frame < 6; ++frame) {
+    advance(state, still, 1.0f / 30.0f, &add);
+  }
+  const double added = sum(to_dense(state).density);
+  const double expected = 0.8 * voxels * 6.0 / 30.0;
+  std::cout << "  add: density total " << added << ", expected " << expected << std::endl;
+  require(std::abs(added / expected - 1.0) < 1.0e-4, "adding did not accumulate the rate");
+
+  /* A source velocity carries the smoke along. */
+  emit.u.assign(emit.density.size(), 0.0f);
+  emit.v.assign(emit.density.size(), 0.0f);
+  emit.w.assign(emit.density.size(), 0.0f);
+  for (std::size_t i = 0; i < emit.w.size(); ++i) {
+    emit.w[i] = shape.density[i] > 0.0f ? 40.0f : 0.0f;
+  }
+  state = from_dense(empty, 8, still.thresholds, still.dilation);
+  const Sources jet = sources_from_dense(emit, 8, SourceMode::Raise);
+  for (int frame = 0; frame < 8; ++frame) {
+    advance(state, still, 1.0f / 30.0f, &jet);
+  }
+  result = to_dense(state);
+  const double rise = center_of_mass_z(result) - center_of_mass_z(shape);
+  std::cout << "  jet: smoke centre " << rise << " voxels above the source" << std::endl;
+  require(rise > 2.0, "the source velocity did not carry the smoke");
+}
+
+/** A plate moving up pushes the smoke above it and carries no flow through its faces. */
+void test_moving_obstacle_pushes_smoke()
+{
+  const Extent extent{32, 32, 48};
+  DenseFields initial = blob(extent, 16.0f, 16.0f, 24.0f, 8.0f);
+  const auto plate_at = [&](const int bottom) {
+    std::vector<std::uint8_t> solid(initial.density.size(), 0);
+    for (int z = bottom; z < bottom + 3; ++z) {
+      for (int y = 10; y < 22; ++y) {
+        for (int x = 10; x < 22; ++x) {
+          solid[dense_index(extent, x, y, z)] = 1;
+        }
+      }
+    }
+    return solid;
+  };
+  const float speed = 30.0f; /* Voxels per second: one voxel per frame. */
+  Settings settings;
+  settings.heat_buoyancy = 0.0f;
+  settings.density_buoyancy = 0.0f;
+  settings.pressure_solver = PressureSolver::Multigrid;
+  settings.pressure_iterations = 6;
+  State state = from_dense(initial, 8, settings.thresholds, settings.dilation);
+  const double start_z = center_of_mass_z(initial);
+  int bottom = 14;
+  float worst_face = 0.0f, worst_divergence = 0.0f;
+  for (int frame = 0; frame < 6; ++frame) {
+    DenseFields obstacles;
+    obstacles.extent = extent;
+    obstacles.obstacle = plate_at(bottom);
+    obstacles.obstacle_u.assign(initial.density.size(), 0.0f);
+    obstacles.obstacle_v.assign(initial.density.size(), 0.0f);
+    obstacles.obstacle_w.assign(initial.density.size(), 0.0f);
+    for (std::size_t i = 0; i < obstacles.obstacle.size(); ++i) {
+      obstacles.obstacle_w[i] = obstacles.obstacle[i] ? speed : 0.0f;
+    }
+    set_obstacles_from_dense(state, obstacles);
+    const FrameInfo info = advance(state, settings, 1.0f / 30.0f);
+    worst_divergence = std::max(worst_divergence, info.last_step.max_divergence);
+    const DenseFields now = to_dense(state);
+    /* Faces on the plate's top and bottom move with it; no smoke stays inside. */
+    for (int y = 10; y < 22; ++y) {
+      for (int x = 10; x < 22; ++x) {
+        worst_face = std::max(worst_face,
+                              std::abs(now.w[dense_index(extent, x, y, bottom)] - speed));
+        worst_face = std::max(worst_face,
+                              std::abs(now.w[dense_index(extent, x, y, bottom + 3)] - speed));
+        for (int z = bottom; z < bottom + 3; ++z) {
+          require(now.density[dense_index(extent, x, y, z)] == 0.0f, "smoke inside the plate");
+        }
+      }
+    }
+    ++bottom;
+  }
+  const double rise = center_of_mass_z(to_dense(state)) - start_z;
+  std::cout << "  plate face error " << worst_face << ", worst divergence " << worst_divergence
+            << ", smoke centre rose " << rise << " voxels" << std::endl;
+  require(worst_face < 1.0e-4f, "the plate's faces do not move with it");
+  require(worst_divergence < 0.05f, "the projection failed around the moving plate");
+  require(rise > 0.5, "the moving plate did not push the smoke");
+}
+
+/** The turbulence force stirs without compressing, follows its seed and time, and its mask. */
+void test_turbulence_stirs()
+{
+  const Extent extent{32, 32, 48};
+  const DenseFields initial = blob(extent, 16.0f, 16.0f, 24.0f, 6.0f);
+  Settings settings;
+  settings.dilation = 1000; /* Every brick, so the mask has empty air to leave alone. */
+  const State start = from_dense(initial, 8, settings.thresholds, settings.dilation);
+  Turbulence turbulence;
+  turbulence.strength = 300.0f;
+  turbulence.scale = 8.0f;
+  turbulence.seed = 3;
+  turbulence.mask = TurbulenceMask::None;
+
+  const auto stirred = [&](const Turbulence &t, const float time) {
+    State state = start;
+    add_turbulence(state, t, time, 1.0f / 30.0f);
+    return state;
+  };
+  const auto difference = [](const State &a, const State &b) {
+    double result = 0.0;
+    for (std::size_t i = 0; i < a.u.size(); ++i) {
+      result = std::max({result, static_cast<double>(std::abs(a.u[i] - b.u[i])),
+                         static_cast<double>(std::abs(a.v[i] - b.v[i])),
+                         static_cast<double>(std::abs(a.w[i] - b.w[i]))});
+    }
+    return result;
+  };
+
+  const State once = stirred(turbulence, 0.0f);
+  const double magnitude = difference(once, start);
+  /* Away from the walls, where faces touching a wall get no push. */
+  std::vector<float> div;
+  divergence(once, div);
+  DenseFields div_dense = to_dense(once);
+  {
+    State probe = once;
+    probe.density = div;
+    div_dense = to_dense(probe);
+  }
+  float worst = 0.0f;
+  for (int z = 2; z < extent.z - 2; ++z) {
+    for (int y = 2; y < extent.y - 2; ++y) {
+      for (int x = 2; x < extent.x - 2; ++x) {
+        worst = std::max(worst, std::abs(div_dense.density[dense_index(extent, x, y, z)]));
+      }
+    }
+  }
+  std::cout << "  largest push " << magnitude << " voxels/s, largest divergence " << worst
+            << " 1/s" << std::endl;
+  require(magnitude > 1.0, "turbulence did not move the air");
+  /* A curl is divergence-free; differencing on the faces leaves a small part. */
+  require(worst < 0.25 * magnitude, "turbulence compresses the air");
+
+  require(difference(stirred(turbulence, 0.0f), once) == 0.0, "turbulence is not repeatable");
+  Turbulence other = turbulence;
+  other.seed = 4;
+  require(difference(stirred(other, 0.0f), once) > 0.5 * magnitude, "the seed changes nothing");
+  require(difference(stirred(turbulence, 0.5f), once) > 0.1 * magnitude,
+          "the pattern does not change over time");
+  Turbulence frozen = turbulence;
+  frozen.speed = 0.0f;
+  require(difference(stirred(frozen, 0.5f), stirred(frozen, 0.0f)) == 0.0,
+          "a frozen pattern changed over time");
+
+  /* Masked by density: faces of empty air keep their velocity. */
+  Turbulence masked = turbulence;
+  masked.mask = TurbulenceMask::Density;
+  masked.mask_level = 0.1f;
+  const State in_smoke = stirred(masked, 0.0f);
+  const DenseFields dense = to_dense(in_smoke);
+  float empty_push = 0.0f;
+  for (int z = 2; z < 6; ++z) {
+    for (int y = 2; y < 30; ++y) {
+      for (int x = 2; x < 30; ++x) {
+        const std::size_t i = dense_index(extent, x, y, z);
+        empty_push = std::max({empty_push, std::abs(dense.u[i]), std::abs(dense.v[i]),
+                               std::abs(dense.w[i])});
+      }
+    }
+  }
+  require(empty_push == 0.0f, "the density mask let turbulence move empty air");
+  require(difference(in_smoke, start) > 0.5 * magnitude, "the masked force vanished in smoke");
+
+  /* Through whole frames the total amount of smoke is still held. */
+  State state = from_dense(initial, 8, settings.thresholds, 1);
+  Settings stir = plume_settings();
+  stir.pressure_solver = PressureSolver::Multigrid;
+  stir.pressure_iterations = 6;
+  stir.turbulence = turbulence;
+  stir.turbulence.mask = TurbulenceMask::Density;
+  for (int frame = 0; frame < 6; ++frame) {
+    stir.time = static_cast<float>(frame) / 30.0f;
+    advance(state, stir, 1.0f / 30.0f);
+  }
+  const double kept = sum(to_dense(state).density) / sum(initial.density);
+  std::cout << "  mass kept after 6 stirred frames " << kept << std::endl;
+  require(std::abs(kept - 1.0) < 1.0e-3, "turbulence changed the amount of smoke");
+}
+
 }  // namespace
 
 int main()
@@ -578,6 +811,9 @@ int main()
       {"large steps keep mass", test_large_steps_keep_mass},
       {"symmetric scene stays symmetric", test_symmetric_scene_stays_symmetric},
       {"obstacle blocks the plume", test_obstacle_blocks_the_plume},
+      {"sources emit", test_sources_emit},
+      {"moving obstacle pushes smoke", test_moving_obstacle_pushes_smoke},
+      {"turbulence stirs", test_turbulence_stirs},
   };
   const char *only = std::getenv("SPARSE_GAS_TEST");
   for (const auto &[name, test] : tests) {

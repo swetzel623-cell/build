@@ -89,6 +89,61 @@ Topology build_topology(Extent extent,
 std::vector<std::uint32_t> pack_obstacle(const Extent &extent,
                                          const std::vector<std::uint8_t> &solid);
 
+/**
+ * Values on some bricks of the domain, kept apart from a State's storage: what sources emit and
+ * how obstacles move. The bricks are those of the State's brick grid.
+ */
+struct BrickField {
+  int brick_size = 8;
+  Extent brick_extent;
+  /** Per brick of the domain (X-fastest): slot, or -1 where every channel is zero. */
+  std::vector<std::int32_t> table;
+  /** Per channel: `brick_size`^3 values per slot, X-fastest inside each brick. */
+  std::vector<std::vector<float>> channels;
+
+  std::size_t slot_count() const;
+  bool empty() const { return slot_count() == 0; }
+  /** Value of a channel at domain coordinates; zero outside the stored bricks. */
+  float at(std::size_t channel, int x, int y, int z) const;
+  /**
+   * The value of a channel at domain coordinates inside the domain's bricks, storing the brick
+   * (zero-filled, in every channel) first if it has no storage yet.
+   */
+  float &touch(std::size_t channel, int x, int y, int z);
+};
+
+/** An empty field over the bricks of `extent`, with `channel_count` channels. */
+BrickField make_brick_field(const Extent &extent, int brick_size, std::size_t channel_count);
+
+/**
+ * Keep the bricks of dense X-fastest arrays (each covering `extent`) where any of them is
+ * nonzero. Empty arrays are not allowed; the result has one channel per array, in order.
+ */
+BrickField brick_field_from_dense(const Extent &extent,
+                                  int brick_size,
+                                  const std::vector<const std::vector<float> *> &channels);
+
+enum class SourceMode {
+  /** Raise density and temperature to the source's value where it is higher (Blender's default). */
+  Raise,
+  /** Add the source's value per second. */
+  Add,
+};
+
+/**
+ * What sources emit at the start of every step they are passed to. Channels: density,
+ * temperature and, optionally, a cell-centered velocity u, v, w in voxels per second that is
+ * set on the lower faces of every voxel emitting density or temperature, as Mantaflow sets an
+ * emitter's initial velocity. Bricks holding a source stay active.
+ */
+struct Sources {
+  SourceMode mode = SourceMode::Raise;
+  BrickField field;
+};
+
+/** Sources from dense fields: density and temperature, and the velocity if `u` is not empty. */
+Sources sources_from_dense(const struct DenseFields &dense, int brick_size, SourceMode mode);
+
 /** Staggered (MAC) gas state on a sparse topology. Velocity is in voxels per second. */
 struct State {
   Topology topology;
@@ -97,6 +152,13 @@ struct State {
   /** Velocity through the lower X, Y, and Z face of each voxel. */
   std::vector<float> u, v, w;
   std::vector<float> pressure;
+  /**
+   * Velocity of the obstacles in voxels per second, cell-centered: three channels, read at
+   * obstacle voxels only. Empty when the obstacles are at rest. A face between a solid and any
+   * other cell takes the velocity of the obstacle side (the mean of both if both are solid);
+   * the domain's outer wall is at rest.
+   */
+  BrickField obstacle_velocity;
 };
 
 struct ActivityThresholds {
@@ -117,9 +179,14 @@ struct DenseFields {
   std::vector<float> u, v, w;
   /** The last pressure, the first guess of the next solve; may be empty. */
   std::vector<float> pressure;
-  /** Nonzero where a voxel is a solid obstacle at rest; may be empty. */
+  /** Nonzero where a voxel is a solid obstacle; may be empty. */
   std::vector<std::uint8_t> obstacle;
+  /** Cell-centered velocity of the obstacles in voxels per second; empty when at rest. */
+  std::vector<float> obstacle_u, obstacle_v, obstacle_w;
 };
+
+/** A state on `topology` with every channel zero. */
+State make_state(Topology topology);
 
 State from_dense(const DenseFields &dense,
                  int brick_size,
@@ -129,9 +196,24 @@ DenseFields to_dense(const State &state);
 
 /**
  * Recompute which bricks are active from the current values and move the state onto the new
- * topology. Values in bricks that become inactive are discarded.
+ * topology. Values in bricks that become inactive are discarded. Bricks holding a source are
+ * active.
  */
-void retopologize(State &state, const ActivityThresholds &thresholds, int dilation);
+void retopologize(State &state,
+                  const ActivityThresholds &thresholds,
+                  int dilation,
+                  const Sources *sources = nullptr);
+
+/**
+ * Replace the obstacles, for example with a collider's position in the next frame. The bricks
+ * stay as they are and their cells are classified again. Smoke and heat inside voxels that
+ * become solid are dropped at the start of the next step. `velocity` is as
+ * State::obstacle_velocity.
+ */
+void set_obstacles(State &state, std::vector<std::uint32_t> mask, BrickField velocity = {});
+
+/** Obstacle mask and velocity from the obstacle fields of `dense` (which may be empty). */
+void set_obstacles_from_dense(State &state, const struct DenseFields &dense);
 
 enum class PressureSolver {
   /** Jacobi-preconditioned conjugate gradients, run to `pressure_accuracy`. */
@@ -156,9 +238,46 @@ enum class Advection {
   MacCormack,
 };
 
+enum class TurbulenceMask {
+  /** Full strength everywhere in the simulated bricks. */
+  None,
+  /** Scaled by density up to `mask_level`, full strength above it. */
+  Density,
+  /** Scaled by temperature up to `mask_level`, full strength above it. */
+  Temperature,
+};
+
+/**
+ * A swirling noise force: the curl of a smooth gradient-noise vector field, so it stirs the
+ * smoke without pushing it apart or together. Like a turbulence or disturbance force in
+ * EmberGen or Houdini, it changes how the smoke moves; it is not upres detail.
+ */
+struct Turbulence {
+  /** Acceleration in voxels per second squared; 0 turns the force off. */
+  float strength = 0.0f;
+  /** Size of the swirls in voxels. */
+  float scale = 16.0f;
+  /** How many times per second the pattern changes completely; 0 freezes it. */
+  float speed = 1.0f;
+  std::uint32_t seed = 0;
+  /**
+   * Masked by density by default. Unmasked, the force stirs the air in every simulated brick,
+   * which spreads the smoke, which activates more bricks: at 64x64x96 a plume then fills the
+   * domain within 50 frames instead of rising.
+   */
+  TurbulenceMask mask = TurbulenceMask::Density;
+  float mask_level = 0.1f;
+};
+
 struct Settings {
   /** Time step of step(). advance() chooses its own steps and ignores this. */
   float dt = 1.0f / 30.0f;
+  /**
+   * Simulation time in seconds at the start of step(), which the turbulence pattern follows.
+   * advance() advances it through its substeps.
+   */
+  float time = 0.0f;
+  Turbulence turbulence;
   Advection advection = Advection::MacCormack;
   /**
    * Trace departure points with the velocity half way along the path (second order) instead of
@@ -290,12 +409,30 @@ float max_speed(const State &state);
 /** Time step for the next substep of a frame: the rest of the frame, limited by the CFL number. */
 float cfl_time_step(float remaining, float cfl, float speed);
 
+/**
+ * The turbulence force on faces between two fluid cells, over `dt` seconds, with the pattern
+ * at `time`. Does nothing if its strength is zero.
+ */
+void add_turbulence(State &state, const Turbulence &turbulence, float time, float dt);
+
+/** The two time slices of the turbulence pattern at `time` and the blend between them. */
+void turbulence_time(const Turbulence &turbulence, float time, int &slice, float &blend);
+
 /** Mantaflow-style buoyancy on faces between two fluid cells. */
 void add_buoyancy(State &state, const std::vector<float> &factor, float coefficient, float dt,
                   const float gravity[3]);
 
-/** Zero every face that touches a solid cell. */
+/**
+ * Set every face that touches a solid cell to the obstacle's velocity (zero for obstacles at
+ * rest and for the domain's outer wall). See State::obstacle_velocity.
+ */
 void enforce_walls(State &state);
+
+/**
+ * Start of a step: zero density and temperature in solid cells, then apply `sources` (may be
+ * null) over `dt` seconds.
+ */
+void inject(State &state, const Sources *sources, float dt);
 
 /** Divergence of fluid cells in 1/s; zero elsewhere. */
 void divergence(const State &state, std::vector<float> &result);
@@ -354,19 +491,28 @@ float poisson_residual(const Topology &topology,
                        const std::vector<float> &rhs,
                        const std::vector<float> &pressure);
 
-/** Subtract the pressure gradient from every face that borders a fluid cell. */
+/**
+ * Subtract the pressure gradient from every face that borders a fluid cell. Faces touching a
+ * solid are left as enforce_walls set them.
+ */
 void subtract_gradient(State &state);
 
 /** Solve for pressure with the configured solver and make the velocity divergence-free. */
 StepInfo project(State &state, const Settings &settings);
 
-/** Advance one time step: retopologize, advect, add buoyancy, enforce walls, project. */
-StepInfo step(State &state, const Settings &settings);
+/**
+ * Advance one time step: retopologize, inject sources, advect, add buoyancy, enforce walls,
+ * project. `sources` may be null.
+ */
+StepInfo step(State &state, const Settings &settings, const Sources *sources = nullptr);
 
 /**
  * Advance by `frame_time` in CFL-limited substeps. Throws std::runtime_error, leaving the state
  * partly advanced, if that takes more than `max_substeps`.
  */
-FrameInfo advance(State &state, const Settings &settings, float frame_time);
+FrameInfo advance(State &state,
+                  const Settings &settings,
+                  float frame_time,
+                  const Sources *sources = nullptr);
 
 }  // namespace manta_improve::sparse

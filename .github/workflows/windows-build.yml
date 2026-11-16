@@ -82,12 +82,25 @@ jobs:
           cmake --build %BUILD_DIR% --target install || exit /b 1
           dir %DIST_DIR%
 
+      # Add Modifier > Physics > Smoke Simulation, and Smoke Source and Smoke Collider in the
+      # node editor: node-group assets written into the build's own Essentials library.
+      - name: Install the smoke assets
+        shell: cmd
+        run: |
+          %DIST_DIR%\blender.exe -b --factory-startup --python overlay\blender\assets\smoke_assets.py || exit /b 1
+          dir %DIST_DIR%\*\datafiles\assets\nodes
+
       - name: Run the in-Blender runtime tests
         id: tests
         continue-on-error: true
         shell: cmd
         run: |
           %DIST_DIR%\blender.exe -b --factory-startup --python overlay\blender\tests\gas_node_runtime_tests.py -- --work %RUNNER_TEMP%\gas_tests
+          set NODE_TESTS=%ERRORLEVEL%
+          %DIST_DIR%\blender.exe -b --factory-startup --python overlay\blender\tests\smoke_modifier_tests.py
+          set MODIFIER_TESTS=%ERRORLEVEL%
+          if not "%NODE_TESTS%"=="0" exit /b 1
+          if not "%MODIFIER_TESTS%"=="0" exit /b 1
 
       - name: Record what was built
         shell: bash

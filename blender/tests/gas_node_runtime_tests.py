@@ -381,13 +381,12 @@ def test_reruns_are_reproducible(_work):
         check(np.array_equal(whole[name], again[name]), f"{name} is not reproducible")
 
 
-def sparse_zone(prefix="", res=(32, 32, 48), obstacle=None, **params):
+def sparse_zone(prefix="", res=(32, 32, 48), **params):
     params.setdefault("Sparse GPU", True)
     params.setdefault("CFL", 6.0)
     zone = Zone(res, prefix=prefix, **params)
     field = blob(zone, (res[0] / 2, res[1] / 2, res[2] / 4), 4.0)
-    lib.make_data_object((prefix or "sparse") + "_data", zone, density=field, temperature=field,
-                         obstacle=obstacle)
+    lib.make_data_object((prefix or "sparse") + "_data", zone, density=field, temperature=field)
     return zone
 
 
@@ -420,22 +419,151 @@ def test_sparse_gpu_advances_and_rises(_work):
     check(wall_normal == 0.0, f"velocity {wall_normal} through a closed wall")
 
 
+def plate_colliders(bottom0, speed_cells):
+    """A 14x14x3 plate whose bottom is at voxel bottom0 + (frame - 1) * speed_cells / 30."""
+    def build(b, zone):
+        frame = b.new("GeometryNodeInputSceneTime").outputs["Frame"]
+        bottom = b.math("ADD", float(bottom0),
+                        b.math("FLOOR", b.math("MULTIPLY", b.math("SUBTRACT", frame, 1.0),
+                                               speed_cells / 30.0)))
+        top = b.math("ADD", bottom, 3.0)
+        mask = lib.box_field(b, zone, (9.0, 9.0, bottom), (23.0, 23.0, top))
+        speed = speed_cells * zone.voxel
+        return lib.grid_volume(b, zone, [("obstacle", "FLOAT", mask),
+                                         ("velocity", "VECTOR", (0.0, 0.0, speed))])
+    return build
+
+
+def plate_mask(zone, bottom):
+    return lib.dense(zone, lambda x, y, z: ((z >= bottom) & (z < bottom + 3) & (x >= 9) & (x < 23)
+                                            & (y >= 9) & (y < 23)) * 1.0).astype(bool)
+
+
 def test_sparse_gpu_obstacle(_work):
     lib.reset_scene()
-    res = (32, 32, 48)
-    plate = lambda x, y, z: ((z >= 22) & (z < 25) & (x >= 9) & (x < 23) & (y >= 9) & (y < 23)) * 1.0
-    probe = Zone(res)
-    solid = lib.dense(probe, plate).astype(bool)
-    zone = sparse_zone(obstacle=lib.dense(probe, plate))
+    zone = sparse_zone(colliders=plate_colliders(22, 0.0))
     obj = lib.build_object("plate", [zone])
     (start,), _ = lib.evaluate(obj, [zone], 1)
     (end,), names = lib.run_frames(obj, [zone], 2, 13)
     print(f"  sparse solver: {sparse_note(obj)}")
-    check(names == sorted(lib.GRID_NAMES + ("obstacle",)), f"unexpected grids: {names}")
+    check(names == sorted(lib.GRID_NAMES), f"unexpected grids: {names}")
     check(not errors(obj), f"unexpected node errors: {errors(obj)}")
+    solid = plate_mask(zone, 22)
     check(np.abs(end["density"][solid]).max() == 0.0, "smoke entered the obstacle")
+    above = lib.as_grid(zone, end["density"])[25:, 11:21, 11:21].sum()
+    check(above < 0.25 * lib.as_grid(zone, start["density"]).sum(), "the plate did not shelter the space above it")
     mass_ratio = float(end["density"].sum() / start["density"].sum())
     check(abs(mass_ratio - 1.0) < 1.0e-3, f"density mass changed by a factor of {mass_ratio:.5f}")
+
+
+def test_sparse_gpu_moving_collider(_work):
+    lib.reset_scene()
+    still = {"Heat Buoyancy": 0.0, "Density Buoyancy": 0.0}
+    zone = sparse_zone(colliders=plate_colliders(10, 30.0), **still)
+    obj = lib.build_object("moving", [zone])
+    (start,), _ = lib.evaluate(obj, [zone], 1)
+    (end,), _ = lib.run_frames(obj, [zone], 2, 9)
+    print(f"  sparse solver: {sparse_note(obj)}")
+    check(not errors(obj), f"unexpected node errors: {errors(obj)}")
+    # At frame 9 the plate's bottom is at voxel 18.
+    check(np.abs(end["density"][plate_mask(zone, 18)]).max() == 0.0, "smoke inside the moving plate")
+    grid = lib.as_grid(zone, end["velocity"])
+    face = grid[18, 9:23, 9:23, 2]
+    check(np.abs(face - 30.0 * zone.voxel).max() < 1.0e-4, "the plate's faces do not move with it")
+    rise = center_of_mass_z(zone, end["density"]) - center_of_mass_z(zone, start["density"])
+    check(rise > 0.3, f"the moving plate did not push the smoke (rose {rise:.3f})")
+
+
+def test_sparse_gpu_sources(_work):
+    lib.reset_scene()
+    still = {"Heat Buoyancy": 0.0, "Density Buoyancy": 0.0}
+
+    def sphere(level):
+        def build(b, zone):
+            x, y, z = lib.voxel_coords(b, zone)
+            d2 = b.math("ADD", b.math("ADD", b.math("POWER", b.math("SUBTRACT", x, 16.0), 2.0),
+                                      b.math("POWER", b.math("SUBTRACT", y, 16.0), 2.0)),
+                        b.math("POWER", b.math("SUBTRACT", z, 12.0), 2.0))
+            value = b.math("MULTIPLY", b.math("LESS_THAN", d2, 9.5), level)
+            return lib.grid_volume(b, zone, [("density", "FLOAT", value),
+                                             ("temperature", "FLOAT", value)])
+        return build
+
+    res = (32, 32, 48)
+    probe = Zone(res)
+    inside = lib.dense(probe, lambda x, y, z: ((x - 16) ** 2 + (y - 16) ** 2 + (z - 12) ** 2 < 9.5) * 1.0)
+
+    def run(add):
+        lib.reset_scene()
+        zone = Zone(res, prefix="", sources=sphere(0.8), **{"Sparse GPU": True, "CFL": 6.0,
+                                                             "Add Sources": add, **still})
+        empty = np.zeros(zone.cells, dtype=np.float32)
+        lib.make_data_object("empty_data", zone, density=empty, temperature=empty)
+        obj = lib.build_object("emit", [zone])
+        (end,), _ = lib.run_frames(obj, [zone], 1, 7)
+        check(not errors(obj), f"unexpected node errors: {errors(obj)}")
+        print(f"  sparse solver: {sparse_note(obj)}")
+        return end
+
+    raised = run(False)
+    worst = np.abs(raised["density"] - 0.8 * inside).max()
+    check(worst < 1.0e-6, f"raising did not reach the source's level (off by {worst})")
+    added = run(True)
+    expected = 0.8 * inside.sum() * 6.0 / 30.0
+    total = float(added["density"].sum())
+    check(abs(total / expected - 1.0) < 1.0e-3, f"adding gave {total}, expected {expected}")
+
+
+def test_sparse_gpu_turbulence(_work):
+    def run(strength):
+        lib.reset_scene()
+        zone = sparse_zone(**{"Turbulence": strength, "Turbulence Scale": 0.5})
+        obj = lib.build_object("stir", [zone])
+        (start,), _ = lib.evaluate(obj, [zone], 1)
+        (end,), _ = lib.run_frames(obj, [zone], 2, 13)
+        check(not errors(obj), f"unexpected node errors: {errors(obj)}")
+        for name in lib.GRID_NAMES:
+            check(np.isfinite(end[name]).all(), f"{name} is not finite")
+        print(f"  sparse solver: {sparse_note(obj)}")
+        return start, end
+
+    _, calm = run(0.0)
+    start, stirred = run(150.0 * 0.0625)
+    change = np.linalg.norm(stirred["density"] - calm["density"]) / np.linalg.norm(calm["density"])
+    print(f"  turbulence changed the density by {change:.3f} (relative L2)")
+    check(change > 0.05, "turbulence made no visible difference")
+    mass_ratio = float(stirred["density"].sum() / start["density"].sum())
+    check(abs(mass_ratio - 1.0) < 1.0e-3, f"density mass changed by a factor of {mass_ratio:.5f}")
+
+
+def test_sparse_gpu_keeps_state(_work):
+    def run(zones, last):
+        notes = []
+        obj = lib.build_object("kept", zones)
+        lib.evaluate(obj, zones, 1)
+        result = None
+        for frame in range(2, last + 1):
+            result, _ = lib.evaluate(obj, zones, frame)
+            notes.append([m for k, m in lib.warnings(obj) if k != "ERROR"])
+        check(not errors(obj), f"unexpected node errors: {errors(obj)}")
+        return result, notes
+
+    lib.reset_scene()
+    alone, notes = run([sparse_zone(prefix="a_")], 10)
+    print(f"  frame 2: {notes[0]}; frame 10: {notes[-1]}")
+    if any("ran on the CPU" in m for m in notes[-1]):
+        print("  no Vulkan device: nothing is kept on a GPU")
+        return
+    check(all("state uploaded" in m for m in notes[0]), "the first step should upload")
+    check(all(any("kept on the GPU" in m for m in frame) for frame in notes[1:]),
+          "the state was not kept on the GPU between frames")
+
+    # A second zone with another resolution runs in between, on its own solver.
+    lib.reset_scene()
+    together, _ = run([sparse_zone(prefix="a_"), sparse_zone(prefix="b_", res=(24, 24, 40))], 10)
+    for name in lib.GRID_NAMES:
+        check(np.array_equal(together[0][name], alone[0][name]),
+              f"{name} changed when another zone ran in between")
 
 
 TESTS = [
@@ -454,6 +582,10 @@ TESTS = [
     test_matches_legacy_solver,
     test_sparse_gpu_advances_and_rises,
     test_sparse_gpu_obstacle,
+    test_sparse_gpu_moving_collider,
+    test_sparse_gpu_sources,
+    test_sparse_gpu_turbulence,
+    test_sparse_gpu_keeps_state,
 ]
 
 

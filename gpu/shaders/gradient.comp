@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-// Subtract the pressure gradient from every face that borders a fluid cell.
+// Subtract the pressure gradient from every face that borders a fluid cell. Faces touching a
+// solid keep the obstacle velocity the walls kernel gave them.
 #version 450
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
@@ -17,7 +18,7 @@ float corrected(float face, uint here, float upper, ivec3 below)
 {
   uint lower_type = type_at(below);
   if (here == CELL_SOLID || lower_type == CELL_SOLID) {
-    return 0.0;
+    return face;
   }
   if (here == CELL_FLUID || lower_type == CELL_FLUID) {
     return face - (upper - pressure_at(below));

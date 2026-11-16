@@ -25,9 +25,11 @@
 #include "mg_dense_cycle.comp.h"
 #include "divergence.comp.h"
 #include "gradient.comp.h"
+#include "inject.comp.h"
 #include "jacobi.comp.h"
 #include "maccormack.comp.h"
 #include "remap.comp.h"
+#include "turbulence.comp.h"
 #include "walls.comp.h"
 
 #include <algorithm>
@@ -102,7 +104,7 @@ struct SparseGasGpu::Impl {
   Compute compute;
   int advect, maccormack, buoyancy, walls, divergence, jacobi, gradient, activity, remap, classify;
   int classify_links, mask_pressure, mg_smooth0, mg_restrict0, mg_smooth, mg_residual, copy3, reflect;
-  int conserve_reduce, conserve_apply;
+  int conserve_reduce, conserve_apply, inject, turbulence;
   int mg_restrict, mg_prolong0, mg_prolong, mg_build0, mg_build, mg_dense_cycle;
 
   /** One coarse multigrid level on the device. */
@@ -129,6 +131,15 @@ struct SparseGasGpu::Impl {
   Compute::Buffer obstacle;
   /** Sums of each MacCormack work group for conserve_mass, after the factor they produce. */
   Compute::Buffer partials;
+  /** Sources applied at the start of each step: a table per domain brick and the values. */
+  Compute::Buffer source_table, source_values;
+  int source_channels = 0, source_stride = 0, source_mode = 0;
+  /** Domain bricks holding a source; they stay active. */
+  std::vector<std::int32_t> source_bricks;
+  /** Velocity of the obstacles, laid out like the sources. */
+  Compute::Buffer motion_table, motion_values;
+  int motion_stride = 0;
+  bool obstacles_move = false;
 
   sparse::Topology topology;
   Compute::Buffer table, coords, types, slot_map, flags, speeds;
@@ -162,6 +173,8 @@ struct SparseGasGpu::Impl {
     reflect = KERNEL(reflect);
     conserve_reduce = KERNEL(conserve_reduce);
     conserve_apply = KERNEL(conserve_apply);
+    inject = KERNEL(inject);
+    turbulence = KERNEL(turbulence);
     mg_residual = KERNEL(mg_residual);
     mg_smooth = KERNEL(mg_smooth);
     mg_restrict = KERNEL(mg_restrict);
@@ -175,7 +188,7 @@ struct SparseGasGpu::Impl {
 
   ~Impl()
   {
-    for (Compute::Buffer *buffer : {&table, &coords, &types, &slot_map, &flags, &speeds, &links, &bounds, &obstacle, &partials,
+    for (Compute::Buffer *buffer : {&table, &coords, &types, &slot_map, &flags, &speeds, &links, &bounds, &obstacle, &partials, &source_table, &source_values, &motion_table, &motion_values,
                                     &dense_op,
                                     &dense_values, &dense_rhs, &dense_residual, &dense_table})
     {
@@ -499,6 +512,35 @@ struct SparseGasGpu::Impl {
   }
 
   /** Dispatch a stencil kernel with the topology tables at bindings 1-3 and channels after. */
+  /**
+   * Upload a brick field's table and values (channel after channel) into two buffers; returns
+   * the values per channel. Must be called outside recording; the upload itself is recorded.
+   */
+  int reserve_field(const sparse::BrickField &field, Compute::Buffer &table_buffer,
+                    Compute::Buffer &values_buffer)
+  {
+    ensure(table_buffer, std::max<std::size_t>(1, field.table.size()) * sizeof(std::int32_t));
+    std::size_t values = 0;
+    for (const std::vector<float> &channel : field.channels) {
+      values += channel.size();
+    }
+    ensure(values_buffer, std::max<std::size_t>(1, values) * sizeof(float));
+    return field.channels.empty() ? 0 : static_cast<int>(field.channels.front().size());
+  }
+  void record_field(const sparse::BrickField &field, Compute::Buffer &table_buffer,
+                    Compute::Buffer &values_buffer)
+  {
+    if (field.empty()) {
+      return;
+    }
+    compute.upload(table_buffer, field.table.data(), field.table.size() * sizeof(std::int32_t));
+    std::vector<float> packed;
+    for (const std::vector<float> &channel : field.channels) {
+      packed.insert(packed.end(), channel.begin(), channel.end());
+    }
+    compute.upload(values_buffer, packed.data(), packed.size() * sizeof(float));
+  }
+
   void stencil(const int kernel,
                const char *label,
                const Params &p,
@@ -578,17 +620,70 @@ void SparseGasGpu::upload(const sparse::State &state)
   g.topology.cell_type.clear();
   const std::vector<std::uint32_t> &mask = g.topology.obstacle;
   g.ensure(g.obstacle, std::max<std::size_t>(1, mask.size()) * sizeof(std::uint32_t));
+  g.motion_stride = g.reserve_field(state.obstacle_velocity, g.motion_table, g.motion_values);
+  g.obstacles_move = !state.obstacle_velocity.empty();
 
   g.compute.begin();
   if (!mask.empty()) {
     g.compute.upload(g.obstacle, mask.data(), mask.size() * sizeof(std::uint32_t));
   }
+  g.record_field(state.obstacle_velocity, g.motion_table, g.motion_values);
   g.record_topology_upload();
   const std::vector<float> *channels[StateChannels] = {
       &state.density, &state.temperature, &state.u, &state.v, &state.w, &state.pressure};
   for (int i = 0; i < StateChannels; ++i) {
     g.compute.upload(g.channel(i), channels[i]->data(), count * sizeof(float));
   }
+  g.compute.submit();
+}
+
+void SparseGasGpu::set_obstacles(std::vector<std::uint32_t> mask, sparse::BrickField velocity)
+{
+  Impl &g = *impl_;
+  if (!velocity.empty() && velocity.table.size() != g.topology.brick_table.size()) {
+    throw std::invalid_argument("The obstacle velocity does not match the state's brick grid");
+  }
+  g.topology.obstacle = std::move(mask);
+  const std::vector<std::uint32_t> &stored = g.topology.obstacle;
+  g.ensure(g.obstacle, std::max<std::size_t>(1, stored.size()) * sizeof(std::uint32_t));
+  g.motion_stride = g.reserve_field(velocity, g.motion_table, g.motion_values);
+  g.obstacles_move = !velocity.empty();
+  if (g.topology.voxel_count() == 0 && stored.empty() && !g.obstacles_move) {
+    return;
+  }
+  g.compute.begin();
+  if (!stored.empty()) {
+    g.compute.upload(g.obstacle, stored.data(), stored.size() * sizeof(std::uint32_t));
+  }
+  g.record_field(velocity, g.motion_table, g.motion_values);
+  if (g.topology.voxel_count() > 0) {
+    g.record_topology_upload();
+  }
+  g.compute.submit();
+}
+
+void SparseGasGpu::use_sources(const sparse::Sources *sources)
+{
+  Impl &g = *impl_;
+  g.source_bricks.clear();
+  g.source_channels = 0;
+  if (!sources || sources->field.empty()) {
+    return;
+  }
+  const sparse::BrickField &field = sources->field;
+  if (field.channels.size() != 2 && field.channels.size() != 5) {
+    throw std::invalid_argument("Sources have density and temperature, and optionally velocity");
+  }
+  g.source_stride = g.reserve_field(field, g.source_table, g.source_values);
+  g.source_channels = static_cast<int>(field.channels.size());
+  g.source_mode = sources->mode == sparse::SourceMode::Add ? 1 : 0;
+  for (std::size_t brick = 0; brick < field.table.size(); ++brick) {
+    if (field.table[brick] >= 0) {
+      g.source_bricks.push_back(static_cast<std::int32_t>(brick));
+    }
+  }
+  g.compute.begin();
+  g.record_field(field, g.source_table, g.source_values);
   g.compute.submit();
 }
 
@@ -614,13 +709,19 @@ void SparseGasGpu::download(sparse::State &state)
   g.compute.submit();
 }
 
-sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings)
+sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings,
+                                    const sparse::Sources *sources)
 {
+  use_sources(sources);
   return impl_step(settings, nullptr);
 }
 
-sparse::FrameInfo SparseGasGpu::advance(const sparse::Settings &settings, const float frame_time)
+sparse::FrameInfo SparseGasGpu::advance(const sparse::Settings &settings,
+                                        const float frame_time,
+                                        const sparse::Sources *sources)
 {
+  use_sources(sources);
+  sparse::Settings substep = settings;
   sparse::FrameInfo frame;
   Timing total;
   total.gpu_ms = 0.0;
@@ -629,7 +730,9 @@ sparse::FrameInfo SparseGasGpu::advance(const sparse::Settings &settings, const 
     if (frame.substeps >= settings.max_substeps) {
       throw std::runtime_error("The sparse solver exhausted its substep limit");
     }
-    frame.last_step = impl_step(settings, &remaining);
+    /* As sparse::advance: the turbulence pattern follows the substeps' time. */
+    substep.time = settings.time + (frame_time - remaining);
+    frame.last_step = impl_step(substep, &remaining);
     frame.max_speed = std::max(frame.max_speed, impl_->last_speed);
     remaining -= frame.last_step.dt;
     ++frame.substeps;
@@ -720,6 +823,9 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
       brick_flags[static_cast<std::size_t>(old_topology.brick_coords[slot * 4 + 3])] = 1;
     }
   }
+  for (const std::int32_t brick : g.source_bricks) {
+    brick_flags.at(static_cast<std::size_t>(brick)) = 1;
+  }
   sparse::Topology next = sparse::build_topology(
       old_topology.extent, old_topology.brick_size, brick_flags, settings.dilation, false,
       old_topology.obstacle);
@@ -806,6 +912,16 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
   }
 
   if (count > 0) {
+    {
+      /* Clear the scalars of solid cells, then emit. Mirrors inject in the CPU reference. */
+      Params p = g.params(dt, 0, 0, 0);
+      const bool emit = g.source_channels > 0;
+      p.flags[0] = g.source_mode;
+      p.flags[1] = g.source_channels;
+      p.flags[2] = g.source_stride;
+      g.stencil(g.inject, "inject", p, Density, Temperature, U, V, W, -1,
+                emit ? &g.source_table : nullptr, emit ? &g.source_values : nullptr);
+    }
     const float offsets[5][3] = {{0.5f, 0.5f, 0.5f},
                                  {0.5f, 0.5f, 0.5f},
                                  {0.0f, 0.5f, 0.5f},
@@ -856,7 +972,25 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
       };
       buoyancy(Temperature, settings.heat_buoyancy);
       buoyancy(Density, settings.density_buoyancy);
-      g.stencil(g.walls, "walls", g.params(0, 0, 0, 0), U, V, W);
+      const sparse::Turbulence &noise = settings.turbulence;
+      if (noise.strength != 0.0f) {
+        int slice = 0;
+        float blend = 0.0f;
+        sparse::turbulence_time(noise, settings.time, slice, blend);
+        Params p = g.params(noise.strength * step, 1.0f / noise.scale, blend, noise.mask_level);
+        const bool masked = noise.mask != sparse::TurbulenceMask::None;
+        p.flags[0] = static_cast<std::int32_t>(noise.seed);
+        p.flags[1] = masked ? 1 : 0;
+        p.flags[2] = slice;
+        g.stencil(g.turbulence, "turbulence", p, U, V, W,
+                  noise.mask == sparse::TurbulenceMask::Temperature ? Temperature : Density);
+      }
+      Params walls = g.params(0, 0, 0, 0);
+      walls.flags[0] = g.obstacles_move ? 1 : 0;
+      walls.flags[1] = g.motion_stride;
+      g.stencil(g.walls, "walls", walls, U, V, W, -1, -1, -1,
+                g.obstacles_move ? &g.motion_table : nullptr,
+                g.obstacles_move ? &g.motion_values : nullptr);
     };
     const auto project = [&]() {
       const int rhs = StateChannels, next_pressure = StateChannels + 1;

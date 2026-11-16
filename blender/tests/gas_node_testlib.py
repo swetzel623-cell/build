@@ -32,6 +32,9 @@ class Zone:
         # Resolution of the initial grids; None means the node's own resolution.
         self.init_res = params.pop("init_res", None)
         self.readback = params.pop("readback", True)
+        # Callables (builder, zone) -> volume socket for the node's Sources and Colliders.
+        self.sources = params.pop("sources", None)
+        self.colliders = params.pop("colliders", None)
         self.params = params
         self.data_object = None
 
@@ -53,20 +56,15 @@ def reset_scene(fps=30, frame_end=250):
     return scene
 
 
-def make_data_object(name, zone, density=None, temperature=None, velocity=None, obstacle=None):
-    """Create a mesh whose vertices carry one dense initial-state sample per voxel (X fastest).
-
-    With `obstacle`, the initial state also gets a float grid named "obstacle".
-    """
+def make_data_object(name, zone, density=None, temperature=None, velocity=None):
+    """Create a mesh whose vertices carry one dense initial-state sample per voxel (X fastest)."""
     count = zone.cells
     mesh = bpy.data.meshes.new(name)
     mesh.vertices.add(count)
-    zone.has_obstacle = obstacle is not None
     for attr, kind, values, width in (
         ("density", "FLOAT", density, 1),
         ("temperature", "FLOAT", temperature, 1),
         ("velocity", "FLOAT_VECTOR", velocity, 3),
-        ("obstacle", "FLOAT", obstacle, 1),
     ):
         layer = mesh.attributes.new(attr, kind, "POINT")
         array = np.zeros(count * width, dtype=np.float32)
@@ -154,10 +152,7 @@ def _initial_state(b, zone):
     index = b.voxel_index(position, o, v, r)
 
     volume = None
-    names = ["density", "temperature", "velocity"]
-    if getattr(zone, "has_obstacle", False):
-        names.append("obstacle")
-    for name in names:
+    for name in ("density", "temperature", "velocity"):
         vector = name == "velocity"
         kind = "FLOAT_VECTOR" if vector else "FLOAT"
         sock = "VECTOR" if vector else "FLOAT"
@@ -185,6 +180,61 @@ def _initial_state(b, zone):
     return volume
 
 
+def grid_volume(b, zone, items):
+    """Volume on the zone's own voxels with one grid per (name, kind, value) item.
+
+    `kind` is "FLOAT" or "VECTOR"; `value` is a constant or a field socket, evaluated at the
+    voxel positions (b.voxel_coords gives integer voxel coordinates as a field).
+    """
+    topology = b.new("GeometryNodeCubeGridTopology")
+    o, v, r = zone.origin, zone.voxel, zone.res
+    topology.inputs["Bounds Min"].default_value = o
+    topology.inputs["Bounds Max"].default_value = tuple(o[i] + v * r[i] for i in range(3))
+    for axis, count in zip("XYZ", r):
+        topology.inputs["Resolution " + axis].default_value = count
+    volume = None
+    for name, kind, value in items:
+        to_grid = b.new("GeometryNodeFieldToGrid", data_type=kind)
+        to_grid.grid_items.clear()
+        to_grid.grid_items.new(kind, "Value")
+        b.link(topology.outputs["Topology"], to_grid.inputs["Topology"])
+        b.set(to_grid.inputs["Value"], value)
+        store = b.new("GeometryNodeStoreNamedGrid",
+                      data_type="FLOAT" if kind == "FLOAT" else "VECTOR_FLOAT")
+        store.inputs["Name"].default_value = name
+        b.link(to_grid.outputs["Value"], store.inputs["Grid"])
+        if volume is not None:
+            b.link(volume, store.inputs["Volume"])
+        volume = store.outputs["Volume"]
+    return volume
+
+
+def voxel_coords(b, zone):
+    """Field of the voxel coordinates (rounded) of each grid voxel's position, as x, y, z sockets."""
+    position = b.new("GeometryNodeInputPosition").outputs[0]
+    sub = b.new("ShaderNodeVectorMath", operation="SUBTRACT")
+    b.link(position, sub.inputs[0])
+    sub.inputs[1].default_value = zone.origin
+    scale = b.new("ShaderNodeVectorMath", operation="SCALE")
+    b.link(sub.outputs[0], scale.inputs[0])
+    scale.inputs["Scale"].default_value = 1.0 / zone.voxel
+    sep = b.new("ShaderNodeSeparateXYZ")
+    b.link(scale.outputs[0], sep.inputs[0])
+    return tuple(b.math("ROUND", sep.outputs[i]) for i in range(3))
+
+
+def box_field(b, zone, lo, hi):
+    """1.0 inside the voxel box lo <= (x, y, z) < hi, else 0.0. Bounds may be sockets."""
+    coords = voxel_coords(b, zone)
+    inside = None
+    for axis in range(3):
+        above = b.math("GREATER_THAN", coords[axis], b.math("SUBTRACT", lo[axis], 0.5))
+        below = b.math("LESS_THAN", coords[axis], b.math("SUBTRACT", hi[axis], 0.5))
+        term = b.math("MULTIPLY", above, below)
+        inside = term if inside is None else b.math("MULTIPLY", inside, term)
+    return inside
+
+
 def _zone(b, zone, initial):
     sim_in = b.new("GeometryNodeSimulationInput")
     sim_out = b.new("GeometryNodeSimulationOutput")
@@ -203,6 +253,12 @@ def _zone(b, zone, initial):
     for key, value in zone.params.items():
         socket = gas.inputs[key]
         socket.default_value = bool(value) if socket.type == "BOOLEAN" else value
+    if "Time" in gas.inputs and "Time" not in zone.params:
+        b.link(b.new("GeometryNodeInputSceneTime").outputs["Seconds"], gas.inputs["Time"])
+    if zone.sources is not None:
+        b.link(zone.sources(b, zone), gas.inputs["Sources"])
+    if zone.colliders is not None:
+        b.link(zone.colliders(b, zone), gas.inputs["Colliders"])
     b.link(gas.outputs["State"], sim_out.inputs["Geometry"])
 
     diag = b.new("GeometryNodePoints").outputs[0]

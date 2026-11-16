@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: MIT
+// The turbulence force on faces between two fluid cells. Mirrors add_turbulence in the CPU
+// reference, operation for operation.
+// P.a = (strength * dt, 1 / scale, blend between the time slices, mask level);
+// P.flags = (seed, 1 if MASK scales the force, first time slice, unused).
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#define U b4
+#define V b5
+#define W b6
+#define MASK b7
+
+uint mix_hash(uint x)
+{
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  x *= 0x846ca68bu;
+  x ^= x >> 16;
+  return x;
+}
+
+uint corner_hash(ivec3 c, uint seed)
+{
+  return mix_hash((uint(c.x) * 0x8da6b343u) ^
+                  mix_hash((uint(c.y) * 0xd8163841u) ^ mix_hash((uint(c.z) * 0xcb1ab31fu) ^ seed)));
+}
+
+float gradient_dot(uint hash, vec3 t)
+{
+  switch (hash % 12u) {
+    case 0u: return t.x + t.y;
+    case 1u: return -t.x + t.y;
+    case 2u: return t.x - t.y;
+    case 3u: return -t.x - t.y;
+    case 4u: return t.x + t.z;
+    case 5u: return -t.x + t.z;
+    case 6u: return t.x - t.z;
+    case 7u: return -t.x - t.z;
+    case 8u: return t.y + t.z;
+    case 9u: return -t.y + t.z;
+    case 10u: return t.y - t.z;
+    default: return -t.y - t.z;
+  }
+}
+
+float fade(float t)
+{
+  return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+float mixf(float a, float b, float t)
+{
+  return a + (b - a) * t;
+}
+
+float corner(ivec3 i, vec3 t, ivec3 d, uint seed)
+{
+  return gradient_dot(corner_hash(i + d, seed), t - vec3(d));
+}
+
+float gradient_noise(vec3 p, uint seed)
+{
+  vec3 f = floor(p);
+  ivec3 i = ivec3(f);
+  vec3 t = p - f;
+  float ux = fade(t.x), uy = fade(t.y), uz = fade(t.z);
+  float x00 = mixf(corner(i, t, ivec3(0, 0, 0), seed), corner(i, t, ivec3(1, 0, 0), seed), ux);
+  float x10 = mixf(corner(i, t, ivec3(0, 1, 0), seed), corner(i, t, ivec3(1, 1, 0), seed), ux);
+  float x01 = mixf(corner(i, t, ivec3(0, 0, 1), seed), corner(i, t, ivec3(1, 0, 1), seed), ux);
+  float x11 = mixf(corner(i, t, ivec3(0, 1, 1), seed), corner(i, t, ivec3(1, 1, 1), seed), ux);
+  return mixf(mixf(x00, x10, uy), mixf(x01, x11, uy), uz);
+}
+
+float potential(int k, vec3 q)
+{
+  uint channel = mix_hash(uint(P.flags.x) ^ (uint(k) * 0x9e3779b9u));
+  float a = gradient_noise(q, channel ^ mix_hash(uint(P.flags.z)));
+  float b = gradient_noise(q, channel ^ mix_hash(uint(P.flags.z + 1)));
+  return mixf(a, b, P.a.z);
+}
+
+float curl(int axis, vec3 q)
+{
+  const float h = 0.125;
+  int b = (axis + 1) % 3, c = (axis + 2) % 3;
+  vec3 eb = vec3(0.0), ec = vec3(0.0);
+  eb[b] = h;
+  ec[c] = h;
+  float d_c_along_b = potential(c, q + eb) - potential(c, q - eb);
+  float d_b_along_c = potential(b, q + ec) - potential(b, q - ec);
+  return (d_c_along_b - d_b_along_c) / (2.0 * h);
+}
+
+float face_force(ivec3 c, int index, int axis)
+{
+  ivec3 below = c;
+  below[axis] -= 1;
+  if (type_at(below) != CELL_FLUID) {
+    return 0.0;
+  }
+  float weight = 1.0;
+  if (P.flags.y != 0) {
+    float value = 0.5 * (MASK[index] + MASK[index_of(below)]);
+    weight = min(max(value / P.a.w, 0.0), 1.0);
+  }
+  vec3 p = vec3(c) + vec3(axis == 0 ? 0.0 : 0.5, axis == 1 ? 0.0 : 0.5, axis == 2 ? 0.0 : 0.5);
+  return P.a.x * curl(axis, p * P.a.y) * weight;
+}
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index) || cell_type[index] != CELL_FLUID) {
+    return;
+  }
+  ivec3 c = coords_of(index);
+  U[index] += face_force(c, index, 0);
+  V[index] += face_force(c, index, 1);
+  W[index] += face_force(c, index, 2);
+}

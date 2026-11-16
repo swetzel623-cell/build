@@ -801,6 +801,12 @@ disturbance, which changes how the smoke moves (detail upres noise comes later).
   `Turbulence Mask` and `Time` inputs. Not yet timed on a real GPU: each voxel evaluates 24
   noise lookups per step when it is on.
 
+**Smoke Simulation modifier.** Stage 3: Add Modifier > Physics > Smoke Simulation on any mesh,
+built from Smoke Source and Smoke Collider node groups around the Gas Simulation Step node, and
+installed into the build's Essentials asset library (see `blender/README.md`). In-Blender tests
+on llvmpipe: smoke rises from an emitter, a moving emitter leaves a trail in world space, and a
+plate in the Colliders collection holds the smoke's top at 0.70 against 1.00 without it.
+
 ## Not verified, and known gaps
 
 - **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.
@@ -837,10 +843,9 @@ disturbance, which changes how the smoke moves (detail upres noise comes later).
 
 ## Next steps
 
-1. The plan agreed for Blender: a Smoke Simulation modifier with separate Smoke nodes, copying only the blocks with smoke between OpenVDB and the bricks while keeping
-   the state on the GPU between frames, then detail (upres) noise.
-2. Advect density and temperature in one pass: they share their departure points.
-3. Measure multigrid at larger sizes, where dispatch overhead should matter less.
-4. Compare with the Mantaflow engine on a case where the active region covers the domain.
-5. Resolve the Blender GPU-context question, then port the driver to Blender's GPU module behind
-   the existing node, with the CPU reference as fallback.
+1. Stage 4 of the plan agreed for Blender: copy only the blocks with smoke between OpenVDB and
+   the bricks, and keep the state on the GPU between frames.
+2. Stage 5: detail (upres) noise. Stage 6: compare with Mantaflow, defaults, a user guide and a
+   GitHub Release.
+3. Advect density and temperature in one pass: they share their departure points.
+4. Measure multigrid at larger sizes, where dispatch overhead should matter less.

@@ -36,6 +36,44 @@ The sparse solver's GPU kernels are compiled when CMake finds the Vulkan headers
 when it found both. Blender links no Vulkan library for them: the loader (`vulkan-1.dll`,
 `libvulkan.so.1`) is opened when the node first needs a device.
 
+## Smoke Simulation modifier
+
+`blender/assets/smoke_assets.py` builds three node-group assets and installs them into a Blender
+build's own Essentials library (`datafiles/assets/nodes/smoke_simulation_assets.blend`, plus two
+catalogs in `blender_assets.cats.txt`):
+
+```sh
+blender -b --factory-startup --python blender/assets/smoke_assets.py
+```
+
+The Windows build workflow runs it, so its zip already has them.
+
+- **Add Modifier > Physics > Smoke Simulation** turns the selected mesh into a smoke emitter.
+  Its panels: Emission (density, temperature, adding instead of raising, an optional velocity),
+  Domain (voxel size, domain size, a Colliders collection), Forces (buoyancy, gravity),
+  Turbulence, Solver (GPU on or off, CFL, substeps) and Display (keep the emitter visible).
+  - The simulation runs in world space. The domain is centred on the emitter on the first frame
+    of the simulation, its floor a tenth of its height below the emitter, and stays there: give
+    a moving emitter a domain that covers its path. Only bricks with smoke cost anything.
+  - Colliders may be animated: their velocity comes from how far their points moved since the
+    previous frame.
+  - Turning the GPU off runs Mantaflow, which does not support emission, colliders or
+    turbulence, so nothing appears.
+- **Add > Simulation > Smoke Source** and **Smoke Collider** (node editor) turn a mesh into the
+  `Sources` and `Colliders` volumes of the Gas Simulation Step node, for setups built by hand.
+  Open the Smoke Simulation group (Tab) to see how they are wired.
+
+`blender/tests/smoke_modifier_tests.py` checks the installed assets (catalogs once, the modifier
+trait that Add Modifier filters on), smoke rising from an emitter, a moving emitter leaving a
+trail in world space, and a collider collection holding the smoke back:
+
+```sh
+blender -b --factory-startup --python blender/tests/smoke_modifier_tests.py
+```
+
+Adding the modifier from the menu cannot be exercised in background mode, where the asset
+library does not load; the test checks the metadata the menu reads instead.
+
 ## Sparse GPU mode
 
 With the `Sparse GPU` input on, the node runs this repository's sparse brick-grid solver instead
@@ -71,7 +109,7 @@ of Mantaflow (see `docs/gpu-sparse-solver.md`):
   CPU reference instead (single-threaded and slow) and says so in a warning.
 
 `blender/tests/make_sparse_demo.py` writes a demo file with two plumes in their own zones, one
-rising into a plate given through `Colliders`:
+under a plate, both with the Smoke Simulation modifier:
 
 ```sh
 blender -b --factory-startup --python blender/tests/make_sparse_demo.py -- sparse_gpu_demo.blend

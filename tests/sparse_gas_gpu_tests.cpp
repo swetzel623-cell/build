@@ -259,6 +259,9 @@ int coarse_pre_sweeps = -1, coarse_post_sweeps = -1;
 int midpoint = -1;
 int reflection = -1;
 int conserve = -1;
+/** Turbulence strength in voxels per second squared; masked by density with --turbulence-mask. */
+float turbulence = 0.0f;
+bool turbulence_mask = false;
 std::string image_name;
 
 sparse::Settings test_settings(const int resolution)
@@ -278,6 +281,17 @@ sparse::Settings test_settings(const int resolution)
   }
   if (conserve >= 0) {
     settings.conserve_mass = conserve != 0;
+  }
+  if (turbulence != 0.0f) {
+    settings.turbulence.strength = turbulence;
+    settings.turbulence.scale = resolution / 4.0f;
+    settings.turbulence.speed = 2.0f;
+    settings.turbulence.seed = 7;
+    settings.turbulence.mask = sparse::TurbulenceMask::None;
+    if (turbulence_mask) {
+      settings.turbulence.mask = sparse::TurbulenceMask::Density;
+      settings.turbulence.mask_level = 0.2f;
+    }
   }
   if (first_order) {
     settings.advection = sparse::Advection::SemiLagrangian;
@@ -318,11 +332,13 @@ int compare(gpu::SparseGasGpu &solver, const int resolution, const int steps)
       sparse::set_obstacles_from_dense(cpu, moving_plate(extent, i, 1.0f / frame_time));
       solver.set_obstacles(cpu.topology.obstacle, cpu.obstacle_velocity);
     }
+    sparse::Settings now = settings;
+    now.time = static_cast<float>(i) * frame_time;
     auto start = std::chrono::steady_clock::now();
-    const sparse::FrameInfo cpu_frame = sparse::advance(cpu, settings, frame_time, emit);
+    const sparse::FrameInfo cpu_frame = sparse::advance(cpu, now, frame_time, emit);
     cpu_seconds += seconds_since(start);
     start = std::chrono::steady_clock::now();
-    const sparse::FrameInfo frame = solver.advance(settings, frame_time, emit);
+    const sparse::FrameInfo frame = solver.advance(now, frame_time, emit);
     const sparse::StepInfo &info = frame.last_step;
     device_seconds += seconds_since(start);
     if (cpu_frame.substeps != frame.substeps) {
@@ -392,7 +408,9 @@ int benchmark(gpu::SparseGasGpu &solver, const int resolution, const int steps, 
                            sparse::brick_field_from_dense(
                                extent, 8, {&plate.obstacle_u, &plate.obstacle_v, &plate.obstacle_w}));
     }
-    const sparse::FrameInfo frame = solver.advance(settings, frame_time, emit);
+    sparse::Settings now = settings;
+    now.time = static_cast<float>(i) * frame_time;
+    const sparse::FrameInfo frame = solver.advance(now, frame_time, emit);
     const sparse::StepInfo &info = frame.last_step;
     substeps += frame.substeps;
     const gpu::SparseGasGpu::Timing &timing = solver.last_timing();
@@ -484,6 +502,12 @@ int main(int argc, char **argv)
     else if (std::string(argv[i]) == "--obstacle") {
       with_obstacle = true;
     }
+    else if (std::string(argv[i]) == "--turbulence" && i + 1 < argc) {
+      turbulence = static_cast<float>(std::atof(argv[++i]));
+    }
+    else if (std::string(argv[i]) == "--turbulence-mask") {
+      turbulence_mask = true;
+    }
     else if (std::string(argv[i]) == "--empty") {
       empty_start = true;
     }
@@ -528,6 +552,7 @@ int main(int argc, char **argv)
             << (test_settings(resolution).reflection ? ", advection-reflection" : ", plain steps")
             << (with_obstacle ? ", plate obstacle" : "")
             << (with_moving ? ", moving plate" : "")
+            << (turbulence != 0.0f ? ", turbulence" : "")
             << (source_kind == 1 ? ", raising source" : source_kind == 2 ? ", adding source" : "")
             << (resync ? ", every frame started from the CPU state" : "") << '\n';
   std::cout << "Creating the Vulkan device...\n";

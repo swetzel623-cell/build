@@ -514,6 +514,28 @@ def test_sparse_gpu_sources(_work):
     check(abs(total / expected - 1.0) < 1.0e-3, f"adding gave {total}, expected {expected}")
 
 
+def test_sparse_gpu_turbulence(_work):
+    def run(strength):
+        lib.reset_scene()
+        zone = sparse_zone(**{"Turbulence": strength, "Turbulence Scale": 0.5})
+        obj = lib.build_object("stir", [zone])
+        (start,), _ = lib.evaluate(obj, [zone], 1)
+        (end,), _ = lib.run_frames(obj, [zone], 2, 13)
+        check(not errors(obj), f"unexpected node errors: {errors(obj)}")
+        for name in lib.GRID_NAMES:
+            check(np.isfinite(end[name]).all(), f"{name} is not finite")
+        print(f"  sparse solver: {sparse_note(obj)}")
+        return start, end
+
+    _, calm = run(0.0)
+    start, stirred = run(150.0 * 0.0625)
+    change = np.linalg.norm(stirred["density"] - calm["density"]) / np.linalg.norm(calm["density"])
+    print(f"  turbulence changed the density by {change:.3f} (relative L2)")
+    check(change > 0.05, "turbulence made no visible difference")
+    mass_ratio = float(stirred["density"].sum() / start["density"].sum())
+    check(abs(mass_ratio - 1.0) < 1.0e-3, f"density mass changed by a factor of {mass_ratio:.5f}")
+
+
 TESTS = [
     test_node_is_registered,
     test_zero_time_start_frame,
@@ -532,6 +554,7 @@ TESTS = [
     test_sparse_gpu_obstacle,
     test_sparse_gpu_moving_collider,
     test_sparse_gpu_sources,
+    test_sparse_gpu_turbulence,
 ]
 
 

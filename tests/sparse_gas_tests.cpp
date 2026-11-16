@@ -693,6 +693,106 @@ void test_moving_obstacle_pushes_smoke()
   require(rise > 0.5, "the moving plate did not push the smoke");
 }
 
+/** The turbulence force stirs without compressing, follows its seed and time, and its mask. */
+void test_turbulence_stirs()
+{
+  const Extent extent{32, 32, 48};
+  const DenseFields initial = blob(extent, 16.0f, 16.0f, 24.0f, 6.0f);
+  Settings settings;
+  settings.dilation = 1000; /* Every brick, so the mask has empty air to leave alone. */
+  const State start = from_dense(initial, 8, settings.thresholds, settings.dilation);
+  Turbulence turbulence;
+  turbulence.strength = 300.0f;
+  turbulence.scale = 8.0f;
+  turbulence.seed = 3;
+  turbulence.mask = TurbulenceMask::None;
+
+  const auto stirred = [&](const Turbulence &t, const float time) {
+    State state = start;
+    add_turbulence(state, t, time, 1.0f / 30.0f);
+    return state;
+  };
+  const auto difference = [](const State &a, const State &b) {
+    double result = 0.0;
+    for (std::size_t i = 0; i < a.u.size(); ++i) {
+      result = std::max({result, static_cast<double>(std::abs(a.u[i] - b.u[i])),
+                         static_cast<double>(std::abs(a.v[i] - b.v[i])),
+                         static_cast<double>(std::abs(a.w[i] - b.w[i]))});
+    }
+    return result;
+  };
+
+  const State once = stirred(turbulence, 0.0f);
+  const double magnitude = difference(once, start);
+  /* Away from the walls, where faces touching a wall get no push. */
+  std::vector<float> div;
+  divergence(once, div);
+  DenseFields div_dense = to_dense(once);
+  {
+    State probe = once;
+    probe.density = div;
+    div_dense = to_dense(probe);
+  }
+  float worst = 0.0f;
+  for (int z = 2; z < extent.z - 2; ++z) {
+    for (int y = 2; y < extent.y - 2; ++y) {
+      for (int x = 2; x < extent.x - 2; ++x) {
+        worst = std::max(worst, std::abs(div_dense.density[dense_index(extent, x, y, z)]));
+      }
+    }
+  }
+  std::cout << "  largest push " << magnitude << " voxels/s, largest divergence " << worst
+            << " 1/s" << std::endl;
+  require(magnitude > 1.0, "turbulence did not move the air");
+  /* A curl is divergence-free; differencing on the faces leaves a small part. */
+  require(worst < 0.25 * magnitude, "turbulence compresses the air");
+
+  require(difference(stirred(turbulence, 0.0f), once) == 0.0, "turbulence is not repeatable");
+  Turbulence other = turbulence;
+  other.seed = 4;
+  require(difference(stirred(other, 0.0f), once) > 0.5 * magnitude, "the seed changes nothing");
+  require(difference(stirred(turbulence, 0.5f), once) > 0.1 * magnitude,
+          "the pattern does not change over time");
+  Turbulence frozen = turbulence;
+  frozen.speed = 0.0f;
+  require(difference(stirred(frozen, 0.5f), stirred(frozen, 0.0f)) == 0.0,
+          "a frozen pattern changed over time");
+
+  /* Masked by density: faces of empty air keep their velocity. */
+  Turbulence masked = turbulence;
+  masked.mask = TurbulenceMask::Density;
+  masked.mask_level = 0.1f;
+  const State in_smoke = stirred(masked, 0.0f);
+  const DenseFields dense = to_dense(in_smoke);
+  float empty_push = 0.0f;
+  for (int z = 2; z < 6; ++z) {
+    for (int y = 2; y < 30; ++y) {
+      for (int x = 2; x < 30; ++x) {
+        const std::size_t i = dense_index(extent, x, y, z);
+        empty_push = std::max({empty_push, std::abs(dense.u[i]), std::abs(dense.v[i]),
+                               std::abs(dense.w[i])});
+      }
+    }
+  }
+  require(empty_push == 0.0f, "the density mask let turbulence move empty air");
+  require(difference(in_smoke, start) > 0.5 * magnitude, "the masked force vanished in smoke");
+
+  /* Through whole frames the total amount of smoke is still held. */
+  State state = from_dense(initial, 8, settings.thresholds, 1);
+  Settings stir = plume_settings();
+  stir.pressure_solver = PressureSolver::Multigrid;
+  stir.pressure_iterations = 6;
+  stir.turbulence = turbulence;
+  stir.turbulence.mask = TurbulenceMask::Density;
+  for (int frame = 0; frame < 6; ++frame) {
+    stir.time = static_cast<float>(frame) / 30.0f;
+    advance(state, stir, 1.0f / 30.0f);
+  }
+  const double kept = sum(to_dense(state).density) / sum(initial.density);
+  std::cout << "  mass kept after 6 stirred frames " << kept << std::endl;
+  require(std::abs(kept - 1.0) < 1.0e-3, "turbulence changed the amount of smoke");
+}
+
 }  // namespace
 
 int main()
@@ -713,6 +813,7 @@ int main()
       {"obstacle blocks the plume", test_obstacle_blocks_the_plume},
       {"sources emit", test_sources_emit},
       {"moving obstacle pushes smoke", test_moving_obstacle_pushes_smoke},
+      {"turbulence stirs", test_turbulence_stirs},
   };
   const char *only = std::getenv("SPARSE_GAS_TEST");
   for (const auto &[name, test] : tests) {

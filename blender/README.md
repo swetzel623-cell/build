@@ -53,6 +53,11 @@ of Mantaflow (see `docs/gpu-sparse-solver.md`):
 - `Colliders` takes a volume whose float grid `obstacle` marks solid voxels (above 0.5) and an
   optional vector grid `velocity` (world units per second) for their motion. It is read every
   frame, so an animated collider moves; smoke inside voxels that become solid is dropped.
+- `Turbulence` adds a swirling noise force (world units per second squared; compare it with
+  gravity times the buoyancy), with `Turbulence Scale` (swirl size), `Turbulence Speed`
+  (pattern changes per second), `Turbulence Seed`, and `Turbulence Mask`, the density at which it
+  reaches full strength (0 stirs all simulated air, which spreads the smoke through the domain).
+  Connect Scene Time's Seconds to `Time` so the pattern moves.
 - Grids in `Sources` and `Colliders` may use any transform: each active voxel goes to the
   nearest domain voxel, so a voxel size equal to the domain's gives the cleanest result. In
   Mantaflow mode both inputs are ignored with a warning.
@@ -193,7 +198,7 @@ blender -b --factory-startup --python blender/tests/gas_node_legacy_compare.py -
 blender -b --factory-startup --python blender/tests/gas_node_timings.py -- --res 32 64 96 128 --legacy
 ```
 
-`gas_node_runtime_tests.py` runs seventeen tests and exits non-zero on failure:
+`gas_node_runtime_tests.py` runs eighteen tests and exits non-zero on failure:
 
 | Test | What it establishes |
 | --- | --- |
@@ -214,6 +219,7 @@ blender -b --factory-startup --python blender/tests/gas_node_timings.py -- --res
 | sparse gpu obstacle | A plate in `Colliders` above the smoke: no smoke enters it, it shelters the space above, the density total is held. |
 | sparse gpu moving collider | A plate animated by the frame number rises through the smoke: no smoke inside it, its faces move at its velocity, the smoke is pushed up. |
 | sparse gpu sources | A sphere in `Sources` emits into an empty scene: raised values equal the source exactly, and with `Add Sources` the total matches the rate. |
+| sparse gpu turbulence | Turbulence visibly changes the plume (relative L2 above 0.05) and the density total is held. |
 
 ## Validation performed
 

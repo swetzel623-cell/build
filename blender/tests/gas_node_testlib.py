@@ -253,6 +253,8 @@ def _zone(b, zone, initial):
     for key, value in zone.params.items():
         socket = gas.inputs[key]
         socket.default_value = bool(value) if socket.type == "BOOLEAN" else value
+    if "Time" in gas.inputs and "Time" not in zone.params:
+        b.link(b.new("GeometryNodeInputSceneTime").outputs["Seconds"], gas.inputs["Time"])
     if zone.sources is not None:
         b.link(zone.sources(b, zone), gas.inputs["Sources"])
     if zone.colliders is not None:

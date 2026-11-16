@@ -3,8 +3,8 @@
 
     blender -b --factory-startup --python make_sparse_demo.py -- OUTPUT.blend [--res 64]
 
-Two smoke plumes side by side, each in its own Simulation Zone: a free plume and one rising into
-a plate obstacle. Press play to simulate. Untick "Sparse GPU" on a node to run Mantaflow instead.
+Two smoke plumes side by side, each in its own Simulation Zone, both stirred by turbulence: a
+free plume and one rising into a plate obstacle. Press play to simulate. Untick "Sparse GPU" on a node to run Mantaflow instead.
 """
 
 from __future__ import annotations
@@ -43,6 +43,9 @@ def build(name, res, origin, voxel, with_plate):
         "Max Substeps": 64,
         "Heat Buoyancy": 0.5,
         "Density Buoyancy": 0.5,
+        # About half the buoyancy's push, in swirls of 16 voxels, only where there is smoke.
+        "Turbulence": 150.0 * voxel,
+        "Turbulence Scale": 16.0 * voxel,
     })
     nx, ny, nz = res
     radius = nx / 8.0

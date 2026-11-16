@@ -227,9 +227,46 @@ enum class Advection {
   MacCormack,
 };
 
+enum class TurbulenceMask {
+  /** Full strength everywhere in the simulated bricks. */
+  None,
+  /** Scaled by density up to `mask_level`, full strength above it. */
+  Density,
+  /** Scaled by temperature up to `mask_level`, full strength above it. */
+  Temperature,
+};
+
+/**
+ * A swirling noise force: the curl of a smooth gradient-noise vector field, so it stirs the
+ * smoke without pushing it apart or together. Like a turbulence or disturbance force in
+ * EmberGen or Houdini, it changes how the smoke moves; it is not upres detail.
+ */
+struct Turbulence {
+  /** Acceleration in voxels per second squared; 0 turns the force off. */
+  float strength = 0.0f;
+  /** Size of the swirls in voxels. */
+  float scale = 16.0f;
+  /** How many times per second the pattern changes completely; 0 freezes it. */
+  float speed = 1.0f;
+  std::uint32_t seed = 0;
+  /**
+   * Masked by density by default. Unmasked, the force stirs the air in every simulated brick,
+   * which spreads the smoke, which activates more bricks: at 64x64x96 a plume then fills the
+   * domain within 50 frames instead of rising.
+   */
+  TurbulenceMask mask = TurbulenceMask::Density;
+  float mask_level = 0.1f;
+};
+
 struct Settings {
   /** Time step of step(). advance() chooses its own steps and ignores this. */
   float dt = 1.0f / 30.0f;
+  /**
+   * Simulation time in seconds at the start of step(), which the turbulence pattern follows.
+   * advance() advances it through its substeps.
+   */
+  float time = 0.0f;
+  Turbulence turbulence;
   Advection advection = Advection::MacCormack;
   /**
    * Trace departure points with the velocity half way along the path (second order) instead of
@@ -360,6 +397,15 @@ float max_speed(const State &state);
 
 /** Time step for the next substep of a frame: the rest of the frame, limited by the CFL number. */
 float cfl_time_step(float remaining, float cfl, float speed);
+
+/**
+ * The turbulence force on faces between two fluid cells, over `dt` seconds, with the pattern
+ * at `time`. Does nothing if its strength is zero.
+ */
+void add_turbulence(State &state, const Turbulence &turbulence, float time, float dt);
+
+/** The two time slices of the turbulence pattern at `time` and the blend between them. */
+void turbulence_time(const Turbulence &turbulence, float time, int &slice, float &blend);
 
 /** Mantaflow-style buoyancy on faces between two fluid cells. */
 void add_buoyancy(State &state, const std::vector<float> &factor, float coefficient, float dt,

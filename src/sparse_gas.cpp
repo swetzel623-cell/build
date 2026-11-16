@@ -850,6 +850,192 @@ void add_buoyancy(State &state,
   });
 }
 
+namespace {
+
+/* Gradient noise for the turbulence force. noise.glsl repeats every operation in this order,
+ * so the CPU and the device agree to rounding. */
+
+std::uint32_t mix_hash(std::uint32_t x)
+{
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  x *= 0x846ca68bu;
+  x ^= x >> 16;
+  return x;
+}
+
+std::uint32_t corner_hash(const int x, const int y, const int z, const std::uint32_t seed)
+{
+  return mix_hash((static_cast<std::uint32_t>(x) * 0x8da6b343u) ^
+                  mix_hash((static_cast<std::uint32_t>(y) * 0xd8163841u) ^
+                           mix_hash((static_cast<std::uint32_t>(z) * 0xcb1ab31fu) ^ seed)));
+}
+
+/** Dot product of one of the 12 cube-edge directions with (x, y, z). */
+float gradient_dot(const std::uint32_t hash, const float x, const float y, const float z)
+{
+  switch (hash % 12u) {
+    case 0:
+      return x + y;
+    case 1:
+      return -x + y;
+    case 2:
+      return x - y;
+    case 3:
+      return -x - y;
+    case 4:
+      return x + z;
+    case 5:
+      return -x + z;
+    case 6:
+      return x - z;
+    case 7:
+      return -x - z;
+    case 8:
+      return y + z;
+    case 9:
+      return -y + z;
+    case 10:
+      return y - z;
+    default:
+      return -y - z;
+  }
+}
+
+float fade(const float t)
+{
+  return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+float mixf(const float a, const float b, const float t)
+{
+  return a + (b - a) * t;
+}
+
+float gradient_noise(const float px, const float py, const float pz, const std::uint32_t seed)
+{
+  const float fx = std::floor(px), fy = std::floor(py), fz = std::floor(pz);
+  const int ix = static_cast<int>(fx), iy = static_cast<int>(fy), iz = static_cast<int>(fz);
+  const float tx = px - fx, ty = py - fy, tz = pz - fz;
+  const auto corner = [&](const int dx, const int dy, const int dz) {
+    return gradient_dot(corner_hash(ix + dx, iy + dy, iz + dz, seed),
+                        tx - static_cast<float>(dx),
+                        ty - static_cast<float>(dy),
+                        tz - static_cast<float>(dz));
+  };
+  const float ux = fade(tx), uy = fade(ty), uz = fade(tz);
+  const float x00 = mixf(corner(0, 0, 0), corner(1, 0, 0), ux);
+  const float x10 = mixf(corner(0, 1, 0), corner(1, 1, 0), ux);
+  const float x01 = mixf(corner(0, 0, 1), corner(1, 0, 1), ux);
+  const float x11 = mixf(corner(0, 1, 1), corner(1, 1, 1), ux);
+  return mixf(mixf(x00, x10, uy), mixf(x01, x11, uy), uz);
+}
+
+/** Where the turbulence pattern is in time: two slices and the blend between them. */
+struct NoiseTime {
+  int slice = 0;
+  float blend = 0.0f;
+};
+
+NoiseTime noise_time(const Turbulence &turbulence, const float time)
+{
+  const float tau = time * turbulence.speed;
+  const float base = std::floor(tau);
+  return {static_cast<int>(base), fade(tau - base)};
+}
+
+/** Component `k` of the vector potential at noise coordinates q. */
+float potential(const std::uint32_t seed,
+                const NoiseTime &when,
+                const int k,
+                const float qx,
+                const float qy,
+                const float qz)
+{
+  const std::uint32_t channel = mix_hash(seed ^ (static_cast<std::uint32_t>(k) * 0x9e3779b9u));
+  const float a = gradient_noise(
+      qx, qy, qz, channel ^ mix_hash(static_cast<std::uint32_t>(when.slice)));
+  const float b = gradient_noise(
+      qx, qy, qz, channel ^ mix_hash(static_cast<std::uint32_t>(when.slice + 1)));
+  return mixf(a, b, when.blend);
+}
+
+/** Component `axis` of the curl of the potential at noise coordinates q. */
+float curl(const std::uint32_t seed,
+           const NoiseTime &when,
+           const int axis,
+           const float qx,
+           const float qy,
+           const float qz)
+{
+  constexpr float h = 0.125f;
+  /* curl_x = dPz/dy - dPy/dz, and cyclically. */
+  const int b = (axis + 1) % 3, c = (axis + 2) % 3;
+  const float q[3] = {qx, qy, qz};
+  const auto at = [&](const int k, const int along, const float offset) {
+    float p[3] = {q[0], q[1], q[2]};
+    p[along] += offset;
+    return potential(seed, when, k, p[0], p[1], p[2]);
+  };
+  const float d_c_along_b = at(c, b, h) - at(c, b, -h);
+  const float d_b_along_c = at(b, c, h) - at(b, c, -h);
+  return (d_c_along_b - d_b_along_c) / (2.0f * h);
+}
+
+}  // namespace
+
+void turbulence_time(const Turbulence &turbulence, const float time, int &slice, float &blend)
+{
+  const NoiseTime when = noise_time(turbulence, time);
+  slice = when.slice;
+  blend = when.blend;
+}
+
+void add_turbulence(State &state, const Turbulence &turbulence, const float time, const float dt)
+{
+  if (turbulence.strength == 0.0f) {
+    return;
+  }
+  const Topology &topology = state.topology;
+  const float push = turbulence.strength * dt;
+  const float inverse_scale = 1.0f / turbulence.scale;
+  const NoiseTime when = noise_time(turbulence, time);
+  const std::vector<float> *mask = turbulence.mask == TurbulenceMask::Density ?
+                                       &state.density :
+                                   turbulence.mask == TurbulenceMask::Temperature ?
+                                       &state.temperature :
+                                       nullptr;
+  std::vector<float> *faces[3] = {&state.u, &state.v, &state.w};
+  for_each_voxel(topology, [&](const std::size_t index, const int x, const int y, const int z) {
+    if (topology.cell_type[index] != CellFluid) {
+      return;
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+      const int nx = x - (axis == 0), ny = y - (axis == 1), nz = z - (axis == 2);
+      if (topology.type_at(nx, ny, nz) != CellFluid) {
+        continue;
+      }
+      float weight = 1.0f;
+      if (mask) {
+        const float value = 0.5f * ((*mask)[index] + fetch(topology, *mask, nx, ny, nz));
+        weight = std::min(std::max(value / turbulence.mask_level, 0.0f), 1.0f);
+      }
+      /* The face's centre: on the lower face of the voxel along `axis`. */
+      const float px = static_cast<float>(x) + (axis == 0 ? 0.0f : 0.5f);
+      const float py = static_cast<float>(y) + (axis == 1 ? 0.0f : 0.5f);
+      const float pz = static_cast<float>(z) + (axis == 2 ? 0.0f : 0.5f);
+      const float force = curl(turbulence.seed,
+                               when,
+                               axis,
+                               px * inverse_scale,
+                               py * inverse_scale,
+                               pz * inverse_scale);
+      (*faces[axis])[index] += push * force * weight;
+    }
+  });
+}
+
 void enforce_walls(State &state)
 {
   const Topology &topology = state.topology;
@@ -1079,6 +1265,7 @@ StepInfo step(State &state, const Settings &settings, const Sources *sources)
     if (settings.density_buoyancy != 0.0f) {
       add_buoyancy(state, state.density, settings.density_buoyancy, dt, settings.gravity);
     }
+    add_turbulence(state, settings.turbulence, settings.time, dt);
     enforce_walls(state);
   };
 
@@ -1127,6 +1314,7 @@ FrameInfo advance(State &state,
     const float speed = max_speed(state);
     frame.max_speed = std::max(frame.max_speed, speed);
     substep.dt = cfl_time_step(remaining, settings.cfl, speed);
+    substep.time = settings.time + (frame_time - remaining);
     frame.last_step = step(state, substep, sources);
     frame.last_step.dt = substep.dt;
     remaining -= substep.dt;

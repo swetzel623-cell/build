@@ -769,6 +769,38 @@ Velocity is not limited.
 - **In Blender**: `Sources` and `Colliders` inputs on the node (see `blender/README.md`); four
   in-Blender tests pass on llvmpipe, including a collider animated by the frame number.
 
+**Turbulence noise.** Stage 2: a swirling force like EmberGen's turbulence or Houdini's
+disturbance, which changes how the smoke moves (detail upres noise comes later).
+
+- **The force** (`Settings::turbulence`, `add_turbulence`) is the curl of a vector field of
+  three gradient-noise channels, sampled at each face centre and differenced in noise space, so
+  it stirs without compressing: away from the walls its divergence is 2% of its size. It acts on
+  faces between two fluid cells, after buoyancy. Settings: strength (voxels/s²), scale (voxels),
+  speed (pattern changes per second, blended between two time slices), seed, and a mask.
+- **The noise is integer-hashed**, and `turbulence.comp` repeats the CPU's operations in order;
+  the device matches the CPU reference to 1.1e-5 or better. `Settings::time` drives the pattern;
+  `advance` moves it through the substeps.
+- **Masked by density by default** (full strength from density 0.1). Unmasked, it stirs the air
+  in every simulated brick, which spreads the smoke, which activates more bricks: the plume fills
+  the domain instead of rising. 64×64×96, 50 frames, raising source; free plume, then density-
+  masked strength 60 and 150, then unmasked 150, centre slice and side view:
+
+![Turbulence strengths](images/turbulence_strengths.png)
+
+| Variant | Height of smoke centre | Width (rms radius) | Smoke total |
+|---|---|---|---|
+| No turbulence | 65 | 12 | 5,225 |
+| Masked, 60 | 57 | 13 | 5,311 |
+| Masked, 150 | 47 | 18 | 5,879 |
+| Unmasked, 150 | 27 | 21 | 8,164 |
+| Unmasked, 300 / 800 | 25 / 26 | 23 / 24 | 10,753 / 16,445 |
+
+- The totals grow with turbulence because the source refills smoke that is carried away faster;
+  without a source a stirred plume keeps its total to 1e-3 (CPU test).
+- In Blender: `Turbulence`, `Turbulence Scale`, `Turbulence Speed`, `Turbulence Seed`,
+  `Turbulence Mask` and `Time` inputs. Not yet timed on a real GPU: each voxel evaluates 24
+  noise lookups per step when it is on.
+
 ## Not verified, and known gaps
 
 - **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.
@@ -805,8 +837,7 @@ Velocity is not limited.
 
 ## Next steps
 
-1. The plan agreed for Blender: turbulence noise, a Smoke Simulation modifier with separate
-   Smoke nodes, copying only the blocks with smoke between OpenVDB and the bricks while keeping
+1. The plan agreed for Blender: a Smoke Simulation modifier with separate Smoke nodes, copying only the blocks with smoke between OpenVDB and the bricks while keeping
    the state on the GPU between frames, then detail (upres) noise.
 2. Advect density and temperature in one pass: they share their departure points.
 3. Measure multigrid at larger sizes, where dispatch overhead should matter less.

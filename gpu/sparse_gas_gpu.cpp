@@ -29,6 +29,7 @@
 #include "jacobi.comp.h"
 #include "maccormack.comp.h"
 #include "remap.comp.h"
+#include "turbulence.comp.h"
 #include "walls.comp.h"
 
 #include <algorithm>
@@ -103,7 +104,7 @@ struct SparseGasGpu::Impl {
   Compute compute;
   int advect, maccormack, buoyancy, walls, divergence, jacobi, gradient, activity, remap, classify;
   int classify_links, mask_pressure, mg_smooth0, mg_restrict0, mg_smooth, mg_residual, copy3, reflect;
-  int conserve_reduce, conserve_apply, inject;
+  int conserve_reduce, conserve_apply, inject, turbulence;
   int mg_restrict, mg_prolong0, mg_prolong, mg_build0, mg_build, mg_dense_cycle;
 
   /** One coarse multigrid level on the device. */
@@ -173,6 +174,7 @@ struct SparseGasGpu::Impl {
     conserve_reduce = KERNEL(conserve_reduce);
     conserve_apply = KERNEL(conserve_apply);
     inject = KERNEL(inject);
+    turbulence = KERNEL(turbulence);
     mg_residual = KERNEL(mg_residual);
     mg_smooth = KERNEL(mg_smooth);
     mg_restrict = KERNEL(mg_restrict);
@@ -719,6 +721,7 @@ sparse::FrameInfo SparseGasGpu::advance(const sparse::Settings &settings,
                                         const sparse::Sources *sources)
 {
   use_sources(sources);
+  sparse::Settings substep = settings;
   sparse::FrameInfo frame;
   Timing total;
   total.gpu_ms = 0.0;
@@ -727,7 +730,9 @@ sparse::FrameInfo SparseGasGpu::advance(const sparse::Settings &settings,
     if (frame.substeps >= settings.max_substeps) {
       throw std::runtime_error("The sparse solver exhausted its substep limit");
     }
-    frame.last_step = impl_step(settings, &remaining);
+    /* As sparse::advance: the turbulence pattern follows the substeps' time. */
+    substep.time = settings.time + (frame_time - remaining);
+    frame.last_step = impl_step(substep, &remaining);
     frame.max_speed = std::max(frame.max_speed, impl_->last_speed);
     remaining -= frame.last_step.dt;
     ++frame.substeps;
@@ -967,6 +972,19 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
       };
       buoyancy(Temperature, settings.heat_buoyancy);
       buoyancy(Density, settings.density_buoyancy);
+      const sparse::Turbulence &noise = settings.turbulence;
+      if (noise.strength != 0.0f) {
+        int slice = 0;
+        float blend = 0.0f;
+        sparse::turbulence_time(noise, settings.time, slice, blend);
+        Params p = g.params(noise.strength * step, 1.0f / noise.scale, blend, noise.mask_level);
+        const bool masked = noise.mask != sparse::TurbulenceMask::None;
+        p.flags[0] = static_cast<std::int32_t>(noise.seed);
+        p.flags[1] = masked ? 1 : 0;
+        p.flags[2] = slice;
+        g.stencil(g.turbulence, "turbulence", p, U, V, W,
+                  noise.mask == sparse::TurbulenceMask::Temperature ? Temperature : Density);
+      }
       Params walls = g.params(0, 0, 0, 0);
       walls.flags[0] = g.obstacles_move ? 1 : 0;
       walls.flags[1] = g.motion_stride;

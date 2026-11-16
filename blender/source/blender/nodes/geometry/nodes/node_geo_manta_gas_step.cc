@@ -22,6 +22,7 @@
 #  include "openvdb/openvdb.h"
 #  include "openvdb/tools/Interpolation.h"
 
+#  include <algorithm>
 #  include <chrono>
 #  include <cmath>
 #  include <memory>
@@ -126,6 +127,33 @@ static void node_declare(NodeDeclarationBuilder &b)
           "0.5), for example from Mesh to Density Grid, evaluated every frame so colliders may "
           "move. An optional vector grid 'velocity' (world units per second) moves the "
           "collider's faces");
+  b.add_input<decl::Float>("Time"_ustr)
+      .default_value(0.0f)
+      .subtype(PROP_TIME_ABSOLUTE)
+      .description("Sparse GPU only. Scene time in seconds, which the turbulence pattern follows. "
+                   "Connect Scene Time's Seconds");
+  b.add_input<decl::Float>("Turbulence"_ustr)
+      .default_value(0.0f)
+      .min(0.0f)
+      .subtype(PROP_ACCELERATION)
+      .description("Sparse GPU only. Strength of a swirling noise force in world units per "
+                   "second squared; 0 turns it off. Compare it with gravity times the buoyancy");
+  b.add_input<decl::Float>("Turbulence Scale"_ustr)
+      .default_value(0.5f)
+      .min(1.0e-4f)
+      .subtype(PROP_DISTANCE)
+      .description("Size of the turbulence swirls in world units");
+  b.add_input<decl::Float>("Turbulence Speed"_ustr)
+      .default_value(1.0f)
+      .min(0.0f)
+      .description("How many times per second the turbulence pattern changes; 0 freezes it");
+  b.add_input<decl::Int>("Turbulence Seed"_ustr).default_value(0).min(0);
+  b.add_input<decl::Float>("Turbulence Mask"_ustr)
+      .default_value(0.1f)
+      .min(0.0f)
+      .description("Density at which turbulence reaches full strength; it fades out in thinner "
+                   "smoke. 0 stirs all simulated air, which spreads the smoke through the "
+                   "domain");
 
   b.add_output<decl::Int>("Substeps"_ustr).description("Number of internal solver steps executed");
   b.add_output<decl::Float>("Max Velocity"_ustr)
@@ -476,6 +504,8 @@ static void run_sparse_step(const int3 &resolution,
                             std::vector<MantaGasVec3> &velocity,
                             const MantaGasVelocityLayout velocity_layout,
                             const sparse::Sources &sources,
+                            const sparse::Turbulence &turbulence,
+                            const float time,
                             std::vector<std::uint8_t> obstacle,
                             std::vector<float> obstacle_u,
                             std::vector<float> obstacle_v,
@@ -534,6 +564,8 @@ static void run_sparse_step(const int3 &resolution,
   settings.heat_buoyancy = step_settings.heat_buoyancy;
   settings.pressure_solver = sparse::PressureSolver::Multigrid;
   settings.pressure_iterations = 6;
+  settings.turbulence = turbulence;
+  settings.time = time;
 
   sparse::State state = sparse::from_dense(fields, 8, settings.thresholds, settings.dilation);
   fields = {};
@@ -659,6 +691,24 @@ static void node_geo_exec(GeoNodeExecParams params)
     const GeometrySet source_geometry = params.extract_input<GeometrySet>("Sources"_ustr);
     const bool add_sources = params.extract_input<bool>("Add Sources"_ustr);
     const GeometrySet collider_geometry = params.extract_input<GeometrySet>("Colliders"_ustr);
+    const float time = params.extract_input<float>("Time"_ustr);
+    sparse::Turbulence turbulence;
+    turbulence.strength = params.extract_input<float>("Turbulence"_ustr) / voxel_size;
+    turbulence.scale = params.extract_input<float>("Turbulence Scale"_ustr) / voxel_size;
+    turbulence.speed = params.extract_input<float>("Turbulence Speed"_ustr);
+    turbulence.seed = static_cast<std::uint32_t>(
+        std::max(0, params.extract_input<int>("Turbulence Seed"_ustr)));
+    const float turbulence_mask = params.extract_input<float>("Turbulence Mask"_ustr);
+    turbulence.mask = turbulence_mask > 0.0f ? sparse::TurbulenceMask::Density :
+                                               sparse::TurbulenceMask::None;
+    turbulence.mask_level = turbulence_mask > 0.0f ? turbulence_mask : 1.0f;
+    if (!std::isfinite(time) || !std::isfinite(turbulence.strength) ||
+        !(turbulence.scale > 0.0f) || !std::isfinite(turbulence.scale) ||
+        !std::isfinite(turbulence.speed))
+    {
+      fail(params, state, "Time and the turbulence settings must be finite, with a positive scale.");
+      return;
+    }
     const Volume *source_volume = source_geometry.get_volume();
     const Volume *collider_volume = collider_geometry.get_volume();
     sparse::DenseFields emit;
@@ -757,6 +807,8 @@ static void node_geo_exec(GeoNodeExecParams params)
                         velocity,
                         velocity_layout,
                         sources,
+                        turbulence,
+                        time,
                         std::move(solid),
                         std::move(obstacle_u),
                         std::move(obstacle_v),
@@ -816,9 +868,10 @@ static void node_geo_exec(GeoNodeExecParams params)
       params.error_message_add(NodeWarningType::Info,
                                "Sparse solver ran on " + sparse_run.device_name);
     }
-    if (!sparse_gpu && (has_sources || has_colliders)) {
-      params.error_message_add(NodeWarningType::Warning,
-                               TIP_("Sources and Colliders are used only by the Sparse GPU solver"));
+    if (!sparse_gpu && (has_sources || has_colliders || turbulence.strength != 0.0f)) {
+      params.error_message_add(
+          NodeWarningType::Warning,
+          TIP_("Sources, Colliders and Turbulence are used only by the Sparse GPU solver"));
     }
     if (!diagnostics.pressure_converged) {
       params.error_message_add(

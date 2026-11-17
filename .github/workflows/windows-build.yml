@@ -4,6 +4,7 @@
 # sccache keeps every compiled file between runs (in the Actions cache, keyed by the Blender
 # commit), so a run recompiles only the files that changed since the last one. The first run
 # after the cache is empty or evicted compiles everything, which takes about two hours.
+# Precompiled headers are off because sccache cannot cache files built with them.
 name: Windows test build
 
 on:
@@ -103,7 +104,8 @@ jobs:
             -DWITH_GTESTS=OFF ^
             -DWITH_BUILDINFO=OFF ^
             -DWITH_WINDOWS_RELEASE_PDB=OFF ^
-            -DWITH_WINDOWS_SCCACHE=ON || exit /b 1
+            -DWITH_WINDOWS_SCCACHE=ON ^
+            -DWITH_COMPILER_PRECOMPILED_HEADERS=OFF || exit /b 1
           findstr /C:"SPARSE_GAS_GLSLANG:FILEPATH=C:" %BUILD_DIR%\CMakeCache.txt || (echo The sparse solver's GPU kernels were not enabled & exit /b 1)
           sccache --zero-stats
           cmake --build %BUILD_DIR% --target install || exit /b 1

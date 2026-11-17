@@ -132,16 +132,19 @@ enum class SourceMode {
 
 /**
  * What sources emit at the start of every step they are passed to. Channels: density,
- * temperature and, optionally, a cell-centered velocity u, v, w in voxels per second that is
- * set on the lower faces of every voxel emitting density or temperature, as Mantaflow sets an
- * emitter's initial velocity. Bricks holding a source stay active.
+ * temperature, fuel and, optionally, a cell-centered velocity u, v, w in voxels per second that
+ * is set on the lower faces of every voxel emitting density, temperature or fuel, as Mantaflow
+ * sets an emitter's initial velocity. Bricks holding a source stay active.
  */
 struct Sources {
   SourceMode mode = SourceMode::Raise;
   BrickField field;
 };
 
-/** Sources from dense fields: density and temperature, and the velocity if `u` is not empty. */
+/**
+ * Sources from dense fields: density, temperature, fuel (zero if `fuel` is empty), and the
+ * velocity if `u` is not empty.
+ */
 Sources sources_from_dense(const struct DenseFields &dense, int brick_size, SourceMode mode);
 
 /** Staggered (MAC) gas state on a sparse topology. Velocity is in voxels per second. */
@@ -149,6 +152,9 @@ struct State {
   Topology topology;
   std::vector<float> density;
   std::vector<float> temperature;
+  /** Fire: unburnt fuel, and the flame of fuel burning now or a moment ago (0 to 1). */
+  std::vector<float> fuel;
+  std::vector<float> flame;
   /** Velocity through the lower X, Y, and Z face of each voxel. */
   std::vector<float> u, v, w;
   std::vector<float> pressure;
@@ -176,6 +182,9 @@ struct DenseFields {
   Extent extent;
   std::vector<float> density;
   std::vector<float> temperature;
+  /** Fire channels; may be empty when there is no fire. */
+  std::vector<float> fuel;
+  std::vector<float> flame;
   std::vector<float> u, v, w;
   /** The last pressure, the first guess of the next solve; may be empty. */
   std::vector<float> pressure;
@@ -245,6 +254,13 @@ enum class TurbulenceMask {
   Density,
   /** Scaled by temperature up to `mask_level`, full strength above it. */
   Temperature,
+  /** Scaled by flame up to `mask_level`, full strength above it. */
+  Flame,
+  /**
+   * Scaled by the speed of the flow (voxels per second) up to `mask_level`. The speed is the
+   * velocity when the layer is applied, after any earlier layer of the step stirred it.
+   */
+  Speed,
 };
 
 /**
@@ -267,6 +283,26 @@ struct Turbulence {
    */
   TurbulenceMask mask = TurbulenceMask::Density;
   float mask_level = 0.1f;
+  /** Apply the layer where the mask is low instead: in thin smoke, or in slow flow. */
+  bool invert = false;
+};
+
+/**
+ * Fire, as fuel that burns: every step, fuel burns at `burn_rate`, and what burns becomes flame,
+ * heat and smoke. Flame shows where fuel is burning or has just burnt; it rises with the hot
+ * gas and fades at `flame_cooling` once nothing burns there.
+ */
+struct Fire {
+  /** Advect and burn fuel and flame. Without fire the two channels are left untouched. */
+  bool enabled = false;
+  /** Fuel burnt per second where there is any. */
+  float burn_rate = 0.75f;
+  /** Temperature added per unit of fuel burnt. */
+  float heat = 4.0f;
+  /** Smoke density added per unit of fuel burnt. */
+  float smoke = 1.0f;
+  /** Flame lost per second where nothing burns. */
+  float flame_cooling = 4.0f;
 };
 
 struct Settings {
@@ -277,7 +313,14 @@ struct Settings {
    * advance() advances it through its substeps.
    */
   float time = 0.0f;
+  /** The first turbulence layer; zero strength turns it off. */
   Turbulence turbulence;
+  /**
+   * Further turbulence layers, applied in order after `turbulence`. Order matters with a Speed
+   * mask, which sees the flow after the layers before it.
+   */
+  std::vector<Turbulence> turbulence_layers;
+  Fire fire;
   Advection advection = Advection::MacCormack;
   /**
    * Trace departure points with the velocity half way along the path (second order) instead of
@@ -415,6 +458,15 @@ float cfl_time_step(float remaining, float cfl, float speed);
  */
 void add_turbulence(State &state, const Turbulence &turbulence, float time, float dt);
 
+/** Speed of the flow at each stored voxel's centre, from the mean of each component's faces. */
+void cell_speed(const State &state, std::vector<float> &result);
+
+/**
+ * Burn fuel over `dt` seconds in every non-solid voxel; see Fire. Does nothing unless the fire
+ * is enabled.
+ */
+void combust(State &state, const Fire &fire, float dt);
+
 /** The two time slices of the turbulence pattern at `time` and the blend between them. */
 void turbulence_time(const Turbulence &turbulence, float time, int &slice, float &blend);
 
@@ -429,8 +481,8 @@ void add_buoyancy(State &state, const std::vector<float> &factor, float coeffici
 void enforce_walls(State &state);
 
 /**
- * Start of a step: zero density and temperature in solid cells, then apply `sources` (may be
- * null) over `dt` seconds.
+ * Start of a step: zero density, temperature, fuel and flame in solid cells, then apply
+ * `sources` (may be null) over `dt` seconds.
  */
 void inject(State &state, const Sources *sources, float dt);
 
@@ -501,8 +553,8 @@ void subtract_gradient(State &state);
 StepInfo project(State &state, const Settings &settings);
 
 /**
- * Advance one time step: retopologize, inject sources, advect, add buoyancy, enforce walls,
- * project. `sources` may be null.
+ * Advance one time step: retopologize, inject sources, advect, burn fuel, add buoyancy and
+ * turbulence, enforce walls, project. `sources` may be null.
  */
 StepInfo step(State &state, const Settings &settings, const Sources *sources = nullptr);
 

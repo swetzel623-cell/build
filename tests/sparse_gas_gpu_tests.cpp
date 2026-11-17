@@ -28,6 +28,10 @@ bool with_obstacle = false;
 bool with_moving = false;
 /** A sphere emitting smoke and heat under the plume: 0 none, 1 raising, 2 adding. */
 int source_kind = 0;
+/** The source emits fuel, which burns, instead of smoke. */
+bool with_fire = false;
+/** Two more turbulence layers after the first: a speed-masked one and an inverted flame one. */
+bool with_layers = false;
 /** Start without the blob: only the sources put smoke in. */
 bool empty_start = false;
 /**
@@ -82,6 +86,7 @@ sparse::Sources scene_sources(const sparse::Extent extent)
   const std::size_t count = static_cast<std::size_t>(extent.x) * extent.y * extent.z;
   emit.density.assign(count, 0.0f);
   emit.temperature.assign(count, 0.0f);
+  emit.fuel.assign(count, 0.0f);
   const float cx = extent.x / 2.0f, cy = extent.y / 2.0f, cz = extent.z / 8.0f;
   const float radius = std::max(2.0f, extent.x / 12.0f);
   const float level = source_kind == 2 ? 6.0f : 0.8f;
@@ -91,8 +96,14 @@ sparse::Sources scene_sources(const sparse::Extent extent)
         const float dx = x + 0.5f - cx, dy = y + 0.5f - cy, dz = z + 0.5f - cz;
         if (dx * dx + dy * dy + dz * dz <= radius * radius) {
           const std::size_t i = x + static_cast<std::size_t>(extent.x) * (y + extent.y * z);
-          emit.density[i] = level;
-          emit.temperature[i] = level;
+          if (with_fire) {
+            emit.fuel[i] = level;
+            emit.temperature[i] = 0.25f * level;
+          }
+          else {
+            emit.density[i] = level;
+            emit.temperature[i] = level;
+          }
         }
       }
     }
@@ -293,6 +304,29 @@ sparse::Settings test_settings(const int resolution)
       settings.turbulence.mask_level = 0.2f;
     }
   }
+  if (with_layers) {
+    sparse::Turbulence fast;
+    fast.strength = 200.0f;
+    fast.scale = resolution / 10.0f;
+    fast.seed = 11;
+    fast.mask = sparse::TurbulenceMask::Speed;
+    fast.mask_level = 4.0f;
+    sparse::Turbulence cool;
+    cool.strength = 100.0f;
+    cool.scale = resolution / 6.0f;
+    cool.seed = 12;
+    cool.mask = sparse::TurbulenceMask::Flame;
+    cool.mask_level = 0.5f;
+    cool.invert = true;
+    settings.turbulence_layers = {fast, cool};
+  }
+  if (with_fire) {
+    settings.fire.enabled = true;
+    settings.fire.burn_rate = 1.5f;
+    settings.fire.heat = 2.0f;
+    settings.fire.smoke = 0.6f;
+    settings.fire.flame_cooling = 3.0f;
+  }
   if (first_order) {
     settings.advection = sparse::Advection::SemiLagrangian;
   }
@@ -359,6 +393,8 @@ int compare(gpu::SparseGasGpu &solver, const int resolution, const int steps)
     const float scale = std::max(1.0f, max_abs(cpu.w));
     const float worst = std::max({max_difference(cpu.density, device.density),
                                   max_difference(cpu.temperature, device.temperature),
+                                  max_difference(cpu.fuel, device.fuel),
+                                  max_difference(cpu.flame, device.flame),
                                   max_difference(cpu.u, device.u) / scale,
                                   max_difference(cpu.v, device.v) / scale,
                                   max_difference(cpu.w, device.w) / scale,
@@ -377,6 +413,10 @@ int compare(gpu::SparseGasGpu &solver, const int resolution, const int steps)
   }
   if (!(max_abs(cpu.w) > 0.1f)) {
     std::cout << "FAIL: the test flow did not develop\n";
+    return 1;
+  }
+  if (with_fire && !(max_abs(cpu.flame) > 0.5f)) {
+    std::cout << "FAIL: the fire did not burn\n";
     return 1;
   }
   std::cout << "CPU reference " << cpu_seconds / steps * 1000.0 << " ms/frame, device "
@@ -517,6 +557,10 @@ int main(int argc, char **argv)
     else if (std::string(argv[i]) == "--sources" && i + 1 < argc) {
       const std::string kind = argv[++i];
       source_kind = kind == "add" ? 2 : 1;
+      with_fire = kind == "fire";
+    }
+    else if (std::string(argv[i]) == "--layers") {
+      with_layers = true;
     }
     else if (std::string(argv[i]) == "--image" && i + 1 < argc) {
       image_name = argv[++i];

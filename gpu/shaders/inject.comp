@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Start of a step: zero the scalars of solid cells, then apply the sources. Mirrors inject in
 // the CPU reference. P.a.x = dt; P.flags.x = 0 to raise, 1 to add; P.flags.y = source channels
-// (0, 2, or 5); P.flags.z = values per source channel.
+// (0, 3, or 6: density, temperature, fuel, then velocity); P.flags.z = values per source channel.
 #version 450
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
@@ -10,6 +10,8 @@
 #define U b6
 #define V b7
 #define W b8
+#define FUEL b9
+layout(std430, binding = 12) buffer B12 { float flame[]; };
 /* Per brick of the domain: the source's slot, or -1. */
 layout(std430, binding = 10) readonly buffer SourceTable { int source_table[]; };
 layout(std430, binding = 11) readonly buffer SourceValues { float source[]; };
@@ -23,6 +25,8 @@ void main()
   if (cell_type[index] == CELL_SOLID) {
     DENSITY[index] = 0.0;
     TEMPERATURE[index] = 0.0;
+    FUEL[index] = 0.0;
+    flame[index] = 0.0;
     return;
   }
   if (P.flags.y == 0) {
@@ -39,6 +43,7 @@ void main()
   int stride = P.flags.z;
   float density = source[at];
   float temperature = source[stride + at];
+  float fuel = source[2 * stride + at];
   if (P.flags.x == 0) {
     if (density != 0.0) {
       DENSITY[index] = max(DENSITY[index], density);
@@ -46,14 +51,18 @@ void main()
     if (temperature != 0.0) {
       TEMPERATURE[index] = max(TEMPERATURE[index], temperature);
     }
+    if (fuel != 0.0) {
+      FUEL[index] = max(FUEL[index], fuel);
+    }
   }
   else {
     DENSITY[index] += density * P.a.x;
     TEMPERATURE[index] += temperature * P.a.x;
+    FUEL[index] += fuel * P.a.x;
   }
-  if (P.flags.y >= 5 && (density != 0.0 || temperature != 0.0)) {
-    U[index] = source[2 * stride + at];
-    V[index] = source[3 * stride + at];
-    W[index] = source[4 * stride + at];
+  if (P.flags.y >= 6 && (density != 0.0 || temperature != 0.0 || fuel != 0.0)) {
+    U[index] = source[3 * stride + at];
+    V[index] = source[4 * stride + at];
+    W[index] = source[5 * stride + at];
   }
 }

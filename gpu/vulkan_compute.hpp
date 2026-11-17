@@ -18,8 +18,8 @@
 
 namespace manta_improve::gpu {
 
-/** Kernels see storage buffers at bindings 1 to 11. */
-constexpr std::size_t binding_count = 11;
+/** Kernels see storage buffers at bindings 1 to 12. */
+constexpr std::size_t binding_count = 12;
 /** Every kernel receives up to this many bytes of push constants. */
 constexpr std::size_t push_constant_bytes = 64;
 

@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: MIT
+// Speed of the flow at each stored voxel's centre, for a turbulence layer's speed mask. Mirrors
+// cell_speed in the CPU reference.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#define U b4
+#define V b5
+#define W b6
+#define SPEED b7
+
+float fetch_u(ivec3 c)
+{
+  int index = index_of(c);
+  return index < 0 ? 0.0 : U[index];
+}
+float fetch_v(ivec3 c)
+{
+  int index = index_of(c);
+  return index < 0 ? 0.0 : V[index];
+}
+float fetch_w(ivec3 c)
+{
+  int index = index_of(c);
+  return index < 0 ? 0.0 : W[index];
+}
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index)) {
+    return;
+  }
+  ivec3 c = coords_of(index);
+  float u = 0.5 * (U[index] + fetch_u(c + ivec3(1, 0, 0)));
+  float v = 0.5 * (V[index] + fetch_v(c + ivec3(0, 1, 0)));
+  float w = 0.5 * (W[index] + fetch_w(c + ivec3(0, 0, 1)));
+  SPEED[index] = sqrt(u * u + v * v + w * w);
+}

@@ -603,6 +603,78 @@ def test_voxel_size_change_moves_the_state(_work):
         check(0.0 <= height[1] - height[0] < old, f"{label}: the smoke moved on the new grid")
 
 
+def test_sparse_gpu_fire(_work):
+    """A source of fuel burns into flame, heat and smoke that rise; without fuel the state has no
+    fire grids."""
+    lib.reset_scene()
+    res = (32, 32, 48)
+
+    def burner(b, zone):
+        x, y, z = lib.voxel_coords(b, zone)
+        d2 = b.math("ADD", b.math("ADD", b.math("POWER", b.math("SUBTRACT", x, 16.0), 2.0),
+                                  b.math("POWER", b.math("SUBTRACT", y, 16.0), 2.0)),
+                    b.math("POWER", b.math("SUBTRACT", z, 8.0), 2.0))
+        inside = b.math("LESS_THAN", d2, 9.5)
+        return lib.grid_volume(b, zone, [("fuel", "FLOAT", inside),
+                                         ("temperature", "FLOAT", b.math("MULTIPLY", inside, 0.3))])
+
+    zone = Zone(res, sources=burner, extra_grids=("fuel", "flame"),
+                **{"Sparse GPU": True, "CFL": 6.0, "Burn Rate": 1.5, "Flame Heat": 3.0,
+                   "Flame Smoke": 0.8, "Flame Cooling": 3.0})
+    empty = np.zeros(zone.cells, dtype=np.float32)
+    lib.make_data_object("fire_data", zone, density=empty, temperature=empty)
+    obj = lib.build_object("fire", [zone])
+    (end,), names = lib.run_frames(obj, [zone], 1, 16)
+    check(not errors(obj), f"unexpected node errors: {errors(obj)}")
+    print(f"  sparse solver: {sparse_note(obj)}")
+    check(names == sorted(lib.GRID_NAMES + ("fuel", "flame")), f"state grids: {names}")
+    flame, smoke = end["flame"], end["density"]
+    smoke_height = center_of_mass_z(zone, smoke)
+    flame_height = center_of_mass_z(zone, flame)
+    print(f"  flame total {flame.sum():.1f} (peak {flame.max():.2f}) centred at z "
+          f"{flame_height:.1f}; smoke total {smoke.sum():.1f} centred at z {smoke_height:.1f}; "
+          f"fuel left {end['fuel'].sum():.1f}")
+    check(flame.max() > 0.9, "the fuel did not burn at the full rate anywhere")
+    check(smoke.sum() > 1.0, "the fire left no smoke")
+    check(smoke_height > 8.0 + 3.0, "the fire's smoke did not rise above the burner")
+    check(np.isfinite(end["velocity"]).all(), "velocity is not finite")
+
+
+def test_sparse_gpu_turbulence_layers(_work):
+    """A layer with the same settings as the single turbulence inputs gives the same result, and
+    the order of layers matters when one is masked by speed."""
+    strength = 150.0 * 0.0625
+
+    def run(single=None, layers=None):
+        lib.reset_scene()
+        params = {"Turbulence Scale": 0.5, "Turbulence Seed": 4, "Turbulence Mask": 0.0}
+        if single:
+            params["Turbulence"] = single
+        if layers:
+            params["layers"] = lambda b, zone: lib.turbulence_layers(b, layers)
+        zone = sparse_zone(**params)
+        obj = lib.build_object("layers", [zone])
+        lib.evaluate(obj, [zone], 1)
+        (end,), _ = lib.run_frames(obj, [zone], 2, 9)
+        check(not errors(obj), f"unexpected node errors: {errors(obj)}")
+        return end
+
+    as_input = run(single=strength)
+    as_layer = run(layers=[{"strength": strength, "scale": 0.5, "speed": 1.0, "seed": 4,
+                            "mask": 0, "mask_level": 1.0}])
+    same = np.abs(as_input["density"] - as_layer["density"]).max()
+    print(f"  one layer against the single turbulence inputs: largest difference {same:.2e}")
+    check(same < 1.0e-6, "a layer did not match the same turbulence given as inputs")
+
+    broad = {"strength": strength, "scale": 0.5, "seed": 1, "mask": 0, "mask_level": 1.0}
+    fast = {"strength": 2.0 * strength, "scale": 0.15, "seed": 2, "mask": 4, "mask_level": 0.3}
+    first = run(layers=[broad, fast])
+    second = run(layers=[fast, broad])
+    order = np.linalg.norm(first["density"] - second["density"]) / np.linalg.norm(first["density"])
+    print(f"  swapping a speed-masked layer and a broad one changed the density by {order:.3f}")
+    check(order > 1.0e-3, "the order of the layers made no difference")
+
+
 TESTS = [
     test_node_is_registered,
     test_zero_time_start_frame,
@@ -624,6 +696,8 @@ TESTS = [
     test_sparse_gpu_turbulence,
     test_sparse_gpu_keeps_state,
     test_voxel_size_change_moves_the_state,
+    test_sparse_gpu_fire,
+    test_sparse_gpu_turbulence_layers,
 ]
 
 

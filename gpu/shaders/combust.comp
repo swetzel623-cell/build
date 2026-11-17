@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: MIT
+// Burn fuel into flame, heat and smoke. Mirrors combust in the CPU reference, operation for
+// operation. P.a = (burn rate * dt, flame cooling * dt, heat per fuel, smoke per fuel).
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#define DENSITY b4
+#define TEMPERATURE b5
+#define FUEL b6
+#define FLAME b7
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index) || cell_type[index] == CELL_SOLID) {
+    return;
+  }
+  float capacity = P.a.x;
+  float flame = max(FLAME[index] - P.a.y, 0.0);
+  float fuel = FUEL[index];
+  if (fuel > 0.0 && capacity > 0.0) {
+    float burnt = min(fuel, capacity);
+    FUEL[index] = fuel - burnt;
+    TEMPERATURE[index] += P.a.z * burnt;
+    DENSITY[index] += P.a.w * burnt;
+    flame = max(flame, burnt / capacity);
+  }
+  FLAME[index] = flame;
+}

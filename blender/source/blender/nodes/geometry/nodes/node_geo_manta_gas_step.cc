@@ -8,6 +8,8 @@
 #include "BKE_volume_grid.hh"
 #include "BKE_volume_openvdb.hh"
 
+#include "DNA_pointcloud_types.h"
+
 #include "BLT_translation.hh"
 
 #if defined(WITH_FLUID) && defined(WITH_OPENVDB)
@@ -42,13 +44,14 @@ static void node_declare(NodeDeclarationBuilder &b)
 {
   b.add_input<decl::Geometry>("State"_ustr)
       .description(
-          "Volume containing density, temperature, velocity, and pressure grids. Missing grids "
-          "start at zero. A velocity grid that is not tagged as staggered is treated as "
+          "Volume containing density, temperature, velocity, and pressure grids, and fuel and "
+          "flame grids for fire. Missing grids start at zero. A velocity grid that is not tagged as staggered is treated as "
           "cell-centered and resampled to faces");
   b.add_output<decl::Geometry>("State"_ustr)
       .description(
-          "Serializable next simulation state containing the four named volume grids. Velocity "
-          "is the solver's staggered (face-centered) field");
+          "Serializable next simulation state: density, temperature, velocity and pressure "
+          "grids, and fuel and flame grids while there is fire. Velocity is the solver's "
+          "staggered (face-centered) field");
 
   b.add_input<decl::Float>("Delta Time"_ustr)
       .default_value(1.0f / 30.0f)
@@ -117,15 +120,16 @@ static void node_declare(NodeDeclarationBuilder &b)
           "solver. Without a usable GPU it runs its slow CPU reference and warns");
   b.add_input<decl::Geometry>("Sources"_ustr)
       .description(
-          "Sparse GPU only. Volume whose float grids 'density' and 'temperature' are emitted "
-          "every step, for example from Mesh to Density Grid. An optional vector grid "
-          "'velocity' (world units per second) is set where they emit. Grids may use any "
+          "Sparse GPU only. Volume whose float grids 'density', 'temperature' and 'fuel' are "
+          "emitted every step, for example from Mesh to Density Grid. Fuel burns into flame, "
+          "heat and smoke. An optional vector grid 'velocity' (world units per second) is set "
+          "where they emit. Grids may use any "
           "transform; each active voxel goes to the nearest domain voxel");
   b.add_input<decl::Bool>("Add Sources"_ustr)
       .default_value(false)
       .description(
-          "Add the sources' values per second instead of raising density and temperature to "
-          "them");
+          "Add the sources' values per second instead of raising density, temperature and fuel "
+          "to them");
   b.add_input<decl::Geometry>("Colliders"_ustr)
       .description(
           "Sparse GPU only. Volume whose float grid 'obstacle' marks solid voxels (value above "
@@ -159,6 +163,30 @@ static void node_declare(NodeDeclarationBuilder &b)
       .description("Density at which turbulence reaches full strength; it fades out in thinner "
                    "smoke. 0 stirs all simulated air, which spreads the smoke through the "
                    "domain");
+  b.add_input<decl::Geometry>("Turbulence Layers"_ustr)
+      .description(
+          "Sparse GPU only. More turbulence, one point per layer, applied in point order after "
+          "the turbulence above, so a layer masked by speed reacts to the layers before it. "
+          "Point attributes: 'strength', 'scale', 'speed', 'mask_level' (floats, world units), "
+          "'seed' and 'mask' (integers; mask 0 none, 1 density, 2 temperature, 3 flame, "
+          "4 speed) and 'invert' (boolean). Turbulence Layer node groups build it");
+  b.add_input<decl::Float>("Burn Rate"_ustr)
+      .default_value(0.75f)
+      .min(0.0f)
+      .description("Sparse GPU only. Fuel burnt per second where there is any. Higher burns "
+                   "faster, in shorter flames");
+  b.add_input<decl::Float>("Flame Heat"_ustr)
+      .default_value(4.0f)
+      .min(0.0f)
+      .description("Temperature added per unit of fuel burnt, which makes the fire rise");
+  b.add_input<decl::Float>("Flame Smoke"_ustr)
+      .default_value(1.0f)
+      .min(0.0f)
+      .description("Smoke density left per unit of fuel burnt");
+  b.add_input<decl::Float>("Flame Cooling"_ustr)
+      .default_value(4.0f)
+      .min(0.0f)
+      .description("Flame lost per second once its fuel is gone. Lower leaves taller flames");
 
   b.add_output<decl::Int>("Substeps"_ustr).description("Number of internal solver steps executed");
   b.add_output<decl::Float>("Max Velocity"_ustr)
@@ -415,7 +443,7 @@ struct SparseRun {
 struct SparseSlot {
   manta_improve::gpu::SparseGasGpu *gpu = nullptr;
   std::int64_t state_id = 0;
-  std::array<const void *, 4> trees{};
+  std::array<const void *, 6> trees{};
   std::array<int, 3> resolution{};
   std::uint64_t last_used = 0;
 };
@@ -523,6 +551,7 @@ static openvdb::Vec3f velocity_at(
 /** The sources of one frame, on bricks, straight from their grids. */
 static sparse::Sources make_sources(const openvdb::FloatGrid *density,
                                     const openvdb::FloatGrid *temperature,
+                                    const openvdb::FloatGrid *fuel,
                                     const openvdb::Vec3SGrid *velocity,
                                     const openvdb::math::Transform &domain,
                                     const int3 &resolution,
@@ -531,14 +560,15 @@ static sparse::Sources make_sources(const openvdb::FloatGrid *density,
 {
   sparse::Sources sources;
   sources.mode = add ? sparse::SourceMode::Add : sparse::SourceMode::Raise;
-  if (!density && !temperature) {
+  if (!density && !temperature && !fuel) {
     return sources;
   }
   sources.field = sparse::make_brick_field(
-      {resolution.x, resolution.y, resolution.z}, 8, velocity ? 5 : 2);
+      {resolution.x, resolution.y, resolution.z}, 8, velocity ? 6 : 3);
   sparse::BrickField &field = sources.field;
-  for (int channel = 0; channel < 2; ++channel) {
-    const openvdb::FloatGrid *grid = channel == 0 ? density : temperature;
+  const openvdb::FloatGrid *channels[3] = {density, temperature, fuel};
+  for (int channel = 0; channel < 3; ++channel) {
+    const openvdb::FloatGrid *grid = channels[channel];
     if (!grid) {
       continue;
     }
@@ -561,7 +591,9 @@ static sparse::Sources make_sources(const openvdb::FloatGrid *density,
       const int bz = int(brick / (std::size_t(field.brick_extent.x) * field.brick_extent.y));
       for (int local = 0; local < 512; ++local) {
         const std::size_t i = std::size_t(slot) * 512 + std::size_t(local);
-        if (field.channels[0][i] == 0.0f && field.channels[1][i] == 0.0f) {
+        if (field.channels[0][i] == 0.0f && field.channels[1][i] == 0.0f &&
+            field.channels[2][i] == 0.0f)
+        {
           continue;
         }
         const openvdb::Vec3f value = velocity_at(sampler,
@@ -570,9 +602,9 @@ static sparse::Sources make_sources(const openvdb::FloatGrid *density,
                                                  bx * 8 + (local & 7),
                                                  by * 8 + ((local >> 3) & 7),
                                                  bz * 8 + (local >> 6));
-        field.channels[2][i] = value[0];
-        field.channels[3][i] = value[1];
-        field.channels[4][i] = value[2];
+        field.channels[3][i] = value[0];
+        field.channels[4][i] = value[1];
+        field.channels[5][i] = value[2];
       }
     }
   }
@@ -625,13 +657,17 @@ struct StateGrids {
   const openvdb::FloatGrid *temperature = nullptr;
   const openvdb::Vec3SGrid *velocity = nullptr;
   const openvdb::FloatGrid *pressure = nullptr;
+  const openvdb::FloatGrid *fuel = nullptr;
+  const openvdb::FloatGrid *flame = nullptr;
 
-  std::array<const void *, 4> trees() const
+  std::array<const void *, 6> trees() const
   {
     return {density ? &density->tree() : nullptr,
             temperature ? &temperature->tree() : nullptr,
             velocity ? &velocity->tree() : nullptr,
-            pressure ? &pressure->tree() : nullptr};
+            pressure ? &pressure->tree() : nullptr,
+            fuel ? &fuel->tree() : nullptr,
+            flame ? &flame->tree() : nullptr};
   }
 
   /** The id a node wrote on its output, or 0. */
@@ -660,7 +696,9 @@ static sparse::State import_sparse_state(const StateGrids &grids,
   const sparse::Extent extent = {resolution.x, resolution.y, resolution.z};
   const sparse::Extent bricks = {(extent.x + 7) / 8, (extent.y + 7) / 8, (extent.z + 7) / 8};
   std::vector<std::uint8_t> flags(std::size_t(bricks.x) * bricks.y * bricks.z, 0);
-  for (const openvdb::FloatGrid *grid : {grids.density, grids.temperature}) {
+  for (const openvdb::FloatGrid *grid :
+       {grids.density, grids.temperature, grids.fuel, grids.flame})
+  {
     if (!grid) {
       continue;
     }
@@ -688,7 +726,7 @@ static sparse::State import_sparse_state(const StateGrids &grids,
   state.obstacle_velocity = std::move(obstacle_velocity);
 
   const float zero = 0.0f;
-  std::optional<openvdb::FloatGrid::ConstAccessor> density, temperature, pressure;
+  std::optional<openvdb::FloatGrid::ConstAccessor> density, temperature, pressure, fuel, flame;
   std::optional<openvdb::Vec3SGrid::ConstAccessor> velocity;
   if (grids.density) {
     density.emplace(grids.density->getConstAccessor());
@@ -698,6 +736,12 @@ static sparse::State import_sparse_state(const StateGrids &grids,
   }
   if (grids.pressure) {
     pressure.emplace(grids.pressure->getConstAccessor());
+  }
+  if (grids.fuel) {
+    fuel.emplace(grids.fuel->getConstAccessor());
+  }
+  if (grids.flame) {
+    flame.emplace(grids.flame->getConstAccessor());
   }
   if (grids.velocity) {
     velocity.emplace(grids.velocity->getConstAccessor());
@@ -720,6 +764,8 @@ static sparse::State import_sparse_state(const StateGrids &grids,
       state.density[i] = density ? density->getValue(c) : zero;
       state.temperature[i] = temperature ? temperature->getValue(c) : zero;
       state.pressure[i] = pressure ? pressure->getValue(c) : zero;
+      state.fuel[i] = fuel ? fuel->getValue(c) : zero;
+      state.flame[i] = flame ? flame->getValue(c) : zero;
       if (!velocity) {
         continue;
       }
@@ -741,13 +787,17 @@ static sparse::State import_sparse_state(const StateGrids &grids,
   return state;
 }
 
-/** Write a solver state into a new volume, brick by brick, tagging it with `state_id`. */
+/**
+ * Write a solver state into a new volume, brick by brick, tagging it with `state_id`. Fuel and
+ * flame grids are written only with `fire`.
+ */
 static Volume *export_sparse_state(const sparse::State &state,
                                    const int3 &resolution,
                                    const openvdb::math::Transform &transform,
                                    const float voxel_size,
                                    const std::int64_t state_id,
-                                   std::array<const void *, 4> &trees)
+                                   const bool fire,
+                                   std::array<const void *, 6> &trees)
 {
   const auto scalar = [&](const bool fog) {
     openvdb::FloatGrid::Ptr grid = openvdb::FloatGrid::create(0.0f);
@@ -757,7 +807,7 @@ static Volume *export_sparse_state(const sparse::State &state,
     return grid;
   };
   openvdb::FloatGrid::Ptr density = scalar(true), temperature = scalar(true),
-                          pressure = scalar(false);
+                          pressure = scalar(false), fuel = scalar(true), flame = scalar(true);
   openvdb::Vec3SGrid::Ptr velocity = openvdb::Vec3SGrid::create(openvdb::Vec3f::zero());
   velocity->setTransform(transform.copy());
   velocity->setGridClass(openvdb::GRID_STAGGERED);
@@ -768,6 +818,8 @@ static Volume *export_sparse_state(const sparse::State &state,
     openvdb::FloatGrid::Accessor density_access = density->getAccessor();
     openvdb::FloatGrid::Accessor temperature_access = temperature->getAccessor();
     openvdb::FloatGrid::Accessor pressure_access = pressure->getAccessor();
+    openvdb::FloatGrid::Accessor fuel_access = fuel->getAccessor();
+    openvdb::FloatGrid::Accessor flame_access = flame->getAccessor();
     openvdb::Vec3SGrid::Accessor velocity_access = velocity->getAccessor();
     const sparse::Topology &topology = state.topology;
     for (std::size_t slot = 0; slot < topology.brick_count(); ++slot) {
@@ -790,6 +842,12 @@ static Volume *export_sparse_state(const sparse::State &state,
         if (state.pressure[i] != 0.0f) {
           pressure_access.setValue(c, state.pressure[i]);
         }
+        if (fire && state.fuel[i] != 0.0f) {
+          fuel_access.setValue(c, state.fuel[i]);
+        }
+        if (fire && state.flame[i] != 0.0f) {
+          flame_access.setValue(c, state.flame[i]);
+        }
         if (state.u[i] != 0.0f || state.v[i] != 0.0f || state.w[i] != 0.0f) {
           velocity_access.setValue(c,
                                    openvdb::Vec3f(state.u[i] * voxel_size,
@@ -799,13 +857,22 @@ static Volume *export_sparse_state(const sparse::State &state,
       }
     }
   }
-  trees = {&density->tree(), &temperature->tree(), &velocity->tree(), &pressure->tree()};
+  trees = {&density->tree(),
+           &temperature->tree(),
+           &velocity->tree(),
+           &pressure->tree(),
+           fire ? &fuel->tree() : nullptr,
+           fire ? &flame->tree() : nullptr};
   Volume *volume = BKE_id_new_nomain<Volume>("Gas Simulation Step State");
   /* The volume must own each grid alone. */
   BKE_volume_grid_add_vdb(*volume, "density", std::move(density));
   BKE_volume_grid_add_vdb(*volume, "temperature", std::move(temperature));
   BKE_volume_grid_add_vdb(*volume, "velocity", std::move(velocity));
   BKE_volume_grid_add_vdb(*volume, "pressure", std::move(pressure));
+  if (fire) {
+    BKE_volume_grid_add_vdb(*volume, "fuel", std::move(fuel));
+    BKE_volume_grid_add_vdb(*volume, "flame", std::move(flame));
+  }
   return volume;
 }
 
@@ -833,6 +900,63 @@ static void check_state_grid(const openvdb::GridBase *grid,
   if (!active_values_fit_domain(*grid, resolution, name, error)) {
     throw std::runtime_error(error);
   }
+}
+
+/** Turbulence layers from a point cloud, one point per layer in point order; see the input. */
+static std::vector<sparse::Turbulence> make_turbulence_layers(const GeometrySet &geometry,
+                                                              const float voxel_size)
+{
+  std::vector<sparse::Turbulence> layers;
+  const PointCloud *points = geometry.get_pointcloud();
+  if (!points || points->totpoint == 0) {
+    return layers;
+  }
+  const bke::AttributeAccessor attributes = points->attributes();
+  const bke::AttrDomain domain = bke::AttrDomain::Point;
+  const VArray<float> strength = *attributes.lookup_or_default<float>("strength", domain, 0.0f);
+  const VArray<float> scale = *attributes.lookup_or_default<float>("scale", domain, 0.5f);
+  const VArray<float> speed = *attributes.lookup_or_default<float>("speed", domain, 1.0f);
+  const VArray<float> level = *attributes.lookup_or_default<float>("mask_level", domain, 0.1f);
+  const VArray<int> seed = *attributes.lookup_or_default<int>("seed", domain, 0);
+  const VArray<int> mask = *attributes.lookup_or_default<int>("mask", domain, 1);
+  const VArray<bool> invert = *attributes.lookup_or_default<bool>("invert", domain, false);
+  for (const int i : IndexRange(points->totpoint)) {
+    sparse::Turbulence layer;
+    layer.strength = strength[i] / voxel_size;
+    layer.scale = scale[i] / voxel_size;
+    layer.speed = speed[i];
+    layer.seed = std::uint32_t(std::max(0, seed[i]));
+    switch (mask[i]) {
+      case 0:
+        layer.mask = sparse::TurbulenceMask::None;
+        break;
+      case 2:
+        layer.mask = sparse::TurbulenceMask::Temperature;
+        break;
+      case 3:
+        layer.mask = sparse::TurbulenceMask::Flame;
+        break;
+      case 4:
+        layer.mask = sparse::TurbulenceMask::Speed;
+        break;
+      default:
+        layer.mask = sparse::TurbulenceMask::Density;
+        break;
+    }
+    /* Speed is in world units per second; the solver's in voxels per second. */
+    layer.mask_level = layer.mask == sparse::TurbulenceMask::Speed ? level[i] / voxel_size :
+                                                                     level[i];
+    layer.invert = invert[i];
+    if (!std::isfinite(layer.strength) || !std::isfinite(layer.speed) ||
+        !(layer.scale > 0.0f) || !std::isfinite(layer.scale) ||
+        !(layer.mask_level > 0.0f) || !std::isfinite(layer.mask_level))
+    {
+      throw std::runtime_error(
+          "Turbulence layers need finite values, with positive scale and mask level");
+    }
+    layers.push_back(layer);
+  }
+  return layers;
 }
 
 /**
@@ -874,6 +998,20 @@ static void exec_sparse(GeoNodeExecParams &params,
   turbulence.mask = turbulence_mask > 0.0f ? sparse::TurbulenceMask::Density :
                                              sparse::TurbulenceMask::None;
   turbulence.mask_level = turbulence_mask > 0.0f ? turbulence_mask : 1.0f;
+  const GeometrySet layer_geometry = params.extract_input<GeometrySet>("Turbulence Layers"_ustr);
+  sparse::Fire &fire = settings.fire;
+  fire.burn_rate = params.extract_input<float>("Burn Rate"_ustr);
+  fire.heat = params.extract_input<float>("Flame Heat"_ustr);
+  fire.smoke = params.extract_input<float>("Flame Smoke"_ustr);
+  fire.flame_cooling = params.extract_input<float>("Flame Cooling"_ustr);
+  if (!std::isfinite(fire.burn_rate) || !std::isfinite(fire.heat) ||
+      !std::isfinite(fire.smoke) || !std::isfinite(fire.flame_cooling) ||
+      fire.burn_rate < 0.0f || fire.heat < 0.0f || fire.smoke < 0.0f ||
+      fire.flame_cooling < 0.0f)
+  {
+    fail(params, state, "The fire settings must be finite and not negative.");
+    return;
+  }
   if (!(settings.cfl > 0.0f) || !std::isfinite(settings.cfl) || settings.max_substeps < 1 ||
       !std::isfinite(settings.time) || !std::isfinite(turbulence.strength) ||
       !(turbulence.scale > 0.0f) || !std::isfinite(turbulence.scale) ||
@@ -897,6 +1035,10 @@ static void exec_sparse(GeoNodeExecParams &params,
     grids.temperature = find_float_grid(input, "temperature", token);
     grids.velocity = find_vector_grid(input, "velocity", token);
     grids.pressure = find_float_grid(input, "pressure", token);
+    grids.fuel = find_float_grid(input, "fuel", token);
+    grids.flame = find_float_grid(input, "flame", token);
+    check_state_grid(grids.fuel, "fuel", transform, resolution, checked);
+    check_state_grid(grids.flame, "flame", transform, resolution, checked);
     check_state_grid(grids.density, "density", transform, resolution, checked);
     check_state_grid(grids.temperature, "temperature", transform, resolution, checked);
     check_state_grid(grids.velocity, "velocity", transform, resolution, checked);
@@ -906,8 +1048,10 @@ static void exec_sparse(GeoNodeExecParams &params,
     staggered = grids.velocity && grids.velocity->getGridClass() == openvdb::GRID_STAGGERED;
 
     const Volume *source_volume = source_geometry.get_volume();
+    const openvdb::FloatGrid *source_fuel = find_float_grid(source_volume, "fuel", token);
     sources = make_sources(find_float_grid(source_volume, "density", token),
                            find_float_grid(source_volume, "temperature", token),
+                           source_fuel,
                            find_vector_grid(source_volume, "velocity", token),
                            transform,
                            resolution,
@@ -921,17 +1065,20 @@ static void exec_sparse(GeoNodeExecParams &params,
                    voxel_size,
                    obstacle,
                    obstacle_velocity);
+    /* Fire runs while there is fuel or flame in the state, or fuel to emit. */
+    fire.enabled = grids.fuel || grids.flame || source_fuel;
+    settings.turbulence_layers = make_turbulence_layers(layer_geometry, voxel_size);
   }
   catch (const std::exception &exception) {
     fail(params, state, exception.what());
     return;
   }
   const std::int64_t input_id = grids.state_id();
-  const std::array<const void *, 4> input_trees = grids.trees();
+  const std::array<const void *, 6> input_trees = grids.trees();
   double import_ms = milliseconds_since(import_start);
 
   const std::int64_t output_id = next_state_id();
-  std::array<const void *, 4> output_trees{};
+  std::array<const void *, 6> output_trees{};
   Volume *output_volume = nullptr;
   SparseRun run;
   double solve_ms = 0.0, export_ms = 0.0;
@@ -955,7 +1102,7 @@ static void exec_sparse(GeoNodeExecParams &params,
       run.active_bricks = static_cast<int>(result.topology.brick_count());
       const auto start = std::chrono::steady_clock::now();
       output_volume = export_sparse_state(
-          result, resolution, transform, voxel_size, output_id, output_trees);
+          result, resolution, transform, voxel_size, output_id, fire.enabled, output_trees);
       export_ms = milliseconds_since(start);
     };
     bool done = false;
@@ -1188,7 +1335,8 @@ static openvdb::GridBase::Ptr fit_grid(const GridT &grid,
   return result;
 }
 
-static constexpr const char *state_grid_names[] = {"density", "temperature", "velocity", "pressure"};
+static constexpr const char *state_grid_names[] = {
+    "density", "temperature", "velocity", "pressure", "fuel", "flame"};
 
 /**
  * A simulation zone keeps its state when the domain's settings change part-way through, so the
@@ -1211,8 +1359,9 @@ static bool fit_state_to_domain(GeometrySet &state,
   }
   /* A node downstream may rebuild one grid without the tag; any tagged grid marks the state. */
   bool tagged = false;
-  std::array<bool, 4> misfit{};
-  for (int i = 0; i < 4; ++i) {
+  constexpr int grid_count = int(std::size(state_grid_names));
+  std::array<bool, grid_count> misfit{};
+  for (int i = 0; i < grid_count; ++i) {
     const bke::VolumeGridData *grid_data = BKE_volume_grid_find(volume, state_grid_names[i]);
     if (!grid_data) {
       continue;
@@ -1238,7 +1387,7 @@ static bool fit_state_to_domain(GeometrySet &state,
   }
 
   Volume *edit = state.get_volume_for_write();
-  for (int i = 0; i < 4; ++i) {
+  for (int i = 0; i < grid_count; ++i) {
     if (!misfit[i]) {
       continue;
     }
@@ -1355,9 +1504,10 @@ static void node_geo_exec(GeoNodeExecParams params)
     const float import_ms = static_cast<float>(milliseconds_since(import_start));
     const GeometrySet source_geometry = params.extract_input<GeometrySet>("Sources"_ustr);
     const GeometrySet collider_geometry = params.extract_input<GeometrySet>("Colliders"_ustr);
-    const bool sparse_only_inputs = source_geometry.has_volume() ||
-                                    collider_geometry.has_volume() ||
-                                    params.extract_input<float>("Turbulence"_ustr) != 0.0f;
+    const bool sparse_only_inputs =
+        source_geometry.has_volume() || collider_geometry.has_volume() ||
+        params.extract_input<float>("Turbulence"_ustr) != 0.0f ||
+        params.extract_input<GeometrySet>("Turbulence Layers"_ustr).has_pointcloud();
 
     MantaGasState manta_state;
     manta_state.resolution = {resolution.x, resolution.y, resolution.z};
@@ -1418,7 +1568,8 @@ static void node_geo_exec(GeoNodeExecParams params)
     if (sparse_only_inputs) {
       params.error_message_add(
           NodeWarningType::Warning,
-          TIP_("Sources, Colliders and Turbulence are used only by the Sparse GPU solver"));
+          TIP_("Sources, Colliders, Turbulence and fire are used only by the Sparse GPU "
+               "solver"));
     }
     if (!diagnostics.pressure_converged) {
       params.error_message_add(

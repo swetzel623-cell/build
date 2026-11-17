@@ -32,6 +32,10 @@ class Zone:
         # Resolution of the initial grids; None means the node's own resolution.
         self.init_res = params.pop("init_res", None)
         self.readback = params.pop("readback", True)
+        # More state grids to read back, such as ("fuel", "flame").
+        self.extra_grids = tuple(params.pop("extra_grids", ()))
+        # Callable (builder, zone) -> geometry socket for the node's Turbulence Layers.
+        self.layers = params.pop("layers", None)
         # Callables (builder, zone) -> volume socket for the node's Sources and Colliders.
         self.sources = params.pop("sources", None)
         self.colliders = params.pop("colliders", None)
@@ -259,6 +263,8 @@ def _zone(b, zone, initial):
         b.link(zone.sources(b, zone), gas.inputs["Sources"])
     if zone.colliders is not None:
         b.link(zone.colliders(b, zone), gas.inputs["Colliders"])
+    if zone.layers is not None:
+        b.link(zone.layers(b, zone), gas.inputs["Turbulence Layers"])
     b.link(gas.outputs["State"], sim_out.inputs["Geometry"])
 
     diag = b.new("GeometryNodePoints").outputs[0]
@@ -289,7 +295,7 @@ def _readback(b, zone, state, diag):
         cloud = node.outputs["Geometry"]
 
     if zone.readback:
-        for name in GRID_NAMES:
+        for name in GRID_NAMES + zone.extra_grids:
             vector = name == "velocity"
             get = b.new("GeometryNodeGetNamedGrid", data_type="VECTOR" if vector else "FLOAT")
             b.link(state, get.inputs["Volume"])
@@ -362,7 +368,7 @@ def evaluate(obj, zones, frame=None):
         lo, hi = offsets[zone.prefix]
         result = {}
         if zone.readback:
-            for name in GRID_NAMES:
+            for name in GRID_NAMES + zone.extra_grids:
                 result[name] = _attribute(cloud, zone.prefix + name, 3 if name == "velocity" else 1)[lo:hi].copy()
         for name in DIAG_NAMES:
             result[name] = float(_attribute(cloud, zone.prefix + name, 1)[lo])
@@ -392,3 +398,35 @@ def as_grid(zone, flat):
 
 def interior(zone, flat):
     return as_grid(zone, flat)[1:-1, 1:-1, 1:-1]
+
+
+def turbulence_layers(b, layers):
+    """Point cloud for the Turbulence Layers input: one point per dict of layer attributes."""
+    points = b.new("GeometryNodePoints")
+    points.inputs["Count"].default_value = len(layers)
+    cloud = points.outputs[0]
+    index = b.new("GeometryNodeInputIndex").outputs[0]
+    names = sorted({key for layer in layers for key in layer})
+    for name in names:
+        kind = {"seed": "INT", "mask": "INT", "invert": "BOOLEAN"}.get(name, "FLOAT")
+        # The value of point i: a chain of switches on the index.
+        value = None
+        for i, layer in enumerate(layers):
+            constant = layer.get(name, 0)
+            if value is None:
+                value = constant
+                continue
+            compare = b.new("FunctionNodeCompare", data_type="INT", operation="EQUAL")
+            b.link(index, compare.inputs["A"])
+            compare.inputs["B"].default_value = i
+            switch = b.new("GeometryNodeSwitch", input_type=kind)
+            b.link(compare.outputs[0], switch.inputs["Switch"])
+            b.set(switch.inputs["False"], value)
+            switch.inputs["True"].default_value = constant
+            value = switch.outputs[0]
+        store = b.new("GeometryNodeStoreNamedAttribute", data_type=kind, domain="POINT")
+        store.inputs["Name"].default_value = name
+        b.link(cloud, store.inputs["Geometry"])
+        b.set(store.inputs["Value"], value)
+        cloud = store.outputs["Geometry"]
+    return cloud

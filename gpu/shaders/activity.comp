@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Mark every storage slot that holds smoke, heat, or (above its threshold) velocity, and record
+// Mark every storage slot that holds smoke, heat, fuel, flame, or (above its threshold) velocity, and record
 // each slot's largest velocity component. Mirrors the CPU reference's activity test and
 // max_speed(); the flags decide the next topology and the speeds the next time step.
 #version 450
@@ -21,6 +21,8 @@ layout(std430, binding = 5) readonly buffer W { float w[]; };
 layout(std430, binding = 6) buffer Flags { uint flags[]; };
 /* Bit patterns of non-negative floats order like the floats, so an integer maximum works. */
 layout(std430, binding = 7) buffer Speeds { uint speed_bits[]; };
+layout(std430, binding = 8) readonly buffer Fuel { float fuel[]; };
+layout(std430, binding = 9) readonly buffer Flame { float flame[]; };
 
 void main()
 {
@@ -30,6 +32,7 @@ void main()
   }
   bool has_content = abs(density[i]) > P.scalar_threshold ||
                 abs(temperature[i]) > P.scalar_threshold ||
+                abs(fuel[i]) > P.scalar_threshold || abs(flame[i]) > P.scalar_threshold ||
                 abs(u[i]) > P.velocity_threshold || abs(v[i]) > P.velocity_threshold ||
                 abs(w[i]) > P.velocity_threshold;
   if (has_content) {

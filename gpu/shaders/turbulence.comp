@@ -2,7 +2,7 @@
 // The turbulence force on faces between two fluid cells. Mirrors add_turbulence in the CPU
 // reference, operation for operation.
 // P.a = (strength * dt, 1 / scale, blend between the time slices, mask level);
-// P.flags = (seed, 1 if MASK scales the force, first time slice, unused).
+// P.flags = (seed, 1 if MASK scales the force, first time slice, 1 to invert the mask).
 #version 450
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
@@ -104,6 +104,9 @@ float face_force(ivec3 c, int index, int axis)
   if (P.flags.y != 0) {
     float value = 0.5 * (MASK[index] + MASK[index_of(below)]);
     weight = min(max(value / P.a.w, 0.0), 1.0);
+    if (P.flags.w != 0) {
+      weight = 1.0 - weight;
+    }
   }
   vec3 p = vec3(c) + vec3(axis == 0 ? 0.0 : 0.5, axis == 1 ? 0.0 : 0.5, axis == 2 ? 0.0 : 0.5);
   return P.a.x * curl(axis, p * P.a.y) * weight;

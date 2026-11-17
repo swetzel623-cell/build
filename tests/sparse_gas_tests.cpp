@@ -795,6 +795,166 @@ void test_turbulence_stirs()
 
 }  // namespace
 
+/** Fuel burns into flame, heat and smoke at the burn rate, and the flame fades once it is gone. */
+void test_fire_burns()
+{
+  const Extent extent{32, 32, 48};
+  const DenseFields shape = blob(extent, 16.0f, 16.0f, 12.0f, 4.0f);
+  DenseFields initial = shape;
+  std::fill(initial.density.begin(), initial.density.end(), 0.0f);
+  std::fill(initial.temperature.begin(), initial.temperature.end(), 0.0f);
+  initial.fuel = shape.density;
+  initial.flame.assign(shape.density.size(), 0.0f);
+  const double fuel = sum(initial.fuel);
+
+  Settings settings;
+  settings.fire.enabled = true;
+  settings.fire.burn_rate = 0.6f;
+  settings.fire.heat = 3.0f;
+  settings.fire.smoke = 0.5f;
+  settings.fire.flame_cooling = 5.0f;
+  settings.gravity[2] = -196.0f; /* 9.81 m/s^2 at 5 cm voxels, as in Blender. */
+  settings.pressure_solver = PressureSolver::Multigrid;
+  settings.pressure_iterations = 6;
+
+  /* At rest, burning is exact: one step burns burn_rate * dt of each voxel's fuel. */
+  State still = from_dense(initial, 8, settings.thresholds, settings.dilation);
+  combust(still, settings.fire, 0.5f);
+  DenseFields burnt = to_dense(still);
+  const double gone = fuel - sum(burnt.fuel);
+  std::cout << "  half a second: fuel " << fuel << " -> " << sum(burnt.fuel) << ", smoke "
+            << sum(burnt.density) << ", heat " << sum(burnt.temperature) << std::endl;
+  require(std::abs(sum(burnt.density) - 0.5 * gone) < 1.0e-3 * fuel, "smoke is not 0.5 per fuel");
+  require(std::abs(sum(burnt.temperature) - 3.0 * gone) < 1.0e-3 * fuel,
+          "heat is not 3 per fuel");
+  float most_flame = 0.0f;
+  for (const float value : burnt.flame) {
+    most_flame = std::max(most_flame, value);
+  }
+  require(most_flame == 1.0f, "fuel burning at the full rate does not flame at 1");
+  for (std::size_t i = 0; i < burnt.fuel.size(); ++i) {
+    const float expected = std::max(initial.fuel[i] - 0.3f, 0.0f);
+    require(std::abs(burnt.fuel[i] - expected) < 1.0e-6f, "fuel did not burn at the rate");
+  }
+  /* Without fuel the flame fades at flame_cooling: from 1 to 0.5 in 0.1 s, gone by 0.2 s. */
+  State faded = still;
+  std::fill(faded.fuel.begin(), faded.fuel.end(), 0.0f);
+  combust(faded, settings.fire, 0.1f);
+  float left = 0.0f;
+  for (const float value : faded.flame) {
+    left = std::max(left, value);
+  }
+  require(std::abs(left - 0.5f) < 1.0e-6f, "the flame did not fade at flame_cooling");
+  combust(faded, settings.fire, 0.1f);
+  left = 0.0f;
+  for (const float value : faded.flame) {
+    left = std::max(left, value);
+  }
+  require(left == 0.0f, "the flame did not fade without fuel");
+
+  /* Burning heats the gas, so a fire rises; its smoke conserves what the fuel became. */
+  State fire = from_dense(initial, 8, settings.thresholds, settings.dilation);
+  for (int frame = 0; frame < 12; ++frame) {
+    advance(fire, settings, 1.0f / 30.0f);
+  }
+  const DenseFields result = to_dense(fire);
+  const double rise = center_of_mass_z(result) - center_of_mass_z(shape);
+  const double total = sum(result.fuel) + sum(result.density) / settings.fire.smoke;
+  std::cout << "  12 frames: smoke centre " << rise << " voxels up, fuel + smoke/0.5 = " << total
+            << " of " << fuel << std::endl;
+  require(rise > 1.0, "the fire did not rise");
+  require(std::abs(total / fuel - 1.0) < 1.0e-3, "burning lost or made material");
+
+  /* Disabled, the fuel just sits and nothing burns. */
+  Settings off = settings;
+  off.fire.enabled = false;
+  State cold = from_dense(initial, 8, off.thresholds, off.dilation);
+  advance(cold, off, 1.0f / 30.0f);
+  require(sum(to_dense(cold).density) == 0.0, "fuel burned with the fire off");
+
+  /* A source emits fuel like density. */
+  DenseFields emit = initial;
+  std::fill(emit.fuel.begin(), emit.fuel.end(), 0.0f);
+  emit.fuel = shape.density;
+  DenseFields empty = initial;
+  std::fill(empty.fuel.begin(), empty.fuel.end(), 0.0f);
+  State lit = from_dense(empty, 8, settings.thresholds, settings.dilation);
+  const Sources source = sources_from_dense(emit, 8, SourceMode::Raise);
+  require(source.field.channels.size() == 3, "sources do not carry a fuel channel");
+  for (int frame = 0; frame < 6; ++frame) {
+    advance(lit, settings, 1.0f / 30.0f, &source);
+  }
+  const DenseFields lit_dense = to_dense(lit);
+  std::cout << "  source: flame " << sum(lit_dense.flame) << ", smoke " << sum(lit_dense.density)
+            << std::endl;
+  require(sum(lit_dense.flame) > 0.0 && sum(lit_dense.density) > 0.0,
+          "an emitted fuel did not burn");
+}
+
+/** Turbulence layers apply in order; a speed mask makes a layer react to the ones before it. */
+void test_turbulence_layers_in_order()
+{
+  const Extent extent{32, 32, 48};
+  const DenseFields initial = blob(extent, 16.0f, 16.0f, 24.0f, 6.0f);
+  Settings settings;
+  settings.dilation = 1000;
+  const State start = from_dense(initial, 8, settings.thresholds, settings.dilation);
+
+  Turbulence large;
+  large.strength = 400.0f;
+  large.scale = 12.0f;
+  large.seed = 1;
+  large.mask = TurbulenceMask::None;
+  Turbulence fine;
+  fine.strength = 300.0f;
+  fine.scale = 3.0f;
+  fine.seed = 2;
+  fine.mask = TurbulenceMask::Speed;
+  fine.mask_level = 4.0f;
+
+  const auto run = [&](const std::vector<Turbulence> &layers) {
+    State state = start;
+    for (const Turbulence &layer : layers) {
+      add_turbulence(state, layer, 0.0f, 1.0f / 30.0f);
+    }
+    return state;
+  };
+  const auto difference = [](const State &a, const State &b) {
+    double result = 0.0;
+    for (std::size_t i = 0; i < a.u.size(); ++i) {
+      result = std::max({result, static_cast<double>(std::abs(a.u[i] - b.u[i])),
+                         static_cast<double>(std::abs(a.v[i] - b.v[i])),
+                         static_cast<double>(std::abs(a.w[i] - b.w[i]))});
+    }
+    return result;
+  };
+  /* The air starts at rest, so the fine layer alone does nothing; after the large layer it
+   * stirs where the large one made the air move. */
+  require(difference(run({fine}), start) == 0.0, "a speed mask stirred air at rest");
+  const double order = difference(run({large, fine}), run({fine, large}));
+  std::cout << "  large then fine differs from fine then large by " << order << " voxels/s"
+            << std::endl;
+  require(order > 1.0, "the order of the layers did not matter");
+  Turbulence inverted = fine;
+  inverted.invert = true;
+  require(difference(run({inverted}), start) > 1.0, "an inverted speed mask did not stir still air");
+  /* step() applies Settings::turbulence, then the layers, in order. */
+  Settings layered = settings;
+  layered.heat_buoyancy = 0.0f;
+  layered.turbulence = large;
+  layered.turbulence_layers = {fine};
+  layered.reflection = false;
+  layered.pressure_solver = PressureSolver::Multigrid;
+  layered.pressure_iterations = 4;
+  Settings swapped = layered;
+  swapped.turbulence = fine;
+  swapped.turbulence_layers = {large};
+  State a = start, b = start;
+  step(a, layered);
+  step(b, swapped);
+  require(difference(a, b) > 0.5, "step() does not apply the layers in order");
+}
+
 int main()
 {
   const std::vector<std::pair<std::string, std::function<void()>>> tests = {
@@ -814,6 +974,8 @@ int main()
       {"sources emit", test_sources_emit},
       {"moving obstacle pushes smoke", test_moving_obstacle_pushes_smoke},
       {"turbulence stirs", test_turbulence_stirs},
+      {"fire burns", test_fire_burns},
+      {"turbulence layers in order", test_turbulence_layers_in_order},
   };
   const char *only = std::getenv("SPARSE_GAS_TEST");
   for (const auto &[name, test] : tests) {

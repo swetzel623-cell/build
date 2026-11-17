@@ -176,6 +176,8 @@ std::vector<std::uint8_t> activity_flags(const State &state, const ActivityThres
     for (std::size_t i = slot * per_brick; i < (slot + 1) * per_brick && !active; ++i) {
       active = std::abs(state.density[i]) > thresholds.scalar ||
                std::abs(state.temperature[i]) > thresholds.scalar ||
+               std::abs(state.fuel[i]) > thresholds.scalar ||
+               std::abs(state.flame[i]) > thresholds.scalar ||
                std::abs(state.u[i]) > thresholds.velocity ||
                std::abs(state.v[i]) > thresholds.velocity ||
                std::abs(state.w[i]) > thresholds.velocity;
@@ -190,8 +192,14 @@ std::vector<std::uint8_t> activity_flags(const State &state, const ActivityThres
 void resize_channels(State &state)
 {
   const std::size_t count = state.topology.voxel_count();
-  for (std::vector<float> *channel :
-       {&state.density, &state.temperature, &state.u, &state.v, &state.w, &state.pressure})
+  for (std::vector<float> *channel : {&state.density,
+                                      &state.temperature,
+                                      &state.fuel,
+                                      &state.flame,
+                                      &state.u,
+                                      &state.v,
+                                      &state.w,
+                                      &state.pressure})
   {
     channel->assign(count, 0.0f);
   }
@@ -361,6 +369,10 @@ State from_dense(const DenseFields &dense,
   if (has_pressure && dense.pressure.size() != count) {
     throw std::invalid_argument("Dense pressure does not match the extent");
   }
+  const bool has_fire = !dense.fuel.empty();
+  if (has_fire && (dense.fuel.size() != count || dense.flame.size() != count)) {
+    throw std::invalid_argument("Dense fuel and flame do not match the extent");
+  }
 
   const Extent bricks = {ceil_div(extent.x, brick_size),
                          ceil_div(extent.y, brick_size),
@@ -372,6 +384,8 @@ State from_dense(const DenseFields &dense,
         const std::size_t i = dense_index(extent, x, y, z);
         const bool active = std::abs(dense.density[i]) > thresholds.scalar ||
                             std::abs(dense.temperature[i]) > thresholds.scalar ||
+                            (has_fire && (std::abs(dense.fuel[i]) > thresholds.scalar ||
+                                          std::abs(dense.flame[i]) > thresholds.scalar)) ||
                             (has_velocity && (std::abs(dense.u[i]) > thresholds.velocity ||
                                               std::abs(dense.v[i]) > thresholds.velocity ||
                                               std::abs(dense.w[i]) > thresholds.velocity));
@@ -395,6 +409,10 @@ State from_dense(const DenseFields &dense,
     const std::size_t i = dense_index(extent, x, y, z);
     state.density[index] = dense.density[i];
     state.temperature[index] = dense.temperature[i];
+    if (has_fire) {
+      state.fuel[index] = dense.fuel[i];
+      state.flame[index] = dense.flame[i];
+    }
     if (has_velocity) {
       state.u[index] = dense.u[i];
       state.v[index] = dense.v[i];
@@ -417,8 +435,14 @@ DenseFields to_dense(const State &state)
   const std::size_t count = static_cast<std::size_t>(extent.x) * extent.y * extent.z;
   DenseFields dense;
   dense.extent = extent;
-  for (std::vector<float> *channel :
-       {&dense.density, &dense.temperature, &dense.u, &dense.v, &dense.w, &dense.pressure})
+  for (std::vector<float> *channel : {&dense.density,
+                                      &dense.temperature,
+                                      &dense.fuel,
+                                      &dense.flame,
+                                      &dense.u,
+                                      &dense.v,
+                                      &dense.w,
+                                      &dense.pressure})
   {
     channel->assign(count, 0.0f);
   }
@@ -429,6 +453,8 @@ DenseFields to_dense(const State &state)
     const std::size_t i = dense_index(extent, x, y, z);
     dense.density[i] = state.density[index];
     dense.temperature[i] = state.temperature[index];
+    dense.fuel[i] = state.fuel[index];
+    dense.flame[i] = state.flame[index];
     dense.u[i] = state.u[index];
     dense.v[i] = state.v[index];
     dense.w[i] = state.w[index];
@@ -487,6 +513,8 @@ void retopologize(State &state,
     };
     copy(state.density, moved.density);
     copy(state.temperature, moved.temperature);
+    copy(state.fuel, moved.fuel);
+    copy(state.flame, moved.flame);
     copy(state.u, moved.u);
     copy(state.v, moved.v);
     copy(state.w, moved.w);
@@ -668,7 +696,9 @@ Sources sources_from_dense(const DenseFields &dense, const int brick_size, const
 {
   Sources sources;
   sources.mode = mode;
-  std::vector<const std::vector<float> *> channels = {&dense.density, &dense.temperature};
+  const std::vector<float> no_fuel(dense.fuel.empty() ? dense.density.size() : 0, 0.0f);
+  std::vector<const std::vector<float> *> channels = {
+      &dense.density, &dense.temperature, dense.fuel.empty() ? &no_fuel : &dense.fuel};
   if (!dense.u.empty()) {
     channels.insert(channels.end(), {&dense.u, &dense.v, &dense.w});
   }
@@ -1030,6 +1060,45 @@ float curl(const std::uint32_t seed,
 
 }  // namespace
 
+void cell_speed(const State &state, std::vector<float> &result)
+{
+  const Topology &topology = state.topology;
+  result.assign(topology.voxel_count(), 0.0f);
+  for_each_voxel(topology, [&](const std::size_t index, const int x, const int y, const int z) {
+    /* The same arithmetic as speed.comp: the mean of each component's two faces. */
+    const float u = 0.5f * (state.u[index] + fetch(topology, state.u, x + 1, y, z));
+    const float v = 0.5f * (state.v[index] + fetch(topology, state.v, x, y + 1, z));
+    const float w = 0.5f * (state.w[index] + fetch(topology, state.w, x, y, z + 1));
+    result[index] = std::sqrt(u * u + v * v + w * w);
+  });
+}
+
+void combust(State &state, const Fire &fire, const float dt)
+{
+  if (!fire.enabled) {
+    return;
+  }
+  const Topology &topology = state.topology;
+  const float capacity = fire.burn_rate * dt;
+  const float fade = fire.flame_cooling * dt;
+  for (std::size_t i = 0; i < topology.voxel_count(); ++i) {
+    if (topology.cell_type[i] == CellSolid) {
+      continue;
+    }
+    /* The same arithmetic as combust.comp. */
+    float flame = std::max(state.flame[i] - fade, 0.0f);
+    const float fuel = state.fuel[i];
+    if (fuel > 0.0f && capacity > 0.0f) {
+      const float burnt = std::min(fuel, capacity);
+      state.fuel[i] = fuel - burnt;
+      state.temperature[i] += fire.heat * burnt;
+      state.density[i] += fire.smoke * burnt;
+      flame = std::max(flame, burnt / capacity);
+    }
+    state.flame[i] = flame;
+  }
+}
+
 void turbulence_time(const Turbulence &turbulence, const float time, int &slice, float &blend)
 {
   const NoiseTime when = noise_time(turbulence, time);
@@ -1046,11 +1115,25 @@ void add_turbulence(State &state, const Turbulence &turbulence, const float time
   const float push = turbulence.strength * dt;
   const float inverse_scale = 1.0f / turbulence.scale;
   const NoiseTime when = noise_time(turbulence, time);
-  const std::vector<float> *mask = turbulence.mask == TurbulenceMask::Density ?
-                                       &state.density :
-                                   turbulence.mask == TurbulenceMask::Temperature ?
-                                       &state.temperature :
-                                       nullptr;
+  std::vector<float> speed;
+  const std::vector<float> *mask = nullptr;
+  switch (turbulence.mask) {
+    case TurbulenceMask::None:
+      break;
+    case TurbulenceMask::Density:
+      mask = &state.density;
+      break;
+    case TurbulenceMask::Temperature:
+      mask = &state.temperature;
+      break;
+    case TurbulenceMask::Flame:
+      mask = &state.flame;
+      break;
+    case TurbulenceMask::Speed:
+      cell_speed(state, speed);
+      mask = &speed;
+      break;
+  }
   std::vector<float> *faces[3] = {&state.u, &state.v, &state.w};
   for_each_voxel(topology, [&](const std::size_t index, const int x, const int y, const int z) {
     if (topology.cell_type[index] != CellFluid) {
@@ -1065,6 +1148,9 @@ void add_turbulence(State &state, const Turbulence &turbulence, const float time
       if (mask) {
         const float value = 0.5f * ((*mask)[index] + fetch(topology, *mask, nx, ny, nz));
         weight = std::min(std::max(value / turbulence.mask_level, 0.0f), 1.0f);
+        if (turbulence.invert) {
+          weight = 1.0f - weight;
+        }
       }
       /* The face's centre: on the lower face of the voxel along `axis`. */
       const float px = static_cast<float>(x) + (axis == 0 ? 0.0f : 0.5f);
@@ -1124,11 +1210,17 @@ void inject(State &state, const Sources *sources, const float dt)
   if (emit && sources->field.table.size() != topology.brick_table.size()) {
     throw std::invalid_argument("The sources do not match the state's brick grid");
   }
-  const bool with_velocity = emit && sources->field.channels.size() >= 5;
+  if (emit && sources->field.channels.size() != 3 && sources->field.channels.size() != 6) {
+    throw std::invalid_argument(
+        "Sources have density, temperature and fuel, and optionally velocity");
+  }
+  const bool with_velocity = emit && sources->field.channels.size() == 6;
   for_each_voxel(topology, [&](const std::size_t index, const int x, const int y, const int z) {
     if (topology.cell_type[index] == CellSolid) {
       state.density[index] = 0.0f;
       state.temperature[index] = 0.0f;
+      state.fuel[index] = 0.0f;
+      state.flame[index] = 0.0f;
       return;
     }
     if (!emit) {
@@ -1136,6 +1228,7 @@ void inject(State &state, const Sources *sources, const float dt)
     }
     const float density = sources->field.at(0, x, y, z);
     const float temperature = sources->field.at(1, x, y, z);
+    const float fuel = sources->field.at(2, x, y, z);
     if (sources->mode == SourceMode::Raise) {
       if (density != 0.0f) {
         state.density[index] = std::max(state.density[index], density);
@@ -1143,15 +1236,19 @@ void inject(State &state, const Sources *sources, const float dt)
       if (temperature != 0.0f) {
         state.temperature[index] = std::max(state.temperature[index], temperature);
       }
+      if (fuel != 0.0f) {
+        state.fuel[index] = std::max(state.fuel[index], fuel);
+      }
     }
     else {
       state.density[index] += density * dt;
       state.temperature[index] += temperature * dt;
+      state.fuel[index] += fuel * dt;
     }
-    if (with_velocity && (density != 0.0f || temperature != 0.0f)) {
-      state.u[index] = sources->field.at(2, x, y, z);
-      state.v[index] = sources->field.at(3, x, y, z);
-      state.w[index] = sources->field.at(4, x, y, z);
+    if (with_velocity && (density != 0.0f || temperature != 0.0f || fuel != 0.0f)) {
+      state.u[index] = sources->field.at(3, x, y, z);
+      state.v[index] = sources->field.at(4, x, y, z);
+      state.w[index] = sources->field.at(5, x, y, z);
     }
   });
 }
@@ -1273,7 +1370,7 @@ StepInfo step(State &state, const Settings &settings, const Sources *sources)
   inject(state, sources, settings.dt);
 
   /* Advect the scalars and a velocity (`sources`) through the state's velocity for `dt`. */
-  std::vector<float> density, temperature, u, v, w, forward;
+  std::vector<float> density, temperature, fuel, flame, u, v, w, forward;
   const auto advect_all = [&](const float dt, const std::vector<float> &source_u,
                               const std::vector<float> &source_v,
                               const std::vector<float> &source_w) {
@@ -1294,6 +1391,12 @@ StepInfo step(State &state, const Settings &settings, const Sources *sources)
     };
     advect_channel(state.density, 0.5f, 0.5f, 0.5f, density, settings.conserve_mass);
     advect_channel(state.temperature, 0.5f, 0.5f, 0.5f, temperature, settings.conserve_mass);
+    if (settings.fire.enabled) {
+      advect_channel(state.fuel, 0.5f, 0.5f, 0.5f, fuel, settings.conserve_mass);
+      advect_channel(state.flame, 0.5f, 0.5f, 0.5f, flame, settings.conserve_mass);
+      state.fuel.swap(fuel);
+      state.flame.swap(flame);
+    }
     advect_channel(source_u, 0.0f, 0.5f, 0.5f, u);
     advect_channel(source_v, 0.5f, 0.0f, 0.5f, v);
     advect_channel(source_w, 0.5f, 0.5f, 0.0f, w);
@@ -1304,6 +1407,7 @@ StepInfo step(State &state, const Settings &settings, const Sources *sources)
     state.w.swap(w);
   };
   const auto add_forces = [&](const float dt) {
+    combust(state, settings.fire, dt);
     if (settings.heat_buoyancy != 0.0f) {
       add_buoyancy(state, state.temperature, settings.heat_buoyancy, dt, settings.gravity);
     }
@@ -1311,6 +1415,9 @@ StepInfo step(State &state, const Settings &settings, const Sources *sources)
       add_buoyancy(state, state.density, settings.density_buoyancy, dt, settings.gravity);
     }
     add_turbulence(state, settings.turbulence, settings.time, dt);
+    for (const Turbulence &layer : settings.turbulence_layers) {
+      add_turbulence(state, layer, settings.time, dt);
+    }
     enforce_walls(state);
   };
 

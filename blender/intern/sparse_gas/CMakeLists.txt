@@ -26,7 +26,7 @@ set(LIB
 set(SPARSE_GAS_KERNELS
   advect maccormack buoyancy walls divergence jacobi gradient activity remap classify
   classify_links mask_pressure mg_smooth0 mg_restrict0 mg_smooth mg_residual mg_restrict copy3
-  reflect conserve_reduce conserve_apply inject turbulence mg_prolong0 mg_prolong mg_build0 mg_build mg_dense_cycle
+  reflect conserve_reduce conserve_apply inject turbulence combust speed mg_prolong0 mg_prolong mg_build0 mg_build mg_dense_cycle
 )
 
 if(VULKAN_INCLUDE_DIRS)

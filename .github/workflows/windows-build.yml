@@ -1,5 +1,9 @@
 # Builds the pinned Blender source with the gas-step overlay on Windows and uploads a portable
-# zip. Start it from the Actions tab ("Run workflow"); it takes a few hours.
+# zip. Start it from the Actions tab ("Run workflow").
+#
+# sccache keeps every compiled file between runs (in the Actions cache, keyed by the Blender
+# commit), so a run recompiles only the files that changed since the last one. The first run
+# after the cache is empty or evicted compiles everything, which takes about two hours.
 name: Windows test build
 
 on:
@@ -23,6 +27,26 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: overlay
+
+      - name: Install sccache
+        shell: pwsh
+        run: |
+          $version = "v0.8.2"
+          $name = "sccache-$version-x86_64-pc-windows-msvc"
+          Invoke-WebRequest -Uri "https://github.com/mozilla/sccache/releases/download/$version/$name.zip" -OutFile "$env:RUNNER_TEMP\sccache.zip"
+          Expand-Archive "$env:RUNNER_TEMP\sccache.zip" -DestinationPath "C:\sccache-bin"
+          "C:\sccache-bin\$name" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "SCCACHE_DIR=C:\sccache" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SCCACHE_CACHE_SIZE=6G" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # The newest cache of this Blender commit. Each run saves a new one under its own key.
+      - name: Restore the compiler cache
+        id: restore_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\sccache
+          key: sccache-windows-${{ env.BLENDER_COMMIT }}-${{ github.run_id }}
+          restore-keys: sccache-windows-${{ env.BLENDER_COMMIT }}-
 
       - name: Fetch Blender at the pinned commit
         shell: bash
@@ -67,6 +91,7 @@ jobs:
           python overlay/blender/apply_integration.py /c/bl
 
       - name: Configure and build
+        id: build
         shell: cmd
         run: |
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSDIR=%%i
@@ -77,10 +102,25 @@ jobs:
             -DWITH_CYCLES=OFF ^
             -DWITH_GTESTS=OFF ^
             -DWITH_BUILDINFO=OFF ^
-            -DWITH_WINDOWS_RELEASE_PDB=OFF || exit /b 1
+            -DWITH_WINDOWS_RELEASE_PDB=OFF ^
+            -DWITH_WINDOWS_SCCACHE=ON || exit /b 1
           findstr /C:"SPARSE_GAS_GLSLANG:FILEPATH=C:" %BUILD_DIR%\CMakeCache.txt || (echo The sparse solver's GPU kernels were not enabled & exit /b 1)
+          sccache --zero-stats
           cmake --build %BUILD_DIR% --target install || exit /b 1
+          sccache --show-stats
           dir %DIST_DIR%
+
+      # Saved even if the build failed part way, so the next run keeps what did compile.
+      - name: Save the compiler cache
+        if: always() && steps.restore_cache.outcome == 'success'
+        shell: bash
+        run: sccache --stop-server || true
+      - name: Upload the compiler cache
+        if: always() && steps.restore_cache.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\sccache
+          key: sccache-windows-${{ env.BLENDER_COMMIT }}-${{ github.run_id }}
 
       # Add Modifier > Physics > Pyro Simulation, and the Pyro building blocks in the
       # node editor: node-group assets written into the build's own Essentials library.
@@ -89,6 +129,10 @@ jobs:
         run: |
           %DIST_DIR%\blender.exe -b --factory-startup --python overlay\blender\assets\smoke_assets.py || exit /b 1
           dir /s /b %DIST_DIR%\pyro_simulation_assets.blend || exit /b 1
+          rem Updating the assets later needs no rebuild: a newer smoke_assets.py next to
+          rem blender.exe, then a double-click on update_pyro_assets.bat.
+          copy overlay\blender\assets\smoke_assets.py %DIST_DIR%\ || exit /b 1
+          copy overlay\blender\assets\update_pyro_assets.bat %DIST_DIR%\ || exit /b 1
 
       - name: Run the in-Blender runtime tests
         id: tests

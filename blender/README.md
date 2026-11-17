@@ -46,7 +46,11 @@ plus two catalogs in `blender_assets.cats.txt`):
 blender -b --factory-startup --python blender/assets/smoke_assets.py
 ```
 
-The Windows build workflow runs it, so its zip already has them.
+The Windows build workflow runs it, so its zip already has them. It also puts
+`smoke_assets.py` and `update_pyro_assets.bat` next to `blender.exe`: changes to the presets and
+node groups need no new build, only a newer `smoke_assets.py` in that folder and a double-click
+on `update_pyro_assets.bat` (with Blender closed). The workflow keeps compiled files between
+runs with sccache, so a build after a C++ change recompiles only what changed.
 
 **Add Modifier > Physics > Pyro Simulation** turns the selected mesh into a smoke or fire emitter.
 

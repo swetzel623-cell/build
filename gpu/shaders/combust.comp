@@ -23,7 +23,7 @@ void main()
     FUEL[index] = fuel - burnt;
     TEMPERATURE[index] += P.a.z * burnt;
     DENSITY[index] += P.a.w * burnt;
-    flame = max(flame, burnt / capacity);
+    flame = max(flame, min(fuel, 1.0));
   }
   FLAME[index] = flame;
 }

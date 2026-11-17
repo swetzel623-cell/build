@@ -832,6 +832,48 @@ plate in the Colliders collection holds the smoke's top at 0.70 against 1.00 wit
   bit the same. Every sparse test passes again with no Vulkan driver (the CPU fallback, which
   keeps nothing). Not yet timed on a real GPU.
 
+**Fire.** Fuel that burns, after Mantaflow's combustion model in spirit. Every step each voxel
+burns `min(fuel, burn rate × dt)`; what burns adds `heat × burnt` temperature and
+`smoke × burnt` density. Flame is the fuel burning there, up to 1, and otherwise fades at the
+cooling rate; it advects with the gas, so it rises. Sources emit fuel as a third channel; fuel
+and flame advect with MacCormack and the mass limiter and keep bricks active. Fire runs while
+there is fuel or flame, so smoke-only states keep their four grids.
+
+- CPU tests: burning is exact (fuel left plus smoke made accounts for all fuel), heat and smoke
+  per unit of fuel, the flame's fade, a fire rising, nothing burning with fire off, emitted fuel
+  burning. GPU (combust kernel, fuel and flame channels): within 2e-6 of the CPU over 10 frames
+  of a fuel source.
+- In Blender: `Burn Rate`, `Flame Heat`, `Flame Smoke`, `Flame Cooling`; a fuel source makes
+  `fuel` and `flame` grids, flame at full strength over the burner and smoke rising above it.
+
+**Turbulence layers.** Turbulence is a list of layers applied in order. A layer is masked by
+density, temperature, flame, or the speed of the flow, optionally inverted. A speed mask reads
+the flow after the layers before it, so order matters: a fine layer masked by speed stirs only
+where a broad layer made the air move. CPU test: such a fine layer alone does nothing to air at
+rest, and swapping it with the broad layer changes the velocity by 44 voxels/s. GPU (speed
+kernel, a turbulence dispatch per layer): within 3e-5 of the CPU. In Blender a layer given as
+a point gives exactly the same result as the same turbulence given as inputs, and swapping two
+layers changes the density by 28%.
+
+**Pyro Simulation modifier.** Replaces the Smoke Simulation modifier. Presets (Custom, Smoke,
+Large Plume, Trail, Explosion, Campfire, Candle) chosen with a Menu Switch over bundles; a
+`Settings` bundle carries everything between the blocks, so the modifier's top level is 15
+nodes (it was 48). Initial velocity from the emitter's motion, its normals and a vector; a
+particle simulation (burst or rate, spread, drag, gravity, fading) whose particles emit puffs
+carrying their velocity; fire; a fine turbulence layer masked by speed. All 11 blocks are
+assets in Add > Pyro. In-Blender tests: Campfire flames rise to 0.65 over a 0.4 emitter;
+Explosion spreads its smoke 1.93 wide in 8 frames where Smoke spreads 0.42; a cube that moved
+0.05 in 1/30 s emits exactly 1.5 m/s; Turbulence Layer chains keep their order.
+
+![The pyro demo at frame 12](images/pyro_demo_frame12.png)
+
+![The pyro demo at frame 40](images/pyro_demo_frame40.png)
+
+The pictures are side views of the demo's four emitters (smoke and flame summed through the
+depth, from the simulated grids; this headless build cannot render): a campfire under a plate,
+an explosion's fireball and then its smoke, a large plume with flame at its base, and a moving
+emitter's trail.
+
 ## Not verified, and known gaps
 
 - **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.

@@ -36,11 +36,11 @@ The sparse solver's GPU kernels are compiled when CMake finds the Vulkan headers
 when it found both. Blender links no Vulkan library for them: the loader (`vulkan-1.dll`,
 `libvulkan.so.1`) is opened when the node first needs a device.
 
-## Smoke Simulation modifier
+## Pyro Simulation modifier
 
-`blender/assets/smoke_assets.py` builds three node-group assets and installs them into a Blender
-build's own Essentials library (`datafiles/assets/nodes/smoke_simulation_assets.blend`, plus two
-catalogs in `blender_assets.cats.txt`):
+`blender/assets/smoke_assets.py` builds the Pyro node-group assets and installs them into a
+Blender build's own Essentials library (`datafiles/assets/nodes/pyro_simulation_assets.blend`,
+plus two catalogs in `blender_assets.cats.txt`):
 
 ```sh
 blender -b --factory-startup --python blender/assets/smoke_assets.py
@@ -48,24 +48,47 @@ blender -b --factory-startup --python blender/assets/smoke_assets.py
 
 The Windows build workflow runs it, so its zip already has them.
 
-- **Add Modifier > Physics > Smoke Simulation** turns the selected mesh into a smoke emitter.
-  Its panels: Emission (density, temperature, adding instead of raising, an optional velocity),
-  Domain (voxel size, domain size, a Colliders collection), Forces (buoyancy, gravity),
-  Turbulence, Solver (GPU on or off, CFL, substeps) and Display (keep the emitter visible).
-  - The simulation runs in world space. The domain is centred on the emitter on the first frame
-    of the simulation, its floor a tenth of its height below the emitter, and stays there: give
-    a moving emitter a domain that covers its path. Only bricks with smoke cost anything.
-  - Colliders may be animated: their velocity comes from how far their points moved since the
-    previous frame.
-  - Turning the GPU off runs Mantaflow, which does not support emission, colliders or
-    turbulence, so nothing appears.
-- **Add > Simulation > Smoke Source** and **Smoke Collider** (node editor) turn a mesh into the
-  `Sources` and `Colliders` volumes of the Gas Simulation Step node, for setups built by hand.
-  Open the Smoke Simulation group (Tab) to see how they are wired.
+**Add Modifier > Physics > Pyro Simulation** turns the selected mesh into a smoke or fire emitter.
 
-`blender/tests/smoke_modifier_tests.py` checks the installed assets (catalogs once, the modifier
-trait that Add Modifier filters on), smoke rising from an emitter, a moving emitter leaving a
-trail in world space, and a collider collection holding the smoke back:
+- **Preset**: Custom, Smoke, Large Plume, Trail, Explosion, Campfire or Candle. A preset sets the
+  emission, particles, fire, buoyancy and turbulence; the panels below it then show greyed out.
+  `Strength` scales what is emitted and `Speed` the emission and particle speeds of any preset.
+  Custom uses the panels.
+- **Emission**: from the mesh's volume or from particles; density, temperature, fuel; adding
+  instead of raising; `Emit Until` stops emitting after so many seconds.
+- **Initial Velocity**: like Blender's flow setting. `Source` is the share of the emitter's own
+  motion (or each particle's) given to the smoke, `Normal` a speed along the surface normals,
+  and `Velocity` a vector added to both.
+- **Particles**: a point simulation off the emitter's surface: rate and first-frame burst,
+  speed along the normals and random spread, drag, gravity, lifetime (they fade out), radius.
+  Each particle emits a puff of its radius carrying its velocity. The Trail, Explosion and
+  Large Plume presets use them.
+- **Fire**: fuel burns at `Burn Rate` into heat (`Flame Heat`) and smoke (`Flame Smoke`); the
+  flame, as bright as the fuel burning, fades at `Flame Cooling` once the fuel is gone. The
+  material shows the `flame` grid as light from dark red through orange to yellow.
+- **Domain**: voxel size, domain size, and a Colliders collection (may be animated).
+- **Forces**, **Turbulence** (large swirls, then fine swirls that act only where the flow moves,
+  so they follow the large ones), **Solver**, **Display**.
+
+The simulation runs in world space. The domain is centred on the emitter on the first frame of
+the simulation, its floor a tenth of its height below it, and stays there: give a moving emitter
+a domain that covers its path. Only bricks with smoke cost anything. Turning the GPU off runs
+Mantaflow, which has no emission, colliders, turbulence or fire, so nothing appears.
+
+Inside (Tab on the modifier's group) it is one row of blocks: **Pyro Preset** makes one
+`Settings` bundle; **Pyro Domain** places the box; **Pyro Particles** runs the particles; in the
+simulation zone **Pyro Emitter**, **Pyro Colliders** and **Pyro Solver** make one step; **Pyro
+Display** shades the result. All of them, and the lower-level **Pyro Source** (mesh), **Pyro
+Point Source** (points with radius, `velocity` and `emission`), **Pyro Collider** and
+**Turbulence Layer**, are in the node editor's **Add > Pyro** menu for setups built by hand.
+Chain Turbulence Layer nodes into Pyro Preset's `Turbulence Layers` (or the Gas Simulation Step
+node's) for more layers: they apply in chain order, and a layer masked by Speed reacts to the
+ones before it.
+
+`blender/tests/smoke_modifier_tests.py` checks the installed assets, smoke rising, a moving
+emitter's trail, a collider holding smoke back, a setting changed mid-simulation, the Campfire
+preset's flame, the Explosion preset's spread, initial velocity from the emitter's motion (and
+exactly 1.5 m/s from a cube that moved 5 cm in 1/30 s), and Turbulence Layer chains:
 
 ```sh
 blender -b --factory-startup --python blender/tests/smoke_modifier_tests.py
@@ -84,10 +107,15 @@ of Mantaflow (see `docs/gpu-sparse-solver.md`):
 - Advection-reflection steps, MacCormack advection with a midpoint trace, and six multigrid
   cycles per projection. Advection keeps the totals of density and temperature. A `CFL` of 6
   suits it; the Mantaflow default of 2 works but costs three times as many substeps.
-- `Sources` takes a volume whose float grids `density` and `temperature` are emitted every
-  step, for example made with Mesh to Density Grid and Store Named Grid. By default density and
-  temperature are raised to the source's values; `Add Sources` adds them per second instead. An
-  optional vector grid `velocity` (world units per second) is set where they emit.
+- `Sources` takes a volume whose float grids `density`, `temperature` and `fuel` are emitted
+  every step, for example made with Mesh to Density Grid and Store Named Grid. By default they
+  are raised to the source's values; `Add Sources` adds them per second instead. An optional
+  vector grid `velocity` (world units per second) is set where they emit.
+- Fire: while the state has `fuel` or `flame` grids, or the sources have fuel, fuel burns at
+  `Burn Rate` per second into heat (`Flame Heat` per unit) and smoke (`Flame Smoke` per unit).
+  The `flame` grid is the fuel burning (up to 1); it rises with the hot gas and fades at
+  `Flame Cooling` per second once the fuel is gone. The output then carries `fuel` and `flame`
+  grids too.
 - `Colliders` takes a volume whose float grid `obstacle` marks solid voxels (above 0.5) and an
   optional vector grid `velocity` (world units per second) for their motion. It is read every
   frame, so an animated collider moves; smoke inside voxels that become solid is dropped.
@@ -95,7 +123,10 @@ of Mantaflow (see `docs/gpu-sparse-solver.md`):
   gravity times the buoyancy), with `Turbulence Scale` (swirl size), `Turbulence Speed`
   (pattern changes per second), `Turbulence Seed`, and `Turbulence Mask`, the density at which it
   reaches full strength (0 stirs all simulated air, which spreads the smoke through the domain).
-  Connect Scene Time's Seconds to `Time` so the pattern moves.
+  Connect Scene Time's Seconds to `Time` so the pattern moves. `Turbulence Layers` takes more
+  layers, one point each (attributes `strength`, `scale`, `speed`, `seed`, `mask`: 0 none,
+  1 density, 2 temperature, 3 flame, 4 speed; `mask_level`, `invert`), applied in point order
+  after the first; Turbulence Layer node groups build it.
 - Grids in `Sources` and `Colliders` may use any transform: each active voxel goes to the
   nearest domain voxel, so a voxel size equal to the domain's gives the cleanest result. In
   Mantaflow mode both inputs are ignored with a warning.
@@ -105,11 +136,11 @@ of Mantaflow (see `docs/gpu-sparse-solver.md`):
 - Without a usable Vulkan device, or in a build without the kernels, the node runs the solver's
   CPU reference instead (single-threaded and slow) and says so in a warning.
 
-`blender/tests/make_sparse_demo.py` writes a demo file with two plumes in their own zones, one
-under a plate, both with the Smoke Simulation modifier:
+`blender/tests/make_sparse_demo.py` writes a demo file with four Pyro Simulation emitters, one
+per preset: a campfire under a plate, an explosion, a large plume and a moving trail:
 
 ```sh
-blender -b --factory-startup --python blender/tests/make_sparse_demo.py -- sparse_gpu_demo.blend
+blender -b --factory-startup --python blender/tests/make_sparse_demo.py -- pyro_demo.blend
 ```
 
 Only the blocks with smoke cross OpenVDB: the state is read and written brick by brick (8³, like

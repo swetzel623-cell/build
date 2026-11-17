@@ -831,7 +831,10 @@ void test_fire_burns()
   for (const float value : burnt.flame) {
     most_flame = std::max(most_flame, value);
   }
-  require(most_flame == 1.0f, "fuel burning at the full rate does not flame at 1");
+  require(most_flame == 1.0f, "a voxel full of fuel does not flame at 1");
+  for (std::size_t i = 0; i < burnt.flame.size(); ++i) {
+    require(burnt.flame[i] == std::min(initial.fuel[i], 1.0f), "flame is not the fuel burning");
+  }
   for (std::size_t i = 0; i < burnt.fuel.size(); ++i) {
     const float expected = std::max(initial.fuel[i] - 0.3f, 0.0f);
     require(std::abs(burnt.fuel[i] - expected) < 1.0e-6f, "fuel did not burn at the rate");

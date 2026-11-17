@@ -1093,7 +1093,7 @@ void combust(State &state, const Fire &fire, const float dt)
       state.fuel[i] = fuel - burnt;
       state.temperature[i] += fire.heat * burnt;
       state.density[i] += fire.smoke * burnt;
-      flame = std::max(flame, burnt / capacity);
+      flame = std::max(flame, std::min(fuel, 1.0f));
     }
     state.flame[i] = flame;
   }

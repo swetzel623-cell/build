@@ -288,9 +288,9 @@ struct Turbulence {
 };
 
 /**
- * Fire, as fuel that burns: every step, fuel burns at `burn_rate`, and what burns becomes flame,
- * heat and smoke. Flame shows where fuel is burning or has just burnt; it rises with the hot
- * gas and fades at `flame_cooling` once nothing burns there.
+ * Fire, as fuel that burns: every step, fuel burns at `burn_rate`, and what burns becomes heat
+ * and smoke. Flame shows where fuel is burning or has just burnt, as bright as the fuel there
+ * (up to 1); it rises with the hot gas and fades at `flame_cooling` once nothing burns there.
  */
 struct Fire {
   /** Advect and burn fuel and flame. Without fire the two channels are left untouched. */

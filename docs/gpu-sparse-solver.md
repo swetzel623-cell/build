@@ -874,6 +874,45 @@ depth, from the simulated grids; this headless build cannot render): a campfire 
 an explosion's fireball and then its smoke, a large plume with flame at its base, and a moving
 emitter's trail.
 
+**Expansion and the Pyro Emitter.** After Houdini's explosion workflow:
+
+- What SideFX documents ([Pyro Burst Source](https://sidefx.com/docs/houdini/nodes/sop/pyroburstsource.html),
+  [Explosions](https://www.sidefx.com/docs/houdini/pyro/explode.html),
+  [Flames](https://www.sidefx.com/docs/houdini/pyro/flames.html)): an explosion is sourced as
+  points, not a volume. The Burst Source scatters points on a blob, trails them toward the
+  centre (`Number of Trailings`, `Trailing Length`, `Trailing Thickness`, `Roundness`: 1 equal
+  spikes, lower irregular), and animates them outward over `Frame Duration` (`Initial Size`,
+  `Outward Expansion` with a ramp that is fast early). Components source density, temperature,
+  burn and *divergence*, with `Scale Over Duration` and `Scale Along Trailing` ramps; several
+  bursts a few frames apart make a multi-burst. The solver's combustion turns burning into
+  temperature, smoke and expansion ("gas release"), and divergence is what the pressure
+  projection turns into the sudden outward push. Disturbance (random accelerations in thin
+  smoke) breaks up smooth caps.
+- The solver now takes a target divergence per voxel: the sources' expansion plus `gas_release`
+  times the fuel burnt per second; the projection solves for `div u = target` instead of zero.
+  CPU test: a source of 20/s gives the flow a divergence of 19.8/s there and pushes the smoke
+  around it outward; burning 2/s with a gas release of 5 gives 9.9/s, and 0 without. GPU: the
+  same to within 1e-6 (inject records expansion, combust the fuel burnt, the divergence kernel
+  subtracts the target).
+- The Pyro Emitter modifier builds bursts like the Burst Source: spikes in a cone (`Spread`),
+  ragged by `Roundness` and smooth `Shape Noise`, points along each spike from tip to
+  `Spike Length` inward, the radius growing as `Size × (1 + (Outward Expansion − 1) ×
+  (1 − (1 − t)^curve))`, each point's velocity the derivative of that, emission fading over the
+  duration and stronger toward the core. Test: 90 spikes give 88 distinct directions, every
+  point moves outward, the reach grows 0.18, 0.81, 1.04 m at frames 1, 3, 5 and stops at the
+  end of the duration.
+- Tuning, in pictures (shaded from the simulated grids; this build cannot render): the first
+  try (fat puffs, five times the expansion) was a round blob that filled the domain in 16
+  frames:
+
+![First try of the explosion burst](images/burst_first_try.png)
+
+  thinner, more numerous, ragged spikes, a fifth of the expansion and a slower burn give a
+  spiky flash, a burning fireball and a rolling column; Fireball is rounder and rises into a
+  mushroom, Ground Blast spreads flat:
+
+![The burst presets after tuning](images/burst_presets.png)
+
 ## Not verified, and known gaps
 
 - **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.

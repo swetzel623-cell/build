@@ -32,6 +32,8 @@ int source_kind = 0;
 bool with_fire = false;
 /** Two more turbulence layers after the first: a speed-masked one and an inverted flame one. */
 bool with_layers = false;
+/** The source also expands (and fuel, if any, releases gas as it burns). */
+bool with_expansion = false;
 /** Start without the blob: only the sources put smoke in. */
 bool empty_start = false;
 /**
@@ -87,6 +89,7 @@ sparse::Sources scene_sources(const sparse::Extent extent)
   emit.density.assign(count, 0.0f);
   emit.temperature.assign(count, 0.0f);
   emit.fuel.assign(count, 0.0f);
+  emit.expansion.assign(count, 0.0f);
   const float cx = extent.x / 2.0f, cy = extent.y / 2.0f, cz = extent.z / 8.0f;
   const float radius = std::max(2.0f, extent.x / 12.0f);
   const float level = source_kind == 2 ? 6.0f : 0.8f;
@@ -96,6 +99,9 @@ sparse::Sources scene_sources(const sparse::Extent extent)
         const float dx = x + 0.5f - cx, dy = y + 0.5f - cy, dz = z + 0.5f - cz;
         if (dx * dx + dy * dy + dz * dz <= radius * radius) {
           const std::size_t i = x + static_cast<std::size_t>(extent.x) * (y + extent.y * z);
+          if (with_expansion) {
+            emit.expansion[i] = 8.0f;
+          }
           if (with_fire) {
             emit.fuel[i] = level;
             emit.temperature[i] = 0.25f * level;
@@ -326,6 +332,7 @@ sparse::Settings test_settings(const int resolution)
     settings.fire.heat = 2.0f;
     settings.fire.smoke = 0.6f;
     settings.fire.flame_cooling = 3.0f;
+    settings.fire.gas_release = with_expansion ? 2.0f : 0.0f;
   }
   if (first_order) {
     settings.advection = sparse::Advection::SemiLagrangian;
@@ -561,6 +568,9 @@ int main(int argc, char **argv)
     }
     else if (std::string(argv[i]) == "--layers") {
       with_layers = true;
+    }
+    else if (std::string(argv[i]) == "--expansion") {
+      with_expansion = true;
     }
     else if (std::string(argv[i]) == "--image" && i + 1 < argc) {
       image_name = argv[++i];

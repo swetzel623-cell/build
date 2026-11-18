@@ -122,7 +122,8 @@ static void node_declare(NodeDeclarationBuilder &b)
       .description(
           "Sparse GPU only. Volume whose float grids 'density', 'temperature' and 'fuel' are "
           "emitted every step, for example from Mesh to Density Grid. Fuel burns into flame, "
-          "heat and smoke. An optional vector grid 'velocity' (world units per second) is set "
+          "heat and smoke. A float grid 'divergence' (1/s) makes the gas expand there, as in an "
+          "explosion. An optional vector grid 'velocity' (world units per second) is set "
           "where they emit. Grids may use any "
           "transform; each active voxel goes to the nearest domain voxel");
   b.add_input<decl::Bool>("Add Sources"_ustr)
@@ -187,6 +188,11 @@ static void node_declare(NodeDeclarationBuilder &b)
       .default_value(4.0f)
       .min(0.0f)
       .description("Flame lost per second once its fuel is gone. Lower leaves taller flames");
+  b.add_input<decl::Float>("Gas Release"_ustr)
+      .default_value(0.0f)
+      .min(0.0f)
+      .description("Sparse GPU only. How much burning fuel expands: the volume grows by this "
+                   "much per unit of fuel burnt, pushing the fire outward like an explosion");
 
   b.add_output<decl::Int>("Substeps"_ustr).description("Number of internal solver steps executed");
   b.add_output<decl::Float>("Max Velocity"_ustr)
@@ -552,6 +558,7 @@ static openvdb::Vec3f velocity_at(
 static sparse::Sources make_sources(const openvdb::FloatGrid *density,
                                     const openvdb::FloatGrid *temperature,
                                     const openvdb::FloatGrid *fuel,
+                                    const openvdb::FloatGrid *expansion,
                                     const openvdb::Vec3SGrid *velocity,
                                     const openvdb::math::Transform &domain,
                                     const int3 &resolution,
@@ -560,14 +567,14 @@ static sparse::Sources make_sources(const openvdb::FloatGrid *density,
 {
   sparse::Sources sources;
   sources.mode = add ? sparse::SourceMode::Add : sparse::SourceMode::Raise;
-  if (!density && !temperature && !fuel) {
+  if (!density && !temperature && !fuel && !expansion) {
     return sources;
   }
   sources.field = sparse::make_brick_field(
-      {resolution.x, resolution.y, resolution.z}, 8, velocity ? 6 : 3);
+      {resolution.x, resolution.y, resolution.z}, 8, velocity ? 7 : 4);
   sparse::BrickField &field = sources.field;
-  const openvdb::FloatGrid *channels[3] = {density, temperature, fuel};
-  for (int channel = 0; channel < 3; ++channel) {
+  const openvdb::FloatGrid *channels[4] = {density, temperature, fuel, expansion};
+  for (int channel = 0; channel < 4; ++channel) {
     const openvdb::FloatGrid *grid = channels[channel];
     if (!grid) {
       continue;
@@ -592,7 +599,7 @@ static sparse::Sources make_sources(const openvdb::FloatGrid *density,
       for (int local = 0; local < 512; ++local) {
         const std::size_t i = std::size_t(slot) * 512 + std::size_t(local);
         if (field.channels[0][i] == 0.0f && field.channels[1][i] == 0.0f &&
-            field.channels[2][i] == 0.0f)
+            field.channels[2][i] == 0.0f && field.channels[3][i] == 0.0f)
         {
           continue;
         }
@@ -602,9 +609,9 @@ static sparse::Sources make_sources(const openvdb::FloatGrid *density,
                                                  bx * 8 + (local & 7),
                                                  by * 8 + ((local >> 3) & 7),
                                                  bz * 8 + (local >> 6));
-        field.channels[3][i] = value[0];
-        field.channels[4][i] = value[1];
-        field.channels[5][i] = value[2];
+        field.channels[4][i] = value[0];
+        field.channels[5][i] = value[1];
+        field.channels[6][i] = value[2];
       }
     }
   }
@@ -1004,10 +1011,11 @@ static void exec_sparse(GeoNodeExecParams &params,
   fire.heat = params.extract_input<float>("Flame Heat"_ustr);
   fire.smoke = params.extract_input<float>("Flame Smoke"_ustr);
   fire.flame_cooling = params.extract_input<float>("Flame Cooling"_ustr);
+  fire.gas_release = params.extract_input<float>("Gas Release"_ustr);
   if (!std::isfinite(fire.burn_rate) || !std::isfinite(fire.heat) ||
       !std::isfinite(fire.smoke) || !std::isfinite(fire.flame_cooling) ||
-      fire.burn_rate < 0.0f || fire.heat < 0.0f || fire.smoke < 0.0f ||
-      fire.flame_cooling < 0.0f)
+      !std::isfinite(fire.gas_release) || fire.burn_rate < 0.0f || fire.heat < 0.0f ||
+      fire.smoke < 0.0f || fire.flame_cooling < 0.0f || fire.gas_release < 0.0f)
   {
     fail(params, state, "The fire settings must be finite and not negative.");
     return;
@@ -1052,6 +1060,7 @@ static void exec_sparse(GeoNodeExecParams &params,
     sources = make_sources(find_float_grid(source_volume, "density", token),
                            find_float_grid(source_volume, "temperature", token),
                            source_fuel,
+                           find_float_grid(source_volume, "divergence", token),
                            find_vector_grid(source_volume, "velocity", token),
                            transform,
                            resolution,

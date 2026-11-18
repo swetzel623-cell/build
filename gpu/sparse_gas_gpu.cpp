@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -99,8 +100,11 @@ enum Channel {
   Pressure,
   Fuel,
   Flame,
-  StateChannels = 8,
-  AllChannels = 16
+  /* Set every step, not advected; see sparse::State::expansion. */
+  Expansion,
+  Burn,
+  StateChannels = 10,
+  AllChannels = 20
 };
 
 double milliseconds_since(const std::chrono::steady_clock::time_point start)
@@ -571,14 +575,16 @@ struct SparseGasGpu::Impl {
                const Compute::Buffer *c10 = nullptr,
                const Compute::Buffer *c11 = nullptr,
                const std::uint32_t groups = 0,
-               const int c12 = -1)
+               const int c12 = -1,
+               const int c13 = -1,
+               const int c14 = -1)
   {
     const auto bind = [&](const int logical) { return logical < 0 ? nullptr : &channel(logical); };
     compute.dispatch(kernel,
                      &p,
                      sizeof(p),
                      {&table, &coords, &types, bind(c4), bind(c5), bind(c6), bind(c7), bind(c8),
-                      bind(c9), c10, c11, bind(c12)},
+                      bind(c9), c10, c11, bind(c12), bind(c13), bind(c14)},
                      groups ? groups : groups_for(topology.voxel_count()),
                      label);
   }
@@ -655,7 +661,9 @@ void SparseGasGpu::upload(const sparse::State &state)
                                                        &state.w,
                                                        &state.pressure,
                                                        &state.fuel,
-                                                       &state.flame};
+                                                       &state.flame,
+                                                       &state.expansion,
+                                                       &state.burn};
   for (int i = 0; i < StateChannels; ++i) {
     if (channels[i]->size() == count) {
       g.compute.upload(g.channel(i), channels[i]->data(), count * sizeof(float));
@@ -702,9 +710,9 @@ void SparseGasGpu::use_sources(const sparse::Sources *sources)
     return;
   }
   const sparse::BrickField &field = sources->field;
-  if (field.channels.size() != 3 && field.channels.size() != 6) {
+  if (field.channels.size() != 4 && field.channels.size() != 7) {
     throw std::invalid_argument(
-        "Sources have density, temperature and fuel, and optionally velocity");
+        "Sources have density, temperature, fuel and expansion, and optionally velocity");
   }
   g.source_stride = g.reserve_field(field, g.source_table, g.source_values);
   g.source_channels = static_cast<int>(field.channels.size());
@@ -731,7 +739,9 @@ void SparseGasGpu::download(sparse::State &state)
                                                  &state.w,
                                                  &state.pressure,
                                                  &state.fuel,
-                                                 &state.flame};
+                                                 &state.flame,
+                                                 &state.expansion,
+                                                 &state.burn};
   for (std::vector<float> *values : channels) {
     values->assign(count, 0.0f);
   }
@@ -960,7 +970,8 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
       p.flags[1] = g.source_channels;
       p.flags[2] = g.source_stride;
       g.stencil(g.inject, "inject", p, Density, Temperature, U, V, W, Fuel,
-                emit ? &g.source_table : nullptr, emit ? &g.source_values : nullptr, 0, Flame);
+                emit ? &g.source_table : nullptr, emit ? &g.source_values : nullptr, 0, Flame,
+                Expansion, Burn);
     }
     const float offsets[5][3] = {{0.5f, 0.5f, 0.5f},
                                  {0.5f, 0.5f, 0.5f},
@@ -999,13 +1010,10 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
     const auto add_forces = [&](const float step) {
       if (settings.fire.enabled) {
         const sparse::Fire &fire = settings.fire;
-        g.stencil(g.combust,
-                  "combust",
-                  g.params(fire.burn_rate * step, fire.flame_cooling * step, fire.heat, fire.smoke),
-                  Density,
-                  Temperature,
-                  Fuel,
-                  Flame);
+        Params p = g.params(
+            fire.burn_rate * step, fire.flame_cooling * step, fire.heat, fire.smoke);
+        std::memcpy(&p.flags[0], &step, sizeof(float));
+        g.stencil(g.combust, "combust", p, Density, Temperature, Fuel, Flame, Burn);
       }
       const auto buoyancy = [&](const int factor, const float coefficient) {
         if (coefficient != 0.0f) {
@@ -1068,7 +1076,10 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
     };
     const auto project = [&]() {
       const int rhs = StateChannels, next_pressure = StateChannels + 1;
-      g.stencil(g.divergence, "divergence", g.params(-1.0f, 0, 0, 0), U, V, W, rhs);
+      Params target = g.params(
+          -1.0f, settings.fire.enabled ? settings.fire.gas_release : 0.0f, 0, 0);
+      target.flags[0] = 1;
+      g.stencil(g.divergence, "divergence", target, U, V, W, rhs, Expansion, Burn);
       if (settings.pressure_solver == sparse::PressureSolver::Multigrid) {
         g.stencil(g.mask_pressure, "mask pressure", g.params(0, 0, 0, 0), Pressure);
         g.record_multigrid(settings, rhs);

@@ -52,47 +52,50 @@ node groups need no new build, only a newer `smoke_assets.py` in that folder and
 on `update_pyro_assets.bat` (with Blender closed). The workflow keeps compiled files between
 runs with sccache, so a build after a C++ change recompiles only what changed.
 
-**Add Modifier > Physics > Pyro Simulation** turns the selected mesh into a smoke or fire emitter.
+Two modifiers, as Houdini splits sourcing from the solver:
 
-- **Preset**: Custom, Smoke, Large Plume, Trail, Explosion, Campfire or Candle. A preset sets the
-  emission, particles, fire, buoyancy and turbulence; the panels below it then show greyed out.
-  `Strength` scales what is emitted and `Speed` the emission and particle speeds of any preset.
-  Custom uses the panels.
-- **Emission**: from the mesh's volume or from particles; density, temperature, fuel; adding
-  instead of raising; `Emit Until` stops emitting after so many seconds.
-- **Initial Velocity**: like Blender's flow setting. `Source` is the share of the emitter's own
-  motion (or each particle's) given to the smoke, `Normal` a speed along the surface normals,
-  and `Velocity` a vector added to both.
-- **Particles**: a point simulation off the emitter's surface: rate and first-frame burst,
-  speed along the normals and random spread, drag, gravity, lifetime (they fade out), radius.
-  Each particle emits a puff of its radius carrying its velocity. The Trail, Explosion and
-  Large Plume presets use them.
-- **Fire**: fuel burns at `Burn Rate` into heat (`Flame Heat`) and smoke (`Flame Smoke`); the
-  flame, as bright as the fuel burning, fades at `Flame Cooling` once the fuel is gone. The
-  material shows the `flame` grid as light from dark red through orange to yellow.
-- **Domain**: voxel size, domain size, and a Colliders collection (may be animated).
-- **Forces**, **Turbulence** (large swirls, then fine swirls that act only where the flow moves,
-  so they follow the large ones), **Solver**, **Display**.
+**Add Modifier > Physics > Pyro Emitter** turns a mesh into *pyro points*: points with a radius
+that emit density, temperature, fuel and expansion (1/s, the push of an explosion) and carry a
+velocity. Its Preset menu: Explosion, Fireball, Ground Blast, Muzzle Flash, Smoke Puff (bursts),
+Smoke, Campfire, Candle (the mesh's volume), Trail, Large Plume (particles), or Custom.
 
-The simulation runs in world space. The domain is centred on the emitter on the first frame of
-the simulation, its floor a tenth of its height below it, and stays there: give a moving emitter
-a domain that covers its path. Only bricks with smoke cost anything. Turning the GPU off runs
-Mantaflow, which has no emission, colliders, turbulence or fire, so nothing appears.
+- **Burst** follows Houdini's Pyro Burst Source: random spikes (its "trailings") from the
+  mesh's centre, each a trail of puffs toward the centre. `Spikes`, `Roundness` (1 equal
+  spikes, lower ragged), `Spike Length`, `Thickness`, `Core Strength` (stronger toward the
+  centre), `Shape Noise` (lumpy outline), `Direction` and `Spread` (a cone; 180 is all round,
+  75 a ground blast, 15 a muzzle flash), `Size`, `Outward Expansion` and `Expansion Curve` (how
+  much it grows, fast at first), `Start Frame` and `Duration` (frames), `Fade`, and several
+  `Bursts` a few frames apart and a little scattered. Its points move outward at the burst's
+  own expansion speed (`Outward Speed`) plus `Speed Noise`.
+- **Volume** and **Surface** fill the mesh or cover its surface with points `Point Spacing`
+  apart; **Particles** runs a particle simulation off the surface.
+- **Velocity**: `Initial Velocity`, `Source` (share of the emitter's own motion), `Normal` and
+  `Velocity`. Velocities are world-oriented.
 
-Inside (Tab on the modifier's group) it is one row of blocks: **Pyro Preset** makes one
-`Settings` bundle; **Pyro Domain** places the box; **Pyro Particles** runs the particles; in the
-simulation zone **Pyro Emitter**, **Pyro Colliders** and **Pyro Solver** make one step; **Pyro
-Display** shades the result. All of them, and the lower-level **Pyro Source** (mesh), **Pyro
-Point Source** (points with radius, `velocity` and `emission`), **Pyro Collider** and
-**Turbulence Layer**, are in the node editor's **Add > Pyro** menu for setups built by hand.
-Chain Turbulence Layer nodes into Pyro Preset's `Turbulence Layers` (or the Gas Simulation Step
-node's) for more layers: they apply in chain order, and a layer masked by Speed reacts to the
-ones before it.
+**Add Modifier > Physics > Pyro Simulation** simulates pyro points: the object's own (put it
+after a Pyro Emitter) and those of the objects in its `Emitters` collection. On a mesh with no
+emitter at all it fills the mesh with plain smoke. Its Preset menu sets the look: Smoke, Fire,
+Explosion, Large Plume, or Custom.
+
+- **Fire**: fuel burns at `Burn Rate` into heat (`Flame Heat`) and smoke (`Flame Smoke`); flame
+  fades at `Flame Cooling`; `Gas Release` makes burning gas expand, the push of a fireball.
+- **Turbulence**: large swirls, fine swirls that act where the flow moves (after the large
+  ones), and `Disturbance`, small fast noise in the thin smoke at the edges that breaks up
+  smooth caps, as Houdini's disturbance does.
+- **Domain**: voxel size, domain size, Emitters and Colliders collections. The domain is centred
+  on the emitters on the first frame, its floor a tenth of its height below them.
+
+The material shows the `flame` grid as light from dark red through orange to yellow. Inside,
+each modifier is one row of blocks passing one Settings bundle; every block is in the node
+editor's **Add > Pyro** menu: Pyro Emitter Preset, Pyro Burst, Pyro Fill, Pyro Particles,
+Pyro Preset, Pyro Gather, Pyro Domain, Pyro Colliders, Pyro Solver, Pyro Display, Pyro Point
+Source, Pyro Collider and Turbulence Layer.
 
 `blender/tests/smoke_modifier_tests.py` checks the installed assets, smoke rising, a moving
-emitter's trail, a collider holding smoke back, a setting changed mid-simulation, the Campfire
-preset's flame, the Explosion preset's spread, initial velocity from the emitter's motion (and
-exactly 1.5 m/s from a cube that moved 5 cm in 1/30 s), and Turbulence Layer chains:
+emitter's trail, a collider holding smoke back, a setting changed mid-simulation, the Campfire's
+flame, the Explosion's spread, the burst's shape (spikes, outward motion, growing fast then
+slower, stopping after its duration), an emitter moving 1.5 m/s giving its points exactly that,
+an Emitters collection, plain smoke from a mesh without emitters, and Turbulence Layer chains:
 
 ```sh
 blender -b --factory-startup --python blender/tests/smoke_modifier_tests.py
@@ -115,8 +118,11 @@ of Mantaflow (see `docs/gpu-sparse-solver.md`):
   every step, for example made with Mesh to Density Grid and Store Named Grid. By default they
   are raised to the source's values; `Add Sources` adds them per second instead. An optional
   vector grid `velocity` (world units per second) is set where they emit.
+- A float grid `divergence` in `Sources` (1/s) makes the gas expand there: the projection
+  gives the flow that divergence instead of zero, which pushes gas outward as in an explosion.
 - Fire: while the state has `fuel` or `flame` grids, or the sources have fuel, fuel burns at
-  `Burn Rate` per second into heat (`Flame Heat` per unit) and smoke (`Flame Smoke` per unit).
+  `Burn Rate` per second into heat (`Flame Heat` per unit) and smoke (`Flame Smoke` per unit);
+  `Gas Release` makes it expand by that much per unit of fuel burnt.
   The `flame` grid is the fuel burning (up to 1); it rises with the hot gas and fades at
   `Flame Cooling` per second once the fuel is gone. The output then carries `fuel` and `flame`
   grids too.
@@ -140,8 +146,8 @@ of Mantaflow (see `docs/gpu-sparse-solver.md`):
 - Without a usable Vulkan device, or in a build without the kernels, the node runs the solver's
   CPU reference instead (single-threaded and slow) and says so in a warning.
 
-`blender/tests/make_sparse_demo.py` writes a demo file with four Pyro Simulation emitters, one
-per preset: a campfire under a plate, an explosion, a large plume and a moving trail:
+`blender/tests/make_sparse_demo.py` writes a demo file with an Explosion, a Fireball, a Ground
+Blast and a Campfire under a plate, each a Pyro Emitter followed by a Pyro Simulation:
 
 ```sh
 blender -b --factory-startup --python blender/tests/make_sparse_demo.py -- pyro_demo.blend

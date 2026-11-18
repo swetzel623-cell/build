@@ -124,13 +124,15 @@ if(MANTA_IMPROVE_BUILD_GPU)
                COMMAND sparse_gas_gpu_tests 32 10 --empty --sources fire)
       add_test(NAME sparse_gas_gpu_layers_tests
                COMMAND sparse_gas_gpu_tests 32 10 --turbulence 300 --layers --sources fire)
+      add_test(NAME sparse_gas_gpu_expansion_tests
+               COMMAND sparse_gas_gpu_tests 32 10 --empty --sources fire --expansion)
       set_tests_properties(
         sparse_gas_gpu_tests sparse_gas_gpu_jacobi_tests sparse_gas_gpu_substep_tests
         sparse_gas_gpu_wcycle_tests sparse_gas_gpu_plain_step_tests
         sparse_gas_gpu_obstacle_tests sparse_gas_gpu_obstacle_jacobi_tests
         sparse_gas_gpu_sources_tests sparse_gas_gpu_add_sources_tests sparse_gas_gpu_moving_tests
         sparse_gas_gpu_turbulence_tests sparse_gas_gpu_masked_turbulence_tests
-        sparse_gas_gpu_fire_tests sparse_gas_gpu_layers_tests
+        sparse_gas_gpu_fire_tests sparse_gas_gpu_layers_tests sparse_gas_gpu_expansion_tests
         PROPERTIES SKIP_RETURN_CODE 77
       )
     endif()

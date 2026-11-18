@@ -675,6 +675,43 @@ def test_sparse_gpu_turbulence_layers(_work):
     check(order > 1.0e-3, "the order of the layers made no difference")
 
 
+def test_sparse_gpu_expansion(_work):
+    """A 'divergence' source grid makes the gas expand there, pushing the smoke around it
+    outward."""
+    res = (32, 32, 32)
+
+    def core(level):
+        def build(b, zone):
+            x, y, z = lib.voxel_coords(b, zone)
+            d2 = b.math("ADD", b.math("ADD", b.math("POWER", b.math("SUBTRACT", x, 16.0), 2.0),
+                                      b.math("POWER", b.math("SUBTRACT", y, 16.0), 2.0)),
+                        b.math("POWER", b.math("SUBTRACT", z, 16.0), 2.0))
+            return lib.grid_volume(b, zone, [("divergence", "FLOAT",
+                                              b.math("MULTIPLY", b.math("LESS_THAN", d2, 9.5),
+                                                     level))])
+        return build
+
+    def spread(level):
+        lib.reset_scene()
+        zone = Zone(res, sources=core(level), **{"Sparse GPU": True, "CFL": 6.0,
+                                                 "Heat Buoyancy": 0.0, "Density Buoyancy": 0.0})
+        field = blob(zone, (16, 16, 16), 8.0)
+        lib.make_data_object("expand_data", zone, density=field, temperature=field * 0.0)
+        obj = lib.build_object("expand", [zone])
+        lib.evaluate(obj, [zone], 1)
+        (end,), _ = lib.run_frames(obj, [zone], 2, 7)
+        check(not errors(obj), f"unexpected node errors: {errors(obj)}")
+        grid = lib.as_grid(zone, end["density"]).astype(np.float64)
+        z, y, x = np.meshgrid(*(np.arange(n) for n in grid.shape), indexing="ij")
+        r = np.sqrt((x - 16.0) ** 2 + (y - 16.0) ** 2 + (z - 16.0) ** 2)
+        return float((grid * r).sum() / grid.sum())
+
+    still, pushed = spread(0.0), spread(20.0)
+    print(f"  mean distance of smoke from the core: {still:.2f} voxels without expansion, "
+          f"{pushed:.2f} with 20/s")
+    check(pushed > still * 1.03, "the divergence source did not push the smoke outward")
+
+
 TESTS = [
     test_node_is_registered,
     test_zero_time_start_frame,
@@ -698,6 +735,7 @@ TESTS = [
     test_voxel_size_change_moves_the_state,
     test_sparse_gpu_fire,
     test_sparse_gpu_turbulence_layers,
+    test_sparse_gpu_expansion,
 ]
 
 

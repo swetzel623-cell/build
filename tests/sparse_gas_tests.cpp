@@ -883,7 +883,7 @@ void test_fire_burns()
   std::fill(empty.fuel.begin(), empty.fuel.end(), 0.0f);
   State lit = from_dense(empty, 8, settings.thresholds, settings.dilation);
   const Sources source = sources_from_dense(emit, 8, SourceMode::Raise);
-  require(source.field.channels.size() == 3, "sources do not carry a fuel channel");
+  require(source.field.channels.size() == 4, "sources do not carry fuel and expansion channels");
   for (int frame = 0; frame < 6; ++frame) {
     advance(lit, settings, 1.0f / 30.0f, &source);
   }
@@ -892,6 +892,96 @@ void test_fire_burns()
             << std::endl;
   require(sum(lit_dense.flame) > 0.0 && sum(lit_dense.density) > 0.0,
           "an emitted fuel did not burn");
+}
+
+/**
+ * Expansion: a source's expansion becomes the flow's divergence there, pushing smoke outward,
+ * and burning fuel with a gas release does the same.
+ */
+void test_expansion_pushes_outward()
+{
+  const Extent extent{32, 32, 32};
+  const DenseFields shape = blob(extent, 16.0f, 16.0f, 16.0f, 3.0f);
+  Settings settings;
+  settings.heat_buoyancy = 0.0f;
+  settings.density_buoyancy = 0.0f;
+  settings.reflection = false;
+  settings.pressure_solver = PressureSolver::Multigrid;
+  settings.pressure_iterations = 10;
+
+  /* A ring of smoke around an expanding core moves outward. */
+  DenseFields initial = blob(extent, 16.0f, 16.0f, 16.0f, 8.0f);
+  DenseFields emit = shape;
+  std::fill(emit.density.begin(), emit.density.end(), 0.0f);
+  std::fill(emit.temperature.begin(), emit.temperature.end(), 0.0f);
+  emit.expansion = shape.density;
+  for (float &value : emit.expansion) {
+    value *= 20.0f;
+  }
+  const Sources source = sources_from_dense(emit, 8, SourceMode::Raise);
+  const auto spread = [&](const DenseFields &dense) {
+    double weighted = 0.0, total = 0.0;
+    for (int z = 0; z < extent.z; ++z) {
+      for (int y = 0; y < extent.y; ++y) {
+        for (int x = 0; x < extent.x; ++x) {
+          const double d = dense.density[dense_index(extent, x, y, z)];
+          const double r2 = (x + 0.5 - 16.0) * (x + 0.5 - 16.0) +
+                            (y + 0.5 - 16.0) * (y + 0.5 - 16.0) +
+                            (z + 0.5 - 16.0) * (z + 0.5 - 16.0);
+          weighted += d * std::sqrt(r2);
+          total += d;
+        }
+      }
+    }
+    return weighted / total;
+  };
+  State state = from_dense(initial, 8, settings.thresholds, settings.dilation);
+  const StepInfo info = step(state, settings, &source);
+  std::vector<float> div;
+  divergence(state, div);
+  const DenseFields after_step = [&] {
+    State probe = state;
+    probe.density = div;
+    return to_dense(probe);
+  }();
+  const float centre = after_step.density[dense_index(extent, 16, 16, 16)];
+  std::cout << "  divergence at the centre " << centre << " 1/s (asked for 20), left over "
+            << info.max_divergence << std::endl;
+  require(std::abs(centre - 20.0f) < 0.5f, "the flow does not take the source's expansion");
+  for (int i = 0; i < 5; ++i) {
+    step(state, settings, &source);
+  }
+  const double before = spread(initial), after = spread(to_dense(state));
+  std::cout << "  mean distance of smoke from the centre: " << before << " -> " << after
+            << " voxels" << std::endl;
+  /* The core grows by about 450 voxels (20/s over 113 voxels for 0.2 s): a 6% larger radius
+   * for the smoke around it. */
+  require(after > before * 1.03, "the expansion did not push the smoke outward");
+
+  /* Burning fuel with a gas release expands where it burns; without, it does not. */
+  DenseFields fuel = shape;
+  std::fill(fuel.density.begin(), fuel.density.end(), 0.0f);
+  std::fill(fuel.temperature.begin(), fuel.temperature.end(), 0.0f);
+  fuel.fuel = shape.density;
+  fuel.flame.assign(shape.density.size(), 0.0f);
+  const auto burn_divergence = [&](const float gas_release) {
+    Settings fire = settings;
+    fire.fire.enabled = true;
+    fire.fire.burn_rate = 2.0f;
+    fire.fire.gas_release = gas_release;
+    State burning = from_dense(fuel, 8, fire.thresholds, fire.dilation);
+    step(burning, fire);
+    std::vector<float> d;
+    divergence(burning, d);
+    State probe = burning;
+    probe.density = d;
+    return to_dense(probe).density[dense_index(extent, 16, 16, 16)];
+  };
+  const float released = burn_divergence(5.0f), quiet = burn_divergence(0.0f);
+  std::cout << "  burning core divergence: " << released << " 1/s with gas release 5 (burning "
+            << "2/s), " << quiet << " without" << std::endl;
+  require(std::abs(released - 10.0f) < 0.5f, "gas release is not 5 times the fuel burnt");
+  require(std::abs(quiet) < 1.0e-3f, "fuel expanded without a gas release");
 }
 
 /** Turbulence layers apply in order; a speed mask makes a layer react to the ones before it. */
@@ -979,6 +1069,7 @@ int main()
       {"turbulence stirs", test_turbulence_stirs},
       {"fire burns", test_fire_burns},
       {"turbulence layers in order", test_turbulence_layers_in_order},
+      {"expansion pushes outward", test_expansion_pushes_outward},
   };
   const char *only = std::getenv("SPARSE_GAS_TEST");
   for (const auto &[name, test] : tests) {

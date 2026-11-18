@@ -199,7 +199,9 @@ void resize_channels(State &state)
                                       &state.u,
                                       &state.v,
                                       &state.w,
-                                      &state.pressure})
+                                      &state.pressure,
+                                      &state.expansion,
+                                      &state.burn})
   {
     channel->assign(count, 0.0f);
   }
@@ -696,9 +698,12 @@ Sources sources_from_dense(const DenseFields &dense, const int brick_size, const
 {
   Sources sources;
   sources.mode = mode;
-  const std::vector<float> no_fuel(dense.fuel.empty() ? dense.density.size() : 0, 0.0f);
+  const std::vector<float> none(dense.density.size(), 0.0f);
   std::vector<const std::vector<float> *> channels = {
-      &dense.density, &dense.temperature, dense.fuel.empty() ? &no_fuel : &dense.fuel};
+      &dense.density,
+      &dense.temperature,
+      dense.fuel.empty() ? &none : &dense.fuel,
+      dense.expansion.empty() ? &none : &dense.expansion};
   if (!dense.u.empty()) {
     channels.insert(channels.end(), {&dense.u, &dense.v, &dense.w});
   }
@@ -1088,8 +1093,10 @@ void combust(State &state, const Fire &fire, const float dt)
     /* The same arithmetic as combust.comp. */
     float flame = std::max(state.flame[i] - fade, 0.0f);
     const float fuel = state.fuel[i];
+    state.burn[i] = 0.0f;
     if (fuel > 0.0f && capacity > 0.0f) {
       const float burnt = std::min(fuel, capacity);
+      state.burn[i] = burnt / dt;
       state.fuel[i] = fuel - burnt;
       state.temperature[i] += fire.heat * burnt;
       state.density[i] += fire.smoke * burnt;
@@ -1210,12 +1217,14 @@ void inject(State &state, const Sources *sources, const float dt)
   if (emit && sources->field.table.size() != topology.brick_table.size()) {
     throw std::invalid_argument("The sources do not match the state's brick grid");
   }
-  if (emit && sources->field.channels.size() != 3 && sources->field.channels.size() != 6) {
+  if (emit && sources->field.channels.size() != 4 && sources->field.channels.size() != 7) {
     throw std::invalid_argument(
-        "Sources have density, temperature and fuel, and optionally velocity");
+        "Sources have density, temperature, fuel and expansion, and optionally velocity");
   }
-  const bool with_velocity = emit && sources->field.channels.size() == 6;
+  const bool with_velocity = emit && sources->field.channels.size() == 7;
   for_each_voxel(topology, [&](const std::size_t index, const int x, const int y, const int z) {
+    state.expansion[index] = 0.0f;
+    state.burn[index] = 0.0f;
     if (topology.cell_type[index] == CellSolid) {
       state.density[index] = 0.0f;
       state.temperature[index] = 0.0f;
@@ -1229,6 +1238,8 @@ void inject(State &state, const Sources *sources, const float dt)
     const float density = sources->field.at(0, x, y, z);
     const float temperature = sources->field.at(1, x, y, z);
     const float fuel = sources->field.at(2, x, y, z);
+    const float expansion = sources->field.at(3, x, y, z);
+    state.expansion[index] = expansion;
     if (sources->mode == SourceMode::Raise) {
       if (density != 0.0f) {
         state.density[index] = std::max(state.density[index], density);
@@ -1245,10 +1256,12 @@ void inject(State &state, const Sources *sources, const float dt)
       state.temperature[index] += temperature * dt;
       state.fuel[index] += fuel * dt;
     }
-    if (with_velocity && (density != 0.0f || temperature != 0.0f || fuel != 0.0f)) {
-      state.u[index] = sources->field.at(3, x, y, z);
-      state.v[index] = sources->field.at(4, x, y, z);
-      state.w[index] = sources->field.at(5, x, y, z);
+    if (with_velocity &&
+        (density != 0.0f || temperature != 0.0f || fuel != 0.0f || expansion != 0.0f))
+    {
+      state.u[index] = sources->field.at(4, x, y, z);
+      state.v[index] = sources->field.at(5, x, y, z);
+      state.w[index] = sources->field.at(6, x, y, z);
     }
   });
 }
@@ -1326,10 +1339,19 @@ StepInfo project(State &state, const Settings &settings)
     return info;
   }
 
+  /* The divergence the flow should have: the sources' expansion and the gas released by burning.
+   * The same arithmetic as divergence.comp. */
+  const float gas_release = settings.fire.enabled ? settings.fire.gas_release : 0.0f;
+  std::vector<float> target(topology.voxel_count(), 0.0f);
+  for (std::size_t i = 0; i < target.size(); ++i) {
+    if (topology.cell_type[i] == CellFluid) {
+      target[i] = state.expansion[i] + gas_release * state.burn[i];
+    }
+  }
   std::vector<float> rhs;
   divergence(state, rhs);
   for (std::size_t i = 0; i < rhs.size(); ++i) {
-    rhs[i] = -rhs[i];
+    rhs[i] = -(rhs[i] - target[i]);
     /* The previous pressure is the initial guess. Cells that are no longer fluid have none. */
     if (topology.cell_type[i] != CellFluid) {
       state.pressure[i] = 0.0f;
@@ -1357,6 +1379,9 @@ StepInfo project(State &state, const Settings &settings)
   subtract_gradient(state);
   std::vector<float> remaining;
   divergence(state, remaining);
+  for (std::size_t i = 0; i < remaining.size(); ++i) {
+    remaining[i] -= target[i];
+  }
   info.max_divergence = max_abs(remaining);
   return info;
 }

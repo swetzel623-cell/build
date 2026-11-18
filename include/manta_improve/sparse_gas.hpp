@@ -132,9 +132,11 @@ enum class SourceMode {
 
 /**
  * What sources emit at the start of every step they are passed to. Channels: density,
- * temperature, fuel and, optionally, a cell-centered velocity u, v, w in voxels per second that
- * is set on the lower faces of every voxel emitting density, temperature or fuel, as Mantaflow
- * sets an emitter's initial velocity. Bricks holding a source stay active.
+ * temperature, fuel, expansion and, optionally, a cell-centered velocity u, v, w in voxels per
+ * second that is set on the lower faces of every voxel emitting density, temperature, fuel or
+ * expansion, as Mantaflow sets an emitter's initial velocity. Expansion is a rate of volume
+ * growth in 1/s, the divergence the projection then gives the flow there, which pushes gas
+ * outward as in an explosion. Bricks holding a source stay active.
  */
 struct Sources {
   SourceMode mode = SourceMode::Raise;
@@ -142,7 +144,7 @@ struct Sources {
 };
 
 /**
- * Sources from dense fields: density, temperature, fuel (zero if `fuel` is empty), and the
+ * Sources from dense fields: density, temperature, fuel and expansion (zero if empty), and the
  * velocity if `u` is not empty.
  */
 Sources sources_from_dense(const struct DenseFields &dense, int brick_size, SourceMode mode);
@@ -158,6 +160,13 @@ struct State {
   /** Velocity through the lower X, Y, and Z face of each voxel. */
   std::vector<float> u, v, w;
   std::vector<float> pressure;
+  /**
+   * Set again every step and not advected: the sources' expansion (1/s), and the fuel burnt per
+   * second by the last combustion, which releases gas at Fire::gas_release. The projection makes
+   * the flow's divergence `expansion + gas_release * burn` instead of zero.
+   */
+  std::vector<float> expansion;
+  std::vector<float> burn;
   /**
    * Velocity of the obstacles in voxels per second, cell-centered: three channels, read at
    * obstacle voxels only. Empty when the obstacles are at rest. A face between a solid and any
@@ -185,6 +194,8 @@ struct DenseFields {
   /** Fire channels; may be empty when there is no fire. */
   std::vector<float> fuel;
   std::vector<float> flame;
+  /** Expansion of sources (1/s); may be empty. */
+  std::vector<float> expansion;
   std::vector<float> u, v, w;
   /** The last pressure, the first guess of the next solve; may be empty. */
   std::vector<float> pressure;
@@ -303,6 +314,11 @@ struct Fire {
   float smoke = 1.0f;
   /** Flame lost per second where nothing burns. */
   float flame_cooling = 4.0f;
+  /**
+   * Gas released per unit of fuel burnt: the burning volume grows at `gas_release` times the
+   * fuel burnt per second (1/s), which pushes the flame outward. 0 burns without expanding.
+   */
+  float gas_release = 0.0f;
 };
 
 struct Settings {
@@ -482,7 +498,8 @@ void enforce_walls(State &state);
 
 /**
  * Start of a step: zero density, temperature, fuel and flame in solid cells, then apply
- * `sources` (may be null) over `dt` seconds.
+ * `sources` (may be null) over `dt` seconds. Sets State::expansion from the sources and clears
+ * State::burn.
  */
 void inject(State &state, const Sources *sources, float dt);
 

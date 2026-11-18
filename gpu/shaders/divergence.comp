@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
-// Divergence of fluid cells, scaled by P.a.x (-1 gives the pressure right-hand side).
+// Divergence of fluid cells, scaled by P.a.x (-1 gives the pressure right-hand side). With
+// P.flags.x, minus the divergence the flow should have: EXPANSION + P.a.y * BURN (gas release).
+// Mirrors project in the CPU reference.
 #version 450
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
@@ -7,6 +9,8 @@
 #define V b5
 #define W b6
 #define RESULT b7
+#define EXPANSION b8
+#define BURN b9
 
 float fetch_u(ivec3 c) { int i = index_of(c); return i < 0 ? 0.0 : U[i]; }
 float fetch_v(ivec3 c) { int i = index_of(c); return i < 0 ? 0.0 : V[i]; }
@@ -25,5 +29,9 @@ void main()
   ivec3 c = coords_of(index);
   float divergence = fetch_u(c + ivec3(1, 0, 0)) - U[index] + fetch_v(c + ivec3(0, 1, 0)) -
                      V[index] + fetch_w(c + ivec3(0, 0, 1)) - W[index];
+  if (P.flags.x != 0) {
+    float target = EXPANSION[index] + P.a.y * BURN[index];
+    divergence = divergence - target;
+  }
   RESULT[index] = P.a.x * divergence;
 }

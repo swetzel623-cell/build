@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
-// Burn fuel into flame, heat and smoke. Mirrors combust in the CPU reference, operation for
-// operation. P.a = (burn rate * dt, flame cooling * dt, heat per fuel, smoke per fuel).
+// Burn fuel into flame, heat and smoke, and record the fuel burnt per second. Mirrors combust
+// in the CPU reference, operation for operation. P.a = (burn rate * dt, flame cooling * dt,
+// heat per fuel, smoke per fuel); P.flags.x = the bits of dt.
 #version 450
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
@@ -8,6 +9,7 @@
 #define TEMPERATURE b5
 #define FUEL b6
 #define FLAME b7
+#define BURN b8
 
 void main()
 {
@@ -18,8 +20,10 @@ void main()
   float capacity = P.a.x;
   float flame = max(FLAME[index] - P.a.y, 0.0);
   float fuel = FUEL[index];
+  BURN[index] = 0.0;
   if (fuel > 0.0 && capacity > 0.0) {
     float burnt = min(fuel, capacity);
+    BURN[index] = burnt / intBitsToFloat(P.flags.x);
     FUEL[index] = fuel - burnt;
     TEMPERATURE[index] += P.a.z * burnt;
     DENSITY[index] += P.a.w * burnt;

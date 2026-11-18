@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Tests of the Pyro Simulation modifier and the Pyro node-group assets.
+"""Tests of the Pyro Emitter and Pyro Simulation modifiers and the Pyro node-group assets.
 
     blender -b --factory-startup --python smoke_modifier_tests.py
 
@@ -13,6 +13,7 @@ import sys
 import traceback
 
 import bpy
+import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets"))
 import smoke_assets  # noqa: E402
@@ -74,15 +75,48 @@ def probe_group(grid="density", threshold=0.02):
     return tree
 
 
-def smoke_emitter(probe=("density", 0.02), **inputs):
-    emitter = add_cube("Emitter", (0.3, -0.2, 0.25), 0.3)
-    modifier = emitter.modifiers.new("Pyro", "NODES")
-    modifier.node_group = smoke_assets.build_assets(mark=False)
-    for name, value in inputs.items():
+def smoke_emitter(probe=("density", 0.02), emitter=None, **inputs):
+    """A small cube with a Pyro Emitter (settings in `emitter`, Smoke preset by default), a Pyro
+    Simulation (Custom look, settings in `inputs`) and a probe that meshes a grid."""
+    obj = add_cube("Emitter", (0.3, -0.2, 0.25), 0.3)
+    emitter_group, simulation_group = smoke_assets.build_assets(mark=False)
+    emitting = obj.modifiers.new("Pyro Emitter", "NODES")
+    emitting.node_group = emitter_group
+    for name, value in {"Preset": "Smoke", **(emitter or {})}.items():
+        set_input(emitting, name, value)
+    modifier = obj.modifiers.new("Pyro", "NODES")
+    modifier.node_group = simulation_group
+    for name, value in {"Preset": "Custom", **inputs}.items():
         set_input(modifier, name, value)
-    probe_modifier = emitter.modifiers.new("Probe", "NODES")
+    probe_modifier = obj.modifiers.new("Probe", "NODES")
     probe_modifier.node_group = probe_group(*probe)
-    return emitter, modifier
+    return obj, modifier
+
+
+def emitted_points(obj, frame):
+    """The pyro points of an object's Pyro Emitter alone, at a frame: positions (world) and the
+    named float or vector attributes."""
+    for modifier in obj.modifiers[1:]:
+        modifier.show_viewport = False
+    bpy.context.scene.frame_set(frame)
+    evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    geometry = evaluated.evaluated_geometry()
+    cloud = geometry.pointcloud
+    result = {}
+    if cloud is not None and len(cloud.attributes["position"].data):
+        for name, width in (("position", 3), ("velocity", 3), ("density", 1), ("fuel", 1),
+                            ("expansion", 1), ("radius", 1)):
+            if name not in cloud.attributes:
+                continue
+            data = cloud.attributes[name].data
+            values = np.zeros(len(data) * width)
+            data.foreach_get("vector" if width == 3 else "value", values)
+            result[name] = values.reshape(-1, 3) if width == 3 else values
+        matrix = np.array(evaluated.matrix_world)
+        result["position"] = result["position"] @ matrix[:3, :3].T + matrix[:3, 3]
+    for modifier in obj.modifiers[1:]:
+        modifier.show_viewport = True
+    return result
 
 
 class Smoke:
@@ -102,7 +136,7 @@ class Smoke:
         self.top = max((p.z for p in points), default=float("nan"))
         self.left = min((p.x for p in points), default=float("nan"))
         self.right = max((p.x for p in points), default=float("nan"))
-        self.warnings = [(w.type, w.message) for w in emitter.modifiers[0].node_warnings]
+        self.warnings = [(w.type, w.message) for w in emitter.modifiers["Pyro"].node_warnings]
         points = [world @ v.co for v in mesh.vertices] if mesh else []
         self.front = max((p.y for p in points), default=float("nan"))
         self.back = min((p.y for p in points), default=float("nan"))
@@ -138,8 +172,9 @@ def test_modifier_emits_and_rises():
 
 def test_moving_emitter_leaves_a_trail():
     reset()
-    emitter, _modifier = smoke_emitter(**{"Voxel Size": 0.0625, "Heat Buoyancy": 0.0,
-                                          "Temperature": 0.0})
+    emitter, _modifier = smoke_emitter(emitter={"Preset": "Custom", "Emit Type": "Volume",
+                                                "Temperature": 0.0, "Initial Velocity": False},
+                                       **{"Voxel Size": 0.0625, "Heat Buoyancy": 0.0})
     emitter.location = (-0.5, 0.0, 0.5)
     emitter.keyframe_insert("location", frame=1)
     emitter.location = (0.5, 0.0, 0.5)
@@ -188,17 +223,17 @@ def test_assets_install():
     path = os.path.join(folder, "assets", "nodes", smoke_assets.ASSET_FILE)
     with bpy.data.libraries.load(path, assets_only=True) as (data_from, _data_to):
         names = sorted(data_from.node_groups)
-    expected = sorted(smoke_assets.BLOCK_NAMES + (smoke_assets.MODIFIER,))
+    expected = sorted(smoke_assets.BLOCK_NAMES + smoke_assets.MODIFIER_NAMES)
     check(names == expected, f"assets: {names}")
     with bpy.data.libraries.load(path) as (_data_from, data_to):
-        data_to.node_groups = [smoke_assets.MODIFIER]
-    group = data_to.node_groups[0]
-    check(group.is_modifier, "Smoke Simulation is not offered as a modifier")
-    check(group.asset_data.catalog_id == smoke_assets.CATALOG_PHYSICS[0], "wrong catalog")
-    # What Add Modifier filters on: a geometry node tree with the modifier trait (1 << 6).
-    check(group.asset_data["type"] == 3, "the asset is not a geometry node tree")
-    check(group.asset_data["geometry_node_asset_traits_flag"] & (1 << 6),
-          "the asset lacks the modifier trait")
+        data_to.node_groups = list(smoke_assets.MODIFIER_NAMES)
+    for group in data_to.node_groups:
+        check(group.is_modifier, f"{group.name} is not offered as a modifier")
+        check(group.asset_data.catalog_id == smoke_assets.CATALOG_PHYSICS[0], "wrong catalog")
+        # What Add Modifier filters on: a geometry node tree with the modifier trait (1 << 6).
+        check(group.asset_data["type"] == 3, "the asset is not a geometry node tree")
+        check(group.asset_data["geometry_node_asset_traits_flag"] & (1 << 6),
+              f"{group.name} lacks the modifier trait")
 
 
 def test_settings_changed_mid_simulation():
@@ -227,10 +262,10 @@ def test_settings_changed_mid_simulation():
 
 
 def test_campfire_burns():
-    """The Campfire preset emits fuel that burns: flame grids, flame above the emitter, smoke."""
+    """The Campfire emitter with the Fire look: fuel burns, flame rises above the emitter."""
     reset()
-    emitter, _modifier = smoke_emitter(probe=("flame", 0.3), **{"Voxel Size": 0.0625,
-                                                               "Preset": "Campfire"})
+    emitter, _modifier = smoke_emitter(probe=("flame", 0.3), emitter={"Preset": "Campfire"},
+                                       **{"Voxel Size": 0.0625, "Preset": "Fire"})
     fire = run_until(emitter, 15)
     print(f"  flame from z {fire.low:.2f} to {fire.top:.2f}; {fire.warnings}")
     check(not [w for w in fire.warnings if w[0] == "ERROR"], f"errors: {fire.warnings}")
@@ -239,21 +274,86 @@ def test_campfire_burns():
 
 
 def test_explosion_spreads():
-    """The Explosion preset bursts particles off the surface: its smoke spreads far sideways
-    within a few frames, where plain smoke stays near the emitter."""
-    def width(**inputs):
+    """The Explosion emitter and look throw smoke out far and fast, where plain smoke stays near
+    the emitter."""
+    def width(emitter, look):
         reset()
-        emitter, _modifier = smoke_emitter(**{"Voxel Size": 0.0625, **inputs})
-        smoke = run_until(emitter, 8)
+        obj, _modifier = smoke_emitter(emitter={"Preset": emitter},
+                                       **{"Voxel Size": 0.0625, "Preset": look,
+                                          "Domain Size": (4.0, 4.0, 4.0)})
+        smoke = run_until(obj, 8)
         check(not [w for w in smoke.warnings if w[0] == "ERROR"], f"errors: {smoke.warnings}")
         return smoke.right - smoke.left, smoke
 
-    calm, _ = width(Preset="Smoke")
-    blast, smoke = width(Preset="Explosion")
-    print(f"  smoke width after 8 frames: smoke preset {calm:.2f}, explosion {blast:.2f}; "
+    calm, _ = width("Smoke", "Smoke")
+    blast, smoke = width("Explosion", "Explosion")
+    print(f"  smoke width after 8 frames: smoke {calm:.2f}, explosion {blast:.2f}; "
           f"flame grid {smoke.has_flame}")
-    check(blast > calm + 0.4, "the explosion did not throw smoke outwards")
+    check(blast > calm + 0.6, "the explosion did not throw smoke outwards")
     check(smoke.has_flame, "the explosion did not burn")
+
+
+def test_burst_is_spiky():
+    """The Explosion burst: points along a few dozen spikes from the centre, growing fast and
+    then slower, moving outward, emitting fuel and expansion, and gone after its bursts."""
+    reset()
+    obj, _modifier = smoke_emitter(emitter={"Preset": "Explosion", "Seed": 3})
+    # The burst's own motion: one burst, no added noise or drift (Custom keeps the rest).
+    emitting = obj.modifiers["Pyro Emitter"]
+    explosion = smoke_assets.EMITTER_PRESETS["Explosion"]
+    set_input(emitting, "Preset", "Custom")
+    for name, value in explosion.items():
+        if name not in ("Emit Type",):
+            set_input(emitting, name, value)
+    set_input(emitting, "Emit Type", "Burst")
+    for name, value in (("Bursts", 1), ("Speed Noise", 0.0), ("Velocity", (0.0, 0.0, 0.0))):
+        set_input(emitting, name, value)
+    centre = np.array(obj.location) + np.array([0.0, 0.0, 0.0])
+    reach = {}
+    for frame in (1, 3, 5, 7, 9):
+        points = emitted_points(obj, frame)
+        if not points:
+            reach[frame] = 0.0
+            continue
+        offset = points["position"] - centre
+        distance = np.linalg.norm(offset, axis=1)
+        reach[frame] = float(distance.max())
+        if frame == 3:
+            directions = offset / np.maximum(distance[:, None], 1e-9)
+            outward = np.einsum("ij,ij->i", directions,
+                                points["velocity"] / np.maximum(np.linalg.norm(
+                                    points["velocity"], axis=1)[:, None], 1e-9))
+            # Points on one spike share a direction: count distinct ones.
+            rounded = {tuple(np.round(d * 20).astype(int)) for d in directions}
+            print(f"  frame 3: {len(distance)} points along about {len(rounded)} directions, "
+                  f"mean outward alignment {outward.mean():.2f}, fuel {points['fuel'].sum():.0f}"
+                  f", expansion up to {points['expansion'].max():.1f} 1/s")
+            check(len(rounded) < len(distance) / 2, "the points are not along spikes")
+            check(outward.mean() > 0.95, "the burst does not move outward")
+            check(points["fuel"].sum() > 0 and points["expansion"].max() > 0,
+                  "the burst emits no fuel or expansion")
+    print(f"  reach by frame: {reach}")
+    check(reach[3] > reach[1] and reach[5] > reach[3], "the burst does not grow")
+    check(reach[3] - reach[1] > reach[5] - reach[3], "the burst does not slow down as it grows")
+    check(reach[9] == 0.0, "the burst still emits after its duration")
+
+
+def test_emitter_motion_gives_velocity():
+    """A Pyro Emitter on a cube moving 0.05 per frame at 30 fps gives its points 1.5 m/s with
+    Source 1, and no velocity with Initial Velocity off."""
+    reset()
+    obj, _modifier = smoke_emitter(emitter={"Preset": "Custom", "Emit Type": "Volume",
+                                            "Initial Velocity": True, "Source": 1.0})
+    for frame in range(1, 6):
+        obj.location = (0.0, 0.05 * (frame - 1), 0.5)
+        points = emitted_points(obj, frame)
+    mean = points["velocity"].mean(axis=0)
+    print(f"  emitted velocity {np.round(mean, 3)} (the cube moves 1.5 m/s in y)")
+    check(abs(mean[1] - 1.5) < 0.05 and abs(mean[0]) < 0.05 and abs(mean[2]) < 0.05,
+          "the emitter's motion is not its points' velocity")
+    set_input(obj.modifiers["Pyro Emitter"], "Initial Velocity", False)
+    points = emitted_points(obj, 5)
+    check("velocity" not in points, "points carry a velocity with Initial Velocity off")
 
 
 def test_initial_velocity_from_motion():
@@ -261,11 +361,11 @@ def test_initial_velocity_from_motion():
     stays where it was emitted, a trail back to the start; with it the smoke travels along."""
     def back(initial):
         reset()
-        emitter, _modifier = smoke_emitter(**{"Voxel Size": 0.0625, "Heat Buoyancy": 0.0,
-                                              "Temperature": 0.0, "Initial Velocity": initial,
-                                              "Source": 1.0})
-        # Steady motion from the first frame, when the back of the trail is emitted.
         bpy.context.preferences.edit.keyframe_new_interpolation_type = "LINEAR"
+        emitter, _modifier = smoke_emitter(emitter={"Preset": "Custom", "Emit Type": "Volume",
+                                                    "Temperature": 0.0,
+                                                    "Initial Velocity": initial, "Source": 1.0},
+                                           **{"Voxel Size": 0.0625, "Heat Buoyancy": 0.0})
         emitter.location = (0.0, -0.4, 0.5)
         emitter.keyframe_insert("location", frame=1)
         emitter.location = (0.0, 0.4, 0.5)
@@ -279,67 +379,42 @@ def test_initial_velocity_from_motion():
     check(carried > still + 0.08, "the emitter's motion did not carry the smoke")
 
 
-def test_source_velocity_from_motion():
-    """Pyro Source turns the mesh's motion since the previous mesh into the emitted velocity,
-    adds the normal and vector velocities, and leaves velocity out unless asked."""
+def test_emitters_collection_and_plain_smoke():
+    """A Pyro Simulation on another object simulates the emitters in its Emitters collection;
+    on a plain mesh without emitters it emits smoke from the mesh itself."""
     reset()
-    smoke_assets.build_assets(mark=False)
+    emitter_group, simulation_group = smoke_assets.build_assets(mark=False)
+    source = add_cube("Source", (1.0, 0.0, 0.3), 0.3)
+    emitting = source.modifiers.new("Pyro Emitter", "NODES")
+    emitting.node_group = emitter_group
+    set_input(emitting, "Preset", "Smoke")
+    emitters = bpy.data.collections.new("Emitters")
+    bpy.context.scene.collection.children.link(emitters)
+    for owner in list(source.users_collection):
+        owner.objects.unlink(source)
+    emitters.objects.link(source)
+    domain = add_cube("Domain", (0.0, 0.0, 0.0), 0.1)
+    simulating = domain.modifiers.new("Pyro", "NODES")
+    simulating.node_group = simulation_group
+    for name, value in {"Preset": "Custom", "Voxel Size": 0.0625, "Emitters": emitters,
+                        "Domain Size": (4.0, 4.0, 4.0), "Show Mesh": False}.items():
+        set_input(simulating, name, value)
+    domain.modifiers.new("Probe", "NODES").node_group = probe_group()
+    smoke = run_until(domain, 12)
+    print(f"  smoke from the collection's emitter spans x {smoke.left:.2f} to {smoke.right:.2f}")
+    check(not [w for w in smoke.warnings if w[0] == "ERROR"], f"errors: {smoke.warnings}")
+    check(0.7 < smoke.left < 1.0 < smoke.right < 1.3, "the smoke is not at the emitter")
 
-    def emitted(**inputs):
-        tree = bpy.data.node_groups.new("Source Probe", "GeometryNodeTree")
-        tree.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
-        nodes, links = tree.nodes, tree.links
-        cube = nodes.new("GeometryNodeMeshCube")
-        cube.inputs["Size"].default_value = (0.4, 0.4, 0.4)
-        moved = nodes.new("GeometryNodeTransform")
-        links.new(cube.outputs[0], moved.inputs["Geometry"])
-        moved.inputs["Translation"].default_value = (0.0, -0.05, 0.0)
-        source = nodes.new("GeometryNodeGroup")
-        source.node_tree = bpy.data.node_groups["Pyro Source"]
-        links.new(cube.outputs[0], source.inputs["Mesh"])
-        links.new(moved.outputs[0], source.inputs["Previous Mesh"])
-        source.inputs["Delta Time"].default_value = 1.0 / 30.0
-        source.inputs["Voxel Size"].default_value = 0.05
-        for name, value in inputs.items():
-            source.inputs[name].default_value = value
-        get = nodes.new("GeometryNodeGetNamedGrid")
-        get.data_type = "VECTOR"
-        get.inputs["Name"].default_value = "velocity"
-        links.new(source.outputs[0], get.inputs["Volume"])
-        sample = nodes.new("GeometryNodeSampleGrid")
-        sample.data_type = "VECTOR"
-        links.new(get.outputs["Grid"], sample.inputs["Grid"])
-        point = nodes.new("GeometryNodePoints")
-        store = nodes.new("GeometryNodeStoreNamedAttribute")
-        store.data_type = "FLOAT_VECTOR"
-        store.inputs["Name"].default_value = "v"
-        links.new(point.outputs[0], store.inputs["Geometry"])
-        links.new(sample.outputs[0], store.inputs["Value"])
-        out = nodes.new("NodeGroupOutput")
-        join = nodes.new("GeometryNodeJoinGeometry")
-        links.new(store.outputs[0], join.inputs[0])
-        links.new(source.outputs[0], join.inputs[0])
-        links.new(join.outputs[0], out.inputs[0])
-        obj = bpy.data.objects.new("probe", bpy.data.meshes.new("probe"))
-        bpy.context.scene.collection.objects.link(obj)
-        obj.modifiers.new("Probe", "NODES").node_group = tree
-        geometry = obj.evaluated_get(bpy.context.evaluated_depsgraph_get()).evaluated_geometry()
-        grids = sorted(g.name for g in geometry.volume.grids) if geometry.volume else []
-        value = tuple(geometry.pointcloud.attributes["v"].data[0].vector)
-        bpy.data.objects.remove(obj)
-        bpy.data.node_groups.remove(tree)
-        return grids, value
-
-    grids, _ = emitted()
-    check("velocity" not in grids, f"velocity emitted without Initial Velocity: {grids}")
-    grids, moving = emitted(**{"Initial Velocity": True, "Source": 1.0})
-    print(f"  the cube moved 0.05 in y in 1/30 s; emitted velocity {moving}")
-    check("velocity" in grids, "no velocity grid with Initial Velocity")
-    check(abs(moving[1] - 1.5) < 0.05 and abs(moving[0]) < 0.05 and abs(moving[2]) < 0.05,
-          "the emitted velocity is not the mesh's motion")
-    _, both = emitted(**{"Initial Velocity": True, "Source": 0.5, "Velocity": (0.0, 0.0, 2.0)})
-    check(abs(both[1] - 0.75) < 0.05 and abs(both[2] - 2.0) < 0.05,
-          f"Source and Velocity do not combine: {both}")
+    reset()
+    _e, simulation_group = smoke_assets.build_assets(mark=False)
+    plain = add_cube("Plain", (0.0, 0.0, 0.3), 0.3)
+    modifier = plain.modifiers.new("Pyro", "NODES")
+    modifier.node_group = simulation_group
+    set_input(modifier, "Voxel Size", 0.0625)
+    plain.modifiers.new("Probe", "NODES").node_group = probe_group()
+    early, late = run_until(plain, 3), run_until(plain, 15)
+    print(f"  plain mesh: smoke top {early.top:.2f} at frame 3, {late.top:.2f} at frame 15")
+    check(late.top > early.top + 0.15, "a plain mesh did not emit rising smoke")
 
 
 def test_turbulence_layers_chain_in_order():
@@ -380,8 +455,10 @@ TESTS = [
     test_settings_changed_mid_simulation,
     test_campfire_burns,
     test_explosion_spreads,
+    test_burst_is_spiky,
+    test_emitter_motion_gives_velocity,
     test_initial_velocity_from_motion,
-    test_source_velocity_from_motion,
+    test_emitters_collection_and_plain_smoke,
     test_turbulence_layers_chain_in_order,
 ]
 

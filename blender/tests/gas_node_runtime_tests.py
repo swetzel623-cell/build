@@ -403,9 +403,9 @@ def test_sparse_gpu_advances_and_rises(_work):
     (start,), _ = lib.evaluate(obj, [zone], 1)
     (end,), names = lib.run_frames(obj, [zone], 2, 16)
     print(f"  sparse solver: {sparse_note(obj)}")
-    check(names == sorted(lib.GRID_NAMES), f"missing state grids: {names}")
+    check(lib.state_grids_match(names, zone), f"missing state grids: {names}")
     check(not errors(obj), f"unexpected node errors: {errors(obj)}")
-    for name in lib.GRID_NAMES:
+    for name in zone.grid_names:
         check(np.isfinite(end[name]).all(), f"{name} is not finite")
     rise = center_of_mass_z(zone, end["density"]) - center_of_mass_z(zone, start["density"])
     check(rise > 1.0, f"smoke rose only {rise:.3f} cells")
@@ -446,7 +446,7 @@ def test_sparse_gpu_obstacle(_work):
     (start,), _ = lib.evaluate(obj, [zone], 1)
     (end,), names = lib.run_frames(obj, [zone], 2, 13)
     print(f"  sparse solver: {sparse_note(obj)}")
-    check(names == sorted(lib.GRID_NAMES), f"unexpected grids: {names}")
+    check(lib.state_grids_match(names, zone), f"unexpected grids: {names}")
     check(not errors(obj), f"unexpected node errors: {errors(obj)}")
     solid = plate_mask(zone, 22)
     check(np.abs(end["density"][solid]).max() == 0.0, "smoke entered the obstacle")
@@ -522,7 +522,7 @@ def test_sparse_gpu_turbulence(_work):
         (start,), _ = lib.evaluate(obj, [zone], 1)
         (end,), _ = lib.run_frames(obj, [zone], 2, 13)
         check(not errors(obj), f"unexpected node errors: {errors(obj)}")
-        for name in lib.GRID_NAMES:
+        for name in zone.grid_names:
             check(np.isfinite(end[name]).all(), f"{name} is not finite")
         print(f"  sparse solver: {sparse_note(obj)}")
         return start, end
@@ -561,7 +561,7 @@ def test_sparse_gpu_keeps_state(_work):
     # A second zone with another resolution runs in between, on its own solver.
     lib.reset_scene()
     together, _ = run([sparse_zone(prefix="a_"), sparse_zone(prefix="b_", res=(24, 24, 40))], 10)
-    for name in lib.GRID_NAMES:
+    for name in lib.SPARSE_GRID_NAMES:
         check(np.array_equal(together[0][name], alone[0][name]),
               f"{name} changed when another zone ran in between")
 
@@ -586,7 +586,7 @@ def test_voxel_size_change_moves_the_state(_work):
         check(not errors(obj), f"{label}: unexpected node errors: {errors(obj)}")
         check(any("moved onto the new grid" in message for _kind, message in notes),
               f"{label}: the move was not reported: {notes}")
-        check(names == sorted(lib.GRID_NAMES), f"{label}: missing state grids: {names}")
+        check(lib.state_grids_match(names, zone), f"{label}: missing state grids: {names}")
 
         mass = [float(before["density"].sum()) * old**3, float(after["density"].sum()) * new**3]
         # In a closed box the air's total momentum is zero; the smoke's is what rises.
@@ -627,7 +627,7 @@ def test_sparse_gpu_fire(_work):
     (end,), names = lib.run_frames(obj, [zone], 1, 16)
     check(not errors(obj), f"unexpected node errors: {errors(obj)}")
     print(f"  sparse solver: {sparse_note(obj)}")
-    check(names == sorted(lib.GRID_NAMES + ("fuel", "flame")), f"state grids: {names}")
+    check(lib.state_grids_match(names, zone, ("fuel", "flame")), f"state grids: {names}")
     flame, smoke = end["flame"], end["density"]
     smoke_height = center_of_mass_z(zone, smoke)
     flame_height = center_of_mass_z(zone, flame)

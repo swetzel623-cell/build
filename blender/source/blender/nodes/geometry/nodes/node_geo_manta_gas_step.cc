@@ -452,6 +452,8 @@ struct SparseSlot {
   std::array<const void *, 6> trees{};
   std::array<int, 3> resolution{};
   std::uint64_t last_used = 0;
+  /** The last frame's downloaded state, kept so its vectors are reused. */
+  sparse::State shown;
 };
 
 struct SparseDevice {
@@ -813,6 +815,8 @@ static Volume *export_sparse_state(const sparse::State &state,
     tag_output(*grid);
     return grid;
   };
+  /* Pressure only when the state has it: the GPU path keeps it on the device. */
+  const bool with_pressure = !state.pressure.empty();
   openvdb::FloatGrid::Ptr density = scalar(true), temperature = scalar(true),
                           pressure = scalar(false), fuel = scalar(true), flame = scalar(true);
   openvdb::Vec3SGrid::Ptr velocity = openvdb::Vec3SGrid::create(openvdb::Vec3f::zero());
@@ -846,7 +850,7 @@ static Volume *export_sparse_state(const sparse::State &state,
         if (state.temperature[i] != 0.0f) {
           temperature_access.setValue(c, state.temperature[i]);
         }
-        if (state.pressure[i] != 0.0f) {
+        if (with_pressure && state.pressure[i] != 0.0f) {
           pressure_access.setValue(c, state.pressure[i]);
         }
         if (fire && state.fuel[i] != 0.0f) {
@@ -867,7 +871,7 @@ static Volume *export_sparse_state(const sparse::State &state,
   trees = {&density->tree(),
            &temperature->tree(),
            &velocity->tree(),
-           &pressure->tree(),
+           with_pressure ? &pressure->tree() : nullptr,
            fire ? &fuel->tree() : nullptr,
            fire ? &flame->tree() : nullptr};
   Volume *volume = BKE_id_new_nomain<Volume>("Gas Simulation Step State");
@@ -875,7 +879,9 @@ static Volume *export_sparse_state(const sparse::State &state,
   BKE_volume_grid_add_vdb(*volume, "density", std::move(density));
   BKE_volume_grid_add_vdb(*volume, "temperature", std::move(temperature));
   BKE_volume_grid_add_vdb(*volume, "velocity", std::move(velocity));
-  BKE_volume_grid_add_vdb(*volume, "pressure", std::move(pressure));
+  if (with_pressure) {
+    BKE_volume_grid_add_vdb(*volume, "pressure", std::move(pressure));
+  }
   if (fire) {
     BKE_volume_grid_add_vdb(*volume, "fuel", std::move(fuel));
     BKE_volume_grid_add_vdb(*volume, "flame", std::move(flame));
@@ -1180,15 +1186,19 @@ static void exec_sparse(GeoNodeExecParams &params,
           fresh = import_state();
         }
         const auto solve_start = std::chrono::steady_clock::now();
-        if (continued) {
-          slot->gpu->set_obstacles(std::move(obstacle), std::move(obstacle_velocity));
-        }
-        else {
+        if (!continued) {
           slot->gpu->upload(fresh);
         }
+        else if (!slot->gpu->same_obstacles(obstacle, obstacle_velocity)) {
+          /* Unchanged colliders (or none) need no new classification or multigrid setup. */
+          slot->gpu->set_obstacles(std::move(obstacle), std::move(obstacle_velocity));
+        }
         const sparse::FrameInfo frame = slot->gpu->advance(settings, delta_time, &sources);
-        sparse::State result;
-        slot->gpu->download(result);
+        /* Only what is shown and needed to continue comes back; pressure stays on the device
+         * (a frame that cannot continue there restarts it from zero). The slot keeps the
+         * vectors so their memory is reused from frame to frame. */
+        sparse::State &result = slot->shown;
+        slot->gpu->download_shown(result, fire.enabled, false);
         solve_ms = milliseconds_since(solve_start);
         finish(result, frame);
         slot->state_id = output_id;

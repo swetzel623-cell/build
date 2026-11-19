@@ -57,8 +57,19 @@ class SparseGasGpu {
    * their cells are classified again, and `velocity` moves the obstacle faces.
    */
   void set_obstacles(std::vector<std::uint32_t> mask, sparse::BrickField velocity = {});
+  /** Whether set_obstacles with these would change nothing: the same mask, and no velocity
+   * now or before. */
+  bool same_obstacles(const std::vector<std::uint32_t> &mask,
+                      const sparse::BrickField &velocity) const;
   /** Copy the device state, including its topology, into `state`. */
   void download(sparse::State &state);
+  /**
+   * Copy only what is shown and cached between frames into `state`: the brick layout (table
+   * and coordinates), density, temperature and velocity, fuel and flame with `fire`, and
+   * pressure with `pressure`. Other channels are emptied. The vectors are resized, not cleared,
+   * so a `state` reused from frame to frame does not zero its memory again.
+   */
+  void download_shown(sparse::State &state, bool fire, bool pressure);
 
   /**
    * Advance the device state by one step. StepInfo::max_divergence is not measured on this path

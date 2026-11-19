@@ -178,7 +178,7 @@ def test_modifier_emits_and_rises():
     print(f"  smoke top: frame 4 {early.top:.3f}, frame 20 {late.top:.3f}; "
           f"{late.warnings}")
     check(not [w for w in late.warnings if w[0] == "ERROR"], f"errors: {late.warnings}")
-    check(late.grids == ["density", "pressure", "temperature", "velocity"],
+    check(late.grids == ["density", "temperature", "velocity"],
           f"unexpected grids: {late.grids}")
     check(late.top > early.top + 0.2, "the smoke did not rise above the emitter")
 
@@ -272,7 +272,7 @@ def test_settings_changed_mid_simulation():
     set_input(modifier, "Domain Size", (1.0, 1.0, 1.0))
     smaller = Smoke(emitter, 13)
     check(not [w for w in smaller.warnings if w[0] == "ERROR"], f"{smaller.warnings}")
-    check(smaller.grids == ["density", "pressure", "temperature", "velocity"],
+    check(smaller.grids == ["density", "temperature", "velocity"],
           f"unexpected grids after shrinking the domain: {smaller.grids}")
 
 

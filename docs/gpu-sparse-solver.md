@@ -984,6 +984,30 @@ and Workbench, which is how the viewport draws Material Preview and Solid view:
   Workbench (Solid view) of the Explosion at frames 6 and 14 with the flame as an orange
   volume in the grey smoke.
 
+**Speed, phase 1.** Three research agents (a profiler, a code review and a literature survey;
+their reports were kept outside the repository) found that on a real GPU the CPU work around
+the kernels, and the Simulation Zone cache, set the frame time of large simulations. The device
+buffers were already device-local and dispatches already recorded into few submits. Phase 1:
+
+- The node downloads only density, temperature, velocity and, with fire, fuel and flame
+  (`SparseGasGpu::download_shown`) into vectors the GPU slot keeps between frames, so they are
+  not zero-filled again. Pressure, expansion, burn and cell types stay on the device. The
+  output has no pressure grid on this path; a frame that cannot continue on the device starts
+  pressure from zero. The CPU path still writes pressure, which it needs to continue.
+- Transfers share one staging buffer kept between submits, grown after a submit that needed
+  more, instead of a new buffer per transfer.
+- `set_obstacles` (classification and multigrid setup) is skipped when the obstacle mask is
+  unchanged and nothing moves, which includes having no colliders.
+- Pyro Point Source evaluates its five source grids with one Field to Grid node, so the
+  nearest point is looked up once per voxel; bursts and trails create no points before they
+  start or after they end.
+
+Measured on llvmpipe (so the GPU solve itself is not representative), same scene before and
+after: memory growth per frame 3.9 → 3.1 MB (voxel 0.06) and 10.4 → 7.4 MB (0.03); export 2.3
+→ 1.8 ms and 6.3 → 5.3 ms; time outside the node 24 → 20 ms and 29 → 24 ms; Explosion frames
+after the burst 30 → 20 ms outside the node; Pyro Point Source 116 → 77 ms at 30,000 points
+and 246 → 144 ms at 100,000.
+
 ## Not verified, and known gaps
 
 - **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.

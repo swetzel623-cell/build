@@ -13,6 +13,15 @@ import numpy as np
 
 GAS_NODE = "GeometryNodeMantaGasStep"
 GRID_NAMES = ("density", "temperature", "velocity", "pressure")
+# The Sparse GPU path keeps pressure on the device; its output has no pressure grid (the CPU
+# fallback of that path still writes one).
+SPARSE_GRID_NAMES = ("density", "temperature", "velocity")
+
+
+def state_grids_match(names, zone, extra=()):
+    """Whether a state volume's grid names are the ones `zone`'s solver path writes."""
+    expected = set(zone.grid_names) | set(extra)
+    return set(names) - ({"pressure"} if zone.sparse else set()) == expected
 DIAG_NAMES = ("substeps", "max_velocity", "import_ms", "solve_ms", "export_ms",
               "pressure_iterations", "pressure_residual", "active_bricks")
 
@@ -41,6 +50,15 @@ class Zone:
         self.colliders = params.pop("colliders", None)
         self.params = params
         self.data_object = None
+
+    @property
+    def sparse(self):
+        return bool(self.params.get("Sparse GPU", False))
+
+    @property
+    def grid_names(self):
+        """The state grids read back: no pressure from the Sparse GPU path."""
+        return SPARSE_GRID_NAMES if self.sparse else GRID_NAMES
 
     @property
     def cells(self):
@@ -295,7 +313,7 @@ def _readback(b, zone, state, diag):
         cloud = node.outputs["Geometry"]
 
     if zone.readback:
-        for name in GRID_NAMES + zone.extra_grids:
+        for name in zone.grid_names + zone.extra_grids:
             vector = name == "velocity"
             get = b.new("GeometryNodeGetNamedGrid", data_type="VECTOR" if vector else "FLOAT")
             b.link(state, get.inputs["Volume"])
@@ -368,7 +386,7 @@ def evaluate(obj, zones, frame=None):
         lo, hi = offsets[zone.prefix]
         result = {}
         if zone.readback:
-            for name in GRID_NAMES + zone.extra_grids:
+            for name in zone.grid_names + zone.extra_grids:
                 result[name] = _attribute(cloud, zone.prefix + name, 3 if name == "velocity" else 1)[lo:hi].copy()
         for name in DIAG_NAMES:
             result[name] = float(_attribute(cloud, zone.prefix + name, 1)[lo])

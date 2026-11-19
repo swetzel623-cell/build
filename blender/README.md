@@ -122,6 +122,14 @@ next to the file (a job with a progress bar; Esc stops it), and playback and ren
 bake. **Delete Bake** lets the simulation run again with new settings. The modifier's own Manage
 > Bake panel does the same per modifier.
 
+**Memory and speed.** Until it is baked, Blender keeps every simulated frame in memory, so a long
+or large simulation grows by tens of megabytes per frame (the state at about 30 bytes per stored
+voxel; pressure is not kept, it stays on the GPU). Bake it to disk from the Pyro tab once it looks
+right. Each frame the node downloads only the channels it shows and continues from the GPU,
+transfers reuse one staging buffer, unchanged colliders are not set up again, the Pyro Point
+Source evaluates all five source grids in one pass, and emitters stop producing points once
+their bursts and trails are over.
+
 Inside, each modifier is one row of blocks passing one Settings bundle; every block is in the node
 editor's **Add > Pyro** menu: Pyro Emitter Preset, Pyro Burst, Pyro Fill, Pyro Particles,
 Pyro Preset, Pyro Gather, Pyro Domain, Pyro Colliders, Pyro Solver, Pyro Display, Pyro Point

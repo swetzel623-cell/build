@@ -220,7 +220,13 @@ struct Compute::Impl {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void *mapped = nullptr;
+    std::size_t size = 0;
   };
+  /** Transfers share one host-visible buffer kept between submits; it grows after a submit
+   * that needed more, and a transfer that does not fit meanwhile gets a buffer of its own. */
+  Staging arena;
+  std::size_t arena_used = 0;
+  std::size_t arena_wanted = 0;
   std::vector<Staging> staging;
   struct PendingDownload {
     void *mapped;
@@ -276,7 +282,7 @@ struct Compute::Impl {
     check(vkBindBufferMemory(device, buffer, memory, 0), "vkBindBufferMemory");
   }
 
-  void *staging_buffer(const std::size_t bytes, VkBuffer &buffer)
+  Staging make_staging(const std::size_t bytes) const
   {
     Staging entry;
     make_buffer(bytes,
@@ -286,18 +292,57 @@ struct Compute::Impl {
                 entry.buffer,
                 entry.memory);
     check(vkMapMemory(device, entry.memory, 0, VK_WHOLE_SIZE, 0, &entry.mapped), "vkMapMemory");
-    staging.push_back(entry);
-    buffer = entry.buffer;
-    return entry.mapped;
+    entry.size = bytes;
+    return entry;
   }
 
+  void free_staging(const Staging &entry) const
+  {
+    vkDestroyBuffer(device, entry.buffer, nullptr);
+    vkFreeMemory(device, entry.memory, nullptr);
+  }
+
+  /** Room for one transfer of `bytes`: the buffer, its offset, and the mapped address. */
+  void *staging_buffer(const std::size_t bytes, VkBuffer &buffer, VkDeviceSize &offset)
+  {
+    const std::size_t aligned = (bytes + 255) & ~std::size_t(255);
+    arena_wanted += aligned;
+    if (arena.buffer && arena_used + aligned <= arena.size) {
+      buffer = arena.buffer;
+      offset = arena_used;
+      arena_used += aligned;
+      return static_cast<char *>(arena.mapped) + offset;
+    }
+    staging.push_back(make_staging(bytes));
+    buffer = staging.back().buffer;
+    offset = 0;
+    return staging.back().mapped;
+  }
+
+  /** After a submit has finished (or its commands were dropped). */
   void release_staging()
   {
     for (const Staging &entry : staging) {
-      vkDestroyBuffer(device, entry.buffer, nullptr);
-      vkFreeMemory(device, entry.memory, nullptr);
+      free_staging(entry);
     }
     staging.clear();
+    if (arena_wanted > arena.size) {
+      if (arena.buffer) {
+        free_staging(arena);
+        arena = Staging();
+      }
+      arena = make_staging(std::max<std::size_t>(arena_wanted + arena_wanted / 4, 1 << 20));
+    }
+    arena_used = 0;
+    arena_wanted = 0;
+  }
+
+  void destroy_arena()
+  {
+    if (arena.buffer) {
+      free_staging(arena);
+      arena = Staging();
+    }
   }
 
   /** Close the timing interval of the command just recorded. */
@@ -535,6 +580,7 @@ Compute::~Compute()
   Impl &v = *impl_;
   vkDeviceWaitIdle(v.device);
   v.release_staging();
+  v.destroy_arena();
   destroy_buffer(v.dummy);
   for (const VkPipeline pipeline : v.pipelines) {
     vkDestroyPipeline(v.device, pipeline, nullptr);
@@ -684,8 +730,10 @@ void Compute::upload(const Buffer &target, const void *data, const std::size_t b
     throw std::logic_error("upload larger than its target buffer");
   }
   VkBuffer staging = VK_NULL_HANDLE;
-  std::memcpy(v.staging_buffer(bytes, staging), data, bytes);
+  VkDeviceSize offset = 0;
+  std::memcpy(v.staging_buffer(bytes, staging, offset), data, bytes);
   VkBufferCopy region{};
+  region.srcOffset = offset;
   region.size = bytes;
   vkCmdCopyBuffer(v.commands, staging, to_vk(target), 1, &region);
   v.barrier();
@@ -702,8 +750,10 @@ void Compute::download(const Buffer &source, void *out, const std::size_t bytes)
     throw std::logic_error("download larger than its source buffer");
   }
   VkBuffer staging = VK_NULL_HANDLE;
-  void *mapped = v.staging_buffer(bytes, staging);
+  VkDeviceSize offset = 0;
+  void *mapped = v.staging_buffer(bytes, staging, offset);
   VkBufferCopy region{};
+  region.dstOffset = offset;
   region.size = bytes;
   vkCmdCopyBuffer(v.commands, to_vk(source), staging, 1, &region);
   v.barrier();

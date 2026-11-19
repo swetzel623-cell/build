@@ -279,15 +279,6 @@ def store_attribute(b, geometry, name, value, kind="FLOAT", domain="POINT"):
     return node.outputs["Geometry"]
 
 
-def field_grid(b, topology, value, kind="FLOAT"):
-    node = b.new("GeometryNodeFieldToGrid", data_type=kind)
-    node.grid_items.clear()
-    node.grid_items.new(kind, "Value")
-    b.link(topology, node.inputs["Topology"])
-    b.set(node.inputs["Value"], value)
-    return node.outputs["Value"]
-
-
 def random(b, kind, minimum, maximum, ident, seed):
     """Random Value of `kind` (FLOAT or FLOAT_VECTOR) for the ID field `ident`."""
     node = b.new("FunctionNodeRandomValue", data_type=kind)
@@ -757,6 +748,16 @@ def finish_points(b, points, position, radius, s, weight, velocity, live, streng
     return dead.outputs[0]
 
 
+def bursting(b, s, frame):
+    """1 while any burst is emitting: from Start Frame to the end of the last burst."""
+    duration = switch(b, "FLOAT", b.math("GREATER_THAN", s["Duration"], 0.0), 8.0, s["Duration"])
+    last = b.math("ADD", s["Start Frame"], b.math("MULTIPLY", b.math(
+        "SUBTRACT", s["Bursts"], 1.0), s["Burst Delay"]))
+    return b.math("MULTIPLY", b.math("GREATER_THAN", frame, b.math("SUBTRACT", s["Start Frame"],
+                                                                    1.0e-4)),
+                  b.math("LESS_THAN", frame, b.math("ADD", last, duration)))
+
+
 def build_burst():
     tree = new_group(
         "Pyro Burst",
@@ -785,9 +786,11 @@ def build_burst():
         "MULTIPLY", b.math("MULTIPLY", biggest, s["Spike Length"]), s["Spike Fill"]), spacing))
     per_spike = b.math("MINIMUM", b.math("MAXIMUM", per_spike, 2.0), 160.0)
     per_burst = b.math("MULTIPLY", s["Spikes"], per_spike)
+    # No points at all before the first burst or after the last one ends.
+    emitting = bursting(b, s, inp["Frame"])
     points = b.new("GeometryNodePoints")
-    b.link(b.math("MINIMUM", b.math("MULTIPLY", per_burst, s["Bursts"]), 300000.0),
-           points.inputs["Count"])
+    b.link(b.math("MULTIPLY", b.math("MINIMUM", b.math("MULTIPLY", per_burst, s["Bursts"]),
+                                      300000.0), emitting), points.inputs["Count"])
     index = b.new("GeometryNodeInputIndex").outputs[0]
     burst = b.math("FLOOR", b.math("DIVIDE", index, per_burst))
     spike_id = b.math("FLOOR", b.math("DIVIDE", index, per_spike))
@@ -848,7 +851,8 @@ def build_burst():
         "DIVIDE", b.math("MULTIPLY", biggest, s["Core Size"]), spacing), 3.0)))
     per_core = b.math("MINIMUM", per_core, 40000.0)
     core_points = b.new("GeometryNodePoints")
-    b.link(b.math("MULTIPLY", per_core, s["Bursts"]), core_points.inputs["Count"])
+    b.link(b.math("MULTIPLY", b.math("MULTIPLY", per_core, s["Bursts"]), emitting),
+           core_points.inputs["Count"])
     core_index = b.new("GeometryNodeInputIndex").outputs[0]
     core_burst = b.math("FLOOR", b.math("DIVIDE", core_index, b.math("MAXIMUM", per_core, 1.0)))
     core_live, core_remaining, core_radius, core_rate, core_centre = burst_timing(
@@ -952,9 +956,14 @@ def build_trails():
     per_trail = b.math("CEIL", b.math("DIVIDE", b.math("MULTIPLY", longest, 1.5),
                                       s["Point Spacing"]))
     per_trail = b.math("MINIMUM", b.math("MAXIMUM", per_trail, 2.0), 160.0)
+    # No points before the first launch or after the longest-lived trail is gone.
+    flying = b.math("MULTIPLY", b.math(
+        "GREATER_THAN", inp["Frame"], b.math("SUBTRACT", s["Start Frame"], 1.0e-4)),
+        b.math("LESS_THAN", inp["Frame"], b.math("ADD", b.math(
+            "ADD", s["Start Frame"], s["Launch Window"]), s["Trail Life"])))
     points = b.new("GeometryNodePoints")
-    b.link(b.math("MINIMUM", b.math("MULTIPLY", s["Trails"], per_trail), 300000.0),
-           points.inputs["Count"])
+    b.link(b.math("MULTIPLY", b.math("MINIMUM", b.math("MULTIPLY", s["Trails"], per_trail),
+                                      300000.0), flying), points.inputs["Count"])
     index = b.new("GeometryNodeInputIndex").outputs[0]
     trail = b.math("FLOOR", b.math("DIVIDE", index, per_trail))
     behind = b.math("DIVIDE", b.math("SUBTRACT", index, b.math("MULTIPLY", trail, per_trail)),
@@ -1416,18 +1425,25 @@ def build_point_source():
         b.link(named_attribute(b, name), stat.inputs["Attribute"])
         return stat.outputs["Max"]
 
+    # One Field to Grid for all five, so the nearest point is found once per voxel.
+    to_grids = b.new("GeometryNodeFieldToGrid", data_type="FLOAT")
+    to_grids.grid_items.clear()
+    for name in ("density", "temperature", "fuel", "expansion"):
+        to_grids.grid_items.new("FLOAT", name)
+    to_grids.grid_items.new("VECTOR", "velocity")
+    b.link(shape, to_grids.inputs["Topology"])
+    for name in ("density", "temperature", "fuel", "expansion"):
+        b.link(b.math("MULTIPLY", weight, nearest_value(name, "FLOAT")), to_grids.inputs[name])
+    b.link(nearest_value("velocity", "FLOAT_VECTOR"), to_grids.inputs["velocity"])
+    grids = to_grids.outputs
     volume = None
     for name in ("density", "temperature"):
-        volume = store_grid(b, volume, name, field_grid(
-            b, shape, b.math("MULTIPLY", weight, nearest_value(name, "FLOAT"))))
+        volume = store_grid(b, volume, name, grids[name])
     # Fuel and expansion grids only where some point emits them: any fuel grid turns fire on.
     for name, grid_name in (("fuel", "fuel"), ("expansion", "divergence")):
-        with_grid = store_grid(b, volume, grid_name, field_grid(
-            b, shape, b.math("MULTIPLY", weight, nearest_value(name, "FLOAT"))))
+        with_grid = store_grid(b, volume, grid_name, grids[name])
         volume = switch(b, "GEOMETRY", b.math("GREATER_THAN", most(name), 0.0), volume, with_grid)
-    moving = store_grid(b, volume, "velocity",
-                        field_grid(b, shape, nearest_value("velocity", "FLOAT_VECTOR"), "VECTOR"),
-                        kind="VECTOR_FLOAT")
+    moving = store_grid(b, volume, "velocity", grids["velocity"], kind="VECTOR_FLOAT")
     # A velocity grid only for points that carry a velocity.
     exists = b.new("GeometryNodeInputNamedAttribute", data_type="FLOAT_VECTOR")
     exists.inputs["Name"].default_value = "velocity"

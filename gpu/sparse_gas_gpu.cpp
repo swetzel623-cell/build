@@ -701,6 +701,13 @@ void SparseGasGpu::set_obstacles(std::vector<std::uint32_t> mask, sparse::BrickF
   g.compute.submit();
 }
 
+bool SparseGasGpu::same_obstacles(const std::vector<std::uint32_t> &mask,
+                                  const sparse::BrickField &velocity) const
+{
+  const Impl &g = *impl_;
+  return velocity.empty() && !g.obstacles_move && mask == g.topology.obstacle;
+}
+
 void SparseGasGpu::use_sources(const sparse::Sources *sources)
 {
   Impl &g = *impl_;
@@ -753,6 +760,53 @@ void SparseGasGpu::download(sparse::State &state)
   g.compute.download(g.types, state.topology.cell_type.data(), count * sizeof(std::uint32_t));
   for (int i = 0; i < StateChannels; ++i) {
     g.compute.download(g.channel(i), channels[i]->data(), count * sizeof(float));
+  }
+  g.compute.submit();
+}
+
+void SparseGasGpu::download_shown(sparse::State &state, const bool fire, const bool pressure)
+{
+  Impl &g = *impl_;
+  const std::size_t count = g.topology.voxel_count();
+  state.topology.extent = g.topology.extent;
+  state.topology.brick_size = g.topology.brick_size;
+  state.topology.brick_extent = g.topology.brick_extent;
+  state.topology.brick_table = g.topology.brick_table;
+  state.topology.brick_coords = g.topology.brick_coords;
+  state.topology.neighbors.clear();
+  state.topology.cell_type.clear();
+  state.topology.obstacle.clear();
+  struct Wanted {
+    std::vector<float> *values;
+    int channel;
+    bool wanted;
+  };
+  const Wanted channels[] = {{&state.density, 0, true},
+                             {&state.temperature, 1, true},
+                             {&state.u, 2, true},
+                             {&state.v, 3, true},
+                             {&state.w, 4, true},
+                             {&state.pressure, 5, pressure},
+                             {&state.fuel, 6, fire},
+                             {&state.flame, 7, fire},
+                             {&state.expansion, 8, false},
+                             {&state.burn, 9, false}};
+  for (const Wanted &item : channels) {
+    if (item.wanted) {
+      item.values->resize(count);
+    }
+    else {
+      item.values->clear();
+    }
+  }
+  if (count == 0) {
+    return;
+  }
+  g.compute.begin();
+  for (const Wanted &item : channels) {
+    if (item.wanted) {
+      g.compute.download(g.channel(item.channel), item.values->data(), count * sizeof(float));
+    }
   }
   g.compute.submit();
 }

@@ -131,9 +131,11 @@ jobs:
         run: |
           %DIST_DIR%\blender.exe -b --factory-startup --python overlay\blender\assets\smoke_assets.py || exit /b 1
           dir /s /b %DIST_DIR%\pyro_simulation_assets.blend || exit /b 1
-          rem Updating the assets later needs no rebuild: a newer smoke_assets.py next to
-          rem blender.exe, then a double-click on update_pyro_assets.bat.
+          dir /s /b %DIST_DIR%\pyro_tools.py || exit /b 1
+          rem Updating the assets later needs no rebuild: a newer smoke_assets.py and
+          rem pyro_tools.py next to blender.exe, then a double-click on update_pyro_assets.bat.
           copy overlay\blender\assets\smoke_assets.py %DIST_DIR%\ || exit /b 1
+          copy overlay\blender\assets\pyro_tools.py %DIST_DIR%\ || exit /b 1
           copy overlay\blender\assets\update_pyro_assets.bat %DIST_DIR%\ || exit /b 1
 
       - name: Run the in-Blender runtime tests

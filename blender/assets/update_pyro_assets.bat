@@ -1,6 +1,7 @@
 @echo off
 rem Reinstall the Pyro node-group assets (Add Modifier > Physics > Pyro Simulation, Add > Pyro)
-rem into this Blender, from smoke_assets.py in this folder. Close Blender first. A newer
+rem and the viewport's Pyro tab into this Blender, from smoke_assets.py and pyro_tools.py in
+rem this folder. Close Blender first. A newer
 rem smoke_assets.py dropped into this folder updates the presets and blocks without a new build.
 cd /d "%~dp0"
 if not exist blender.exe (

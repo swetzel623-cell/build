@@ -6,9 +6,9 @@
 Four small spheres, each with a Pyro Emitter followed by a Pyro Simulation: an Explosion,
 Explosion Trails (with burning trails thrown out, paths shown) and a Ground Blast (spiky bursts
 and trails after Houdini's Pyro Burst Source and Trail Path, with the Explosion look) and a
-Campfire under a plate in the "Colliders" collection (with the Fire look). Press
-play from frame 1. The demo carries its own copy of the node groups, so it also opens in a build
-without the installed assets.
+Campfire under a plate in the "Colliders" collection (with the Fire look). Press play from
+frame 1. It opens in Material Preview, where the flames glow. The demo carries its own copy of
+the node groups, so it also opens in a build without the installed assets.
 """
 
 from __future__ import annotations
@@ -76,6 +76,14 @@ def main():
     bpy.ops.object.camera_add(location=(2.0, -25.0, 2.5), rotation=(np.radians(85), 0.0, 0.0))
     scene.camera = bpy.context.active_object
     bpy.ops.object.light_add(type="SUN", location=(0.0, 0.0, 6.0))
+    # Open in Material Preview, where the flames glow, with sharper volumes and shadowed smoke.
+    scene.eevee.volumetric_tile_size = "4"
+    scene.eevee.use_volumetric_shadows = True
+    for screen in bpy.data.screens:
+        for area in screen.areas:
+            for space in area.spaces:
+                if space.type == "VIEW_3D":
+                    space.shading.type = "MATERIAL"
     bpy.ops.wm.save_as_mainfile(filepath=path)
     print(f"Wrote {path}")
 

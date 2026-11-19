@@ -7,21 +7,24 @@ writes `datafiles/assets/nodes/pyro_simulation_assets.blend` next to the running
 adds its catalogs to `datafiles/assets/blender_assets.cats.txt`, so that:
 
 - Add Modifier > Physics > Pyro Emitter turns any mesh into pyro source points: spiky bursts
-  in the manner of Houdini's Pyro Burst Source (Explosion, Fireball, Ground Blast, Muzzle Flash,
-  Smoke Puff), the mesh's volume or surface (Smoke, Campfire, Candle), or particles (Trail,
-  Large Plume);
+  and ballistic trails in the manner of Houdini's Pyro Burst Source and Trail Path (Explosion,
+  Explosion Trails, Fireball, Ground Blast, Muzzle Flash, Smoke Puff, Debris Trails), the
+  mesh's volume or surface (Smoke, Campfire, Candle), or particles (Trail, Large Plume);
 - Add Modifier > Physics > Pyro Simulation simulates them: on the same object after a Pyro
   Emitter, or on any object with emitters in its Emitters collection; its presets set the look
   of the simulation (Smoke, Fire, Explosion, Large Plume); and
 - Add > Pyro offers the building blocks both are made of, for setups built by hand.
 
-Each modifier's blocks pass one Settings bundle instead of dozens of links. `build_assets()` can also be imported to create the groups in the current file (the tests
-do).
+It also copies pyro_tools.py (the viewport sidebar's Pyro tab: Bake, Delete Bake, Show Flames)
+into `scripts/startup`. Each modifier's blocks pass one Settings bundle instead of dozens of
+links. `build_assets()` can also be imported to create the groups in the current file (the
+tests do).
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 
 import bpy
@@ -29,6 +32,7 @@ import bpy
 CATALOG_PYRO = ("689f4607-3a1d-4e2a-a49b-8166dad896ca", "Geometry Nodes/Pyro")
 CATALOG_PHYSICS = ("4c0f1d1e-6b0a-4a8e-9d43-5d1f3a6b7c21", "Geometry Nodes/Physics")
 ASSET_FILE = "pyro_simulation_assets.blend"
+TOOLS_FILE = "pyro_tools.py"
 MODIFIER = "Pyro Simulation"
 EMITTER_MODIFIER = "Pyro Emitter"
 GAS_NODE = "GeometryNodeMantaGasStep"
@@ -1697,7 +1701,13 @@ def build_solver():
     return tree
 
 
+SMOKE_DENSITY = 12.0  # The material's density per unit of the 'density' grid.
+FLAME_GLOW = 20.0  # The material's emission strength per unit of the 'glow' grid.
+
+
 def build_material():
+    """The smoke and fire shader: 'density' grid for smoke, 'flame' for the flame's colour and
+    'glow' (flame × Flame Brightness, from Pyro Display) for its brightness."""
     material = bpy.data.materials.get("Pyro Simulation")
     if material is None:
         material = bpy.data.materials.new("Pyro Simulation")
@@ -1707,52 +1717,121 @@ def build_material():
     links = material.node_tree.links
     nodes.clear()
     volume = nodes.new("ShaderNodeVolumePrincipled")
-    volume.inputs["Density"].default_value = 5.0
-    # Flame: the 'flame' grid lights the volume, from dark red through orange to yellow.
+    volume.inputs["Density"].default_value = SMOKE_DENSITY
+    volume.inputs["Color"].default_value = (0.42, 0.4, 0.38, 1.0)
+    # Flame: dark red through orange to yellow, by the 'flame' grid.
     flame = nodes.new("ShaderNodeAttribute")
     flame.attribute_name = "flame"
     ramp = nodes.new("ShaderNodeValToRGB")
     elements = ramp.color_ramp.elements
-    elements[0].position, elements[0].color = 0.0, (0.0, 0.0, 0.0, 1.0)
+    elements[0].position, elements[0].color = 0.0, (0.3, 0.02, 0.0, 1.0)
     elements[1].position, elements[1].color = 1.0, (1.0, 0.85, 0.35, 1.0)
     middle = elements.new(0.35)
     middle.color = (1.0, 0.25, 0.02, 1.0)
     links.new(flame.outputs["Fac"], ramp.inputs["Fac"])
     links.new(ramp.outputs["Color"], volume.inputs["Emission Color"])
+    glow = nodes.new("ShaderNodeAttribute")
+    glow.attribute_name = "glow"
     strength = nodes.new("ShaderNodeMath")
     strength.operation = "MULTIPLY"
-    strength.inputs[1].default_value = 8.0
+    strength.inputs[1].default_value = FLAME_GLOW
     strength.label = "Flame Brightness"
-    links.new(flame.outputs["Fac"], strength.inputs[0])
+    links.new(glow.outputs["Fac"], strength.inputs[0])
     links.new(strength.outputs[0], volume.inputs["Emission Strength"])
     output = nodes.new("ShaderNodeOutputMaterial")
     links.new(volume.outputs[0], output.inputs["Volume"])
     return material
 
 
-def build_display(material):
+def build_flame_preview_material():
+    """Orange in Solid view (its viewport colour) and invisible when rendered, for the flame's
+    outline in Solid view, where volumes show only their smoke."""
+    material = bpy.data.materials.get("Pyro Flame Preview")
+    if material is None:
+        material = bpy.data.materials.new("Pyro Flame Preview")
+    material.diffuse_color = (1.0, 0.42, 0.04, 1.0)
+    material.roughness = 1.0
+    if material.node_tree is None:
+        material.use_nodes = True
+    nodes = material.node_tree.nodes
+    nodes.clear()
+    clear = nodes.new("ShaderNodeBsdfTransparent")
+    output = nodes.new("ShaderNodeOutputMaterial")
+    material.node_tree.links.new(clear.outputs[0], output.inputs["Surface"])
+    material.surface_render_method = "DITHERED"
+    material.use_transparent_shadow = True
+    return material
+
+
+def grid_times(b, volume, name, factor, store_as=None, remove=True):
+    """Replace grid `name` (or add `store_as`) with it times `factor`."""
+    get = b.new("GeometryNodeGetNamedGrid", data_type="FLOAT")
+    b.link(volume, get.inputs["Volume"])
+    get.inputs["Name"].default_value = name
+    get.inputs["Remove"].default_value = remove
+    store = b.new("GeometryNodeStoreNamedGrid", data_type="FLOAT")
+    b.link(get.outputs["Volume"], store.inputs["Volume"])
+    store.inputs["Name"].default_value = store_as or name
+    b.link(b.math("MULTIPLY", get.outputs["Grid"], factor), store.inputs["Grid"])
+    return store.outputs[0]
+
+
+def build_display(materials):
+    material, preview = materials
     tree = new_group(
         "Pyro Display",
-        "Shade the simulated smoke and fire, move it into the object's space, and keep the "
-        "object's mesh if asked")
+        "Shade the simulated smoke and fire, outline the flame for Solid view, move it into the "
+        "object's space, and keep the object's mesh if asked")
     socket(tree, "State", "NodeSocketGeometry")
     socket(tree, "Mesh", "NodeSocketGeometry", description="The object's own mesh")
     socket(tree, "To World", "NodeSocketMatrix", description="The object's world matrix")
     socket(tree, "Show Mesh", "NodeSocketBool", default=True)
+    socket(tree, "Smoke Density", "NodeSocketFloat", default=1.0, minimum=0.0,
+           description="How thick the smoke looks")
+    socket(tree, "Flame Brightness", "NodeSocketFloat", default=1.0, minimum=0.0,
+           description="How bright the flame looks")
+    socket(tree, "Flame In Solid View", "NodeSocketBool", default=True,
+           description="Show the flame's outline in orange in Solid view, where volumes show "
+                       "only grey smoke. It is never rendered")
     socket(tree, "Material", "NodeSocketMaterial")
+    socket(tree, "Flame Material", "NodeSocketMaterial")
     socket(tree, "Geometry", "NodeSocketGeometry", in_out="OUTPUT")
     b = Builder(tree)
     group_in = b.new("NodeGroupInput")
     group_out = b.new("NodeGroupOutput")
     inp = group_in.outputs
+    # Only the shown copy changes; the simulation keeps its own state.
+    looks = grid_times(b, inp["State"], "density", inp["Smoke Density"])
+    looks = grid_times(b, looks, "flame", inp["Flame Brightness"], store_as="glow",
+                       remove=False)
     shaded = b.new("GeometryNodeSetMaterial")
-    b.link(inp["State"], shaded.inputs["Geometry"])
+    b.link(looks, shaded.inputs["Geometry"])
     b.link(inp["Material"], shaded.inputs["Material"])
+    # The flame's surface, in the viewport only.
+    flame = b.new("GeometryNodeGetNamedGrid", data_type="FLOAT")
+    b.link(inp["State"], flame.inputs["Volume"])
+    flame.inputs["Name"].default_value = "flame"
+    flame.inputs["Remove"].default_value = False
+    outline = b.new("GeometryNodeGridToMesh")
+    b.link(flame.outputs["Grid"], outline.inputs["Grid"])
+    outline.inputs["Threshold"].default_value = 0.15
+    orange = b.new("GeometryNodeSetMaterial")
+    b.link(outline.outputs[0], orange.inputs["Geometry"])
+    b.link(inp["Flame Material"], orange.inputs["Material"])
+    smooth = b.new("GeometryNodeSetShadeSmooth")
+    b.link(orange.outputs[0], smooth.inputs["Geometry"])
+    show_flame = b.new("FunctionNodeBooleanMath", operation="AND")
+    b.link(inp["Flame In Solid View"], show_flame.inputs[0])
+    b.link(b.new("GeometryNodeIsViewport").outputs[0], show_flame.inputs[1])
+    simulated = b.new("GeometryNodeJoinGeometry")
+    b.link(switch(b, "GEOMETRY", show_flame.outputs[0], None, smooth.outputs[0]),
+           simulated.inputs[0])
+    b.link(shaded.outputs[0], simulated.inputs[0])
     to_local = b.new("GeometryNodeTransform")
     to_local.inputs["Mode"].default_value = "Matrix"
     invert = b.new("FunctionNodeInvertMatrix")
     b.link(inp["To World"], invert.inputs["Matrix"])
-    b.link(shaded.outputs[0], to_local.inputs["Geometry"])
+    b.link(simulated.outputs[0], to_local.inputs["Geometry"])
     b.link(invert.outputs["Matrix"], to_local.inputs["Transform"])
     mesh_only = b.new("GeometryNodeSeparateComponents")
     b.link(inp["Mesh"], mesh_only.inputs[0])
@@ -1765,11 +1844,12 @@ def build_display(material):
     b.link(to_local.outputs[0], join.inputs[0])
     b.link(join.outputs[0], group_out.inputs["Geometry"])
     input_item(tree, "Material").default_value = material
+    input_item(tree, "Flame Material").default_value = preview
     arrange(tree)
     return tree
 
 
-def build_simulation_modifier(blocks, material):
+def build_simulation_modifier(blocks, materials):
     tree = new_group(
         MODIFIER,
         "Simulate smoke and fire from pyro points: this object's (after a Pyro Emitter) and "
@@ -1790,7 +1870,7 @@ def build_simulation_modifier(blocks, material):
                         "Turbulence Mask", "Fine Turbulence", "Fine Scale", "Disturbance",
                         "Disturbance Scale"]),
         ("Solver", ["Sparse GPU", "CFL", "Max Substeps"]),
-        ("Display", ["Show Mesh"]),
+        ("Display", ["Show Mesh", "Smoke Density", "Flame Brightness", "Flame In Solid View"]),
     )
     extra = {
         "Voxel Size": ("NodeSocketFloat", 0.05,
@@ -1803,6 +1883,13 @@ def build_simulation_modifier(blocks, material):
         "Colliders": ("NodeSocketCollection", None,
                       "Objects the smoke flows around. They may be animated"),
         "Show Mesh": ("NodeSocketBool", True, "Keep this object's mesh visible"),
+        "Smoke Density": ("NodeSocketFloat", 1.0, "How thick the smoke looks. It changes "
+                                                  "only the look, not the simulation"),
+        "Flame Brightness": ("NodeSocketFloat", 1.0, "How bright the flame looks"),
+        "Flame In Solid View": ("NodeSocketBool", True,
+                                "Show the flame's outline in orange in Solid view, where "
+                                "volumes show only grey smoke. Flames glow in Material "
+                                "Preview and Rendered view; the outline never renders"),
     }
     copy_panels(tree, panels, preset_inputs, extra)
     input_item(tree, "Domain Size").subtype = "XYZ"
@@ -1864,8 +1951,11 @@ def build_simulation_modifier(blocks, material):
     b.link(colliders.outputs["Geometry"], sim_out.inputs["Previous Colliders"])
 
     display = block("Pyro Display", State=sim_out.outputs["Geometry"], Mesh=inp["Geometry"],
-                    To_World=self_info.outputs["Transform"], Show_Mesh=inp["Show Mesh"])
-    display.inputs["Material"].default_value = material
+                    To_World=self_info.outputs["Transform"], Show_Mesh=inp["Show Mesh"],
+                    Smoke_Density=inp["Smoke Density"], Flame_Brightness=inp["Flame Brightness"],
+                    Flame_In_Solid_View=inp["Flame In Solid View"])
+    display.inputs["Material"].default_value = materials[0]
+    display.inputs["Flame Material"].default_value = materials[1]
     b.link(display.outputs[0], group_out.inputs["Geometry"])
     input_item(tree, "Preset").default_value = "Smoke"
     arrange(tree)
@@ -1884,7 +1974,7 @@ def build_assets(mark=True):
     modifier groups."""
     layer = build_turbulence_layer()
     collider = build_collider()
-    material = build_material()
+    material = (build_material(), build_flame_preview_material())
     blocks = {
         "Turbulence Layer": layer,
         "Pyro Collider": collider,
@@ -1937,6 +2027,18 @@ def install(datafiles):
     with open(catalogs, "w", encoding="utf-8") as stream:
         stream.write("\n".join(lines) + "\n")
     print(f"Installed the pyro assets in {path}")
+
+    # The Pyro tab in the viewport's sidebar (bake, show flames) loads with Blender from the
+    # scripts/startup folder beside datafiles.
+    tools = os.path.join(os.path.dirname(os.path.abspath(__file__)), TOOLS_FILE)
+    startup = os.path.join(os.path.dirname(os.path.normpath(datafiles)), "scripts", "startup")
+    if os.path.exists(tools):
+        os.makedirs(startup, exist_ok=True)
+        shutil.copyfile(tools, os.path.join(startup, TOOLS_FILE))
+        print(f"Installed the Pyro sidebar tab in {startup}")
+    else:
+        print(f"{TOOLS_FILE} is not next to smoke_assets.py; the Pyro sidebar tab is not "
+              "installed")
 
 
 def main():

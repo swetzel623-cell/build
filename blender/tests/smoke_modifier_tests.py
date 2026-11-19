@@ -16,7 +16,9 @@ import traceback
 import bpy
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets"))
+ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets")
+sys.path.insert(0, ASSETS)
+import pyro_tools  # noqa: E402
 import smoke_assets  # noqa: E402
 
 
@@ -166,7 +168,7 @@ def test_modifier_emits_and_rises():
     print(f"  smoke top: frame 4 {early.top:.3f}, frame 20 {late.top:.3f}; "
           f"{late.warnings}")
     check(not [w for w in late.warnings if w[0] == "ERROR"], f"errors: {late.warnings}")
-    check(late.grids == ["density", "pressure", "temperature", "velocity"],
+    check(late.grids == ["density", "glow", "pressure", "temperature", "velocity"],
           f"unexpected grids: {late.grids}")
     check(late.top > early.top + 0.2, "the smoke did not rise above the emitter")
 
@@ -221,6 +223,8 @@ def test_assets_install():
         lines = stream.read().splitlines()
     for uuid, _path in (smoke_assets.CATALOG_PYRO, smoke_assets.CATALOG_PHYSICS):
         check(sum(line.startswith(uuid) for line in lines) == 1, f"catalog {uuid} not once")
+    check(os.path.exists(os.path.join(os.path.dirname(folder), "scripts", "startup",
+                                      smoke_assets.TOOLS_FILE)), "the Pyro tab is not installed")
     path = os.path.join(folder, "assets", "nodes", smoke_assets.ASSET_FILE)
     with bpy.data.libraries.load(path, assets_only=True) as (data_from, _data_to):
         names = sorted(data_from.node_groups)
@@ -258,7 +262,7 @@ def test_settings_changed_mid_simulation():
     set_input(modifier, "Domain Size", (1.0, 1.0, 1.0))
     smaller = Smoke(emitter, 13)
     check(not [w for w in smaller.warnings if w[0] == "ERROR"], f"{smaller.warnings}")
-    check(smaller.grids == ["density", "pressure", "temperature", "velocity"],
+    check(smaller.grids == ["density", "glow", "pressure", "temperature", "velocity"],
           f"unexpected grids after shrinking the domain: {smaller.grids}")
 
 
@@ -497,6 +501,84 @@ def test_turbulence_layers_chain_in_order():
     check(masks == [0, 4, 3], "the masks were not stored")
 
 
+def test_viewport_shows_flame():
+    """Fire shows in the viewport: a 'glow' grid for the material, an orange flame outline for
+    Solid view (viewport only), and Smoke Density changes only the look, not the simulation."""
+    reset()
+    emitter, modifier = smoke_emitter(emitter={"Preset": "Campfire"}, Preset="Fire",
+                                      **{"Voxel Size": 0.05})
+    smoke = run_until(emitter, 10)
+
+    def outline_faces(frame):
+        """Faces with the flame preview material, without the test's probe."""
+        emitter.modifiers["Probe"].show_viewport = False
+        geometry = Smoke(emitter, frame).geometry
+        emitter.modifiers["Probe"].show_viewport = True
+        mesh = geometry.mesh
+        if mesh is None:
+            return 0, []
+        names = [m.name if m else None for m in mesh.materials]
+        preview = {i for i, name in enumerate(names) if name == "Pyro Flame Preview"}
+        return sum(poly.material_index in preview for poly in mesh.polygons), geometry
+
+    faces, geometry = outline_faces(10)
+    print(f"  grids {smoke.grids}; flame outline {faces} faces")
+    check("glow" in smoke.grids and "flame" in smoke.grids, "no flame or glow grid")
+    check(faces > 0, "no flame outline for Solid view")
+    material = geometry.volume.materials[0]
+    check(material and material.name == "Pyro Simulation", "the volume has no fire material")
+    set_input(modifier, "Flame In Solid View", False)
+    check(outline_faces(11)[0] == 0, "the flame outline shows with Flame In Solid View off")
+    bare = Smoke(emitter, 11)
+    # Smoke Density 0 hides the smoke, and the simulation carries on underneath.
+    set_input(modifier, "Smoke Density", 0.0)
+    hidden = Smoke(emitter, 12)
+    set_input(modifier, "Smoke Density", 1.0)
+    shown = Smoke(emitter, 13)
+    print(f"  smoke top: {bare.top:.2f} at frame 11, hidden at 12 ({hidden.top}), "
+          f"{shown.top:.2f} at 13")
+    check(math.isnan(hidden.top), "Smoke Density 0 does not hide the smoke")
+    check(shown.top >= bare.top - 0.05, "hiding the smoke changed the simulation")
+
+
+def test_bake_from_the_pyro_tab():
+    """The sidebar's Bake bakes the selected Pyro simulations into a pyro_bake folder next to
+    the saved file, playback then reads the bake (new settings change nothing), and Delete
+    Bake brings the live simulation back."""
+    reset()
+    try:
+        pyro_tools.register()
+    except ValueError:
+        pass  # Already registered by an earlier run in this Blender.
+    emitter, modifier = smoke_emitter(**{"Voxel Size": 0.0625})
+    scene = bpy.context.scene
+    scene.frame_start, scene.frame_end = 1, 8
+    folder = os.path.join(bpy.app.tempdir, "pyro_bake_test")
+    os.makedirs(folder, exist_ok=True)
+    bpy.ops.wm.save_as_mainfile(filepath=os.path.join(folder, "bake.blend"))
+    emitter = bpy.data.objects[emitter.name]
+    modifier = emitter.modifiers["Pyro"]
+    live = run_until(emitter, 8)
+    bpy.ops.object.select_all(action="DESELECT")
+    emitter.select_set(True)
+    bpy.context.view_layer.objects.active = emitter
+    result = bpy.ops.pyro.bake()
+    baked_files = [name for _root, _dirs, files in os.walk(os.path.join(folder, "pyro_bake"))
+                   for name in files]
+    baked = Smoke(emitter, 8)
+    set_input(modifier, "Voxel Size", 0.1)
+    still = Smoke(emitter, 8)
+    print(f"  bake {result}: {len(baked_files)} files; smoke top live {live.top:.3f}, baked "
+          f"{baked.top:.3f}, baked after a new voxel size {still.top:.3f}")
+    check(result == {"FINISHED"} and baked_files, "nothing was baked")
+    check(abs(baked.top - live.top) < 1e-4, "the bake does not match the simulation")
+    check(abs(still.top - baked.top) < 1e-4, "playback does not read the bake")
+    check(bpy.ops.pyro.delete_bake() == {"FINISHED"}, "Delete Bake failed")
+    again = run_until(emitter, 8)
+    print(f"  after Delete Bake, with the new voxel size: smoke top {again.top:.3f}")
+    check(abs(again.top - baked.top) > 1e-4, "Delete Bake did not bring the simulation back")
+
+
 TESTS = [
     test_assets_install,
     test_modifier_emits_and_rises,
@@ -507,6 +589,8 @@ TESTS = [
     test_explosion_spreads,
     test_burst_is_spiky,
     test_trails_fly_and_fall,
+    test_viewport_shows_flame,
+    test_bake_from_the_pyro_tab,
     test_emitter_motion_gives_velocity,
     test_initial_velocity_from_motion,
     test_emitters_collection_and_plain_smoke,

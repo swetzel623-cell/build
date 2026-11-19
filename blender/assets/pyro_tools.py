@@ -3,17 +3,26 @@
 objects to disk once they look right, delete the bake to change them again, and switch the view
 to one that shows the flames.
 
+It also makes the Pyro modifiers' Preset menus load values: choosing a preset copies its values
+into the modifier's own inputs, so every preset shows the same panel with that preset's
+numbers, and any of them can be changed afterwards. Custom leaves them as they are.
+
 smoke_assets.py installs this file into Blender's scripts/startup folder, so it loads with
 Blender; no add-on needs enabling.
 """
 
 from __future__ import annotations
 
+import json
+
 import bpy
+from bpy.app.handlers import persistent
 
 SIMULATION = "Pyro Simulation"
 EMITTER = "Pyro Emitter"
 BAKE_FOLDER = "//pyro_bake"
+PRESET_TABLE = "pyro_presets"  # On a modifier's node group: its presets, as JSON.
+APPLIED = "pyro_preset_applied"  # On an object: the preset last loaded into each modifier.
 
 
 def pyro_modifiers(obj):
@@ -30,6 +39,52 @@ def simulations(objects):
 
 def bake_folder(obj, modifier):
     return f"{BAKE_FOLDER}/{bpy.path.clean_name(obj.name)}_{bpy.path.clean_name(modifier.name)}"
+
+
+def preset_table(group):
+    raw = group.get(PRESET_TABLE) if group is not None else None
+    return json.loads(raw) if raw else None
+
+
+def modifier_input(modifier, name):
+    for item in modifier.node_group.interface.items_tree:
+        if getattr(item, "in_out", None) == "INPUT" and item.name == name:
+            return getattr(modifier.properties.inputs, item.identifier, None)
+    return None
+
+
+def load_preset(obj, modifier, force=False):
+    """Copy the chosen preset's values into the modifier's inputs, if it changed since the last
+    time (or `force`). Returns True when it loaded values."""
+    table = preset_table(modifier.node_group)
+    menu = modifier_input(modifier, "Preset") if table is not None else None
+    if menu is None:
+        return False
+    chosen = menu.value
+    key = str(modifier.persistent_uid)
+    applied = obj.get(APPLIED)
+    applied = applied.to_dict() if applied is not None else {}
+    if applied.get(key) == chosen and not force:
+        return False
+    applied[key] = chosen
+    obj[APPLIED] = applied
+    if chosen not in table:  # Custom: keep the values.
+        return False
+    for name, value in table[chosen].items():
+        target = modifier_input(modifier, name)
+        if target is not None:
+            target.value = value
+    return True
+
+
+@persistent
+def load_changed_presets(scene, depsgraph):
+    for update in depsgraph.updates:
+        obj = update.id.original if isinstance(update.id, bpy.types.Object) else None
+        if obj is None:
+            continue
+        for modifier in pyro_modifiers(obj):
+            load_preset(obj, modifier)
 
 
 class PYRO_OT_bake(bpy.types.Operator):
@@ -144,12 +199,23 @@ CLASSES = (PYRO_OT_bake, PYRO_OT_delete_bake, PYRO_OT_show_flames, VIEW3D_PT_pyr
 
 def register():
     for cls in CLASSES:
+        # A copy loaded earlier (from scripts/startup, or by a test) gives way to this one.
+        existing = cls.__mro__[1].bl_rna_get_subclass_py(cls.__name__)
+        if existing is not None:
+            bpy.utils.unregister_class(existing)
         bpy.utils.register_class(cls)
+    handlers = bpy.app.handlers.depsgraph_update_post
+    for old in [h for h in handlers if getattr(h, "__name__", "") == "load_changed_presets"]:
+        handlers.remove(old)
+    handlers.append(load_changed_presets)
 
 
 def unregister():
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
+    handlers = bpy.app.handlers.depsgraph_update_post
+    for old in [h for h in handlers if getattr(h, "__name__", "") == "load_changed_presets"]:
+        handlers.remove(old)
 
 
 if __name__ == "__main__":

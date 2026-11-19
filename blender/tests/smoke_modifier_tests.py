@@ -8,6 +8,7 @@ Exits non-zero if any test fails.
 
 from __future__ import annotations
 
+import importlib.util
 import math
 import os
 import sys
@@ -18,8 +19,15 @@ import numpy as np
 
 ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets")
 sys.path.insert(0, ASSETS)
-import pyro_tools  # noqa: E402
 import smoke_assets  # noqa: E402
+
+# This tree's pyro_tools.py, not a copy Blender loaded from scripts/startup.
+_spec = importlib.util.spec_from_file_location("pyro_tools", os.path.join(ASSETS,
+                                                                          "pyro_tools.py"))
+pyro_tools = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(pyro_tools)
+sys.modules["pyro_tools"] = pyro_tools
+pyro_tools.register()
 
 
 def check(condition, message):
@@ -47,6 +55,8 @@ def add_cube(name, location, size):
 def set_input(modifier, name, value):
     item = smoke_assets.input_item(modifier.node_group, name)
     getattr(modifier.properties.inputs, item.identifier).value = value
+    if name == "Preset":  # Load its values now, as the Pyro tab's handler does on an update.
+        pyro_tools.load_preset(modifier.id_data, modifier, force=True)
 
 
 def probe_group(grid="density", threshold=0.02):
@@ -168,7 +178,7 @@ def test_modifier_emits_and_rises():
     print(f"  smoke top: frame 4 {early.top:.3f}, frame 20 {late.top:.3f}; "
           f"{late.warnings}")
     check(not [w for w in late.warnings if w[0] == "ERROR"], f"errors: {late.warnings}")
-    check(late.grids == ["density", "glow", "pressure", "temperature", "velocity"],
+    check(late.grids == ["density", "pressure", "temperature", "velocity"],
           f"unexpected grids: {late.grids}")
     check(late.top > early.top + 0.2, "the smoke did not rise above the emitter")
 
@@ -262,7 +272,7 @@ def test_settings_changed_mid_simulation():
     set_input(modifier, "Domain Size", (1.0, 1.0, 1.0))
     smaller = Smoke(emitter, 13)
     check(not [w for w in smaller.warnings if w[0] == "ERROR"], f"{smaller.warnings}")
-    check(smaller.grids == ["density", "glow", "pressure", "temperature", "velocity"],
+    check(smaller.grids == ["density", "pressure", "temperature", "velocity"],
           f"unexpected grids after shrinking the domain: {smaller.grids}")
 
 
@@ -464,6 +474,7 @@ def test_emitters_collection_and_plain_smoke():
     plain = add_cube("Plain", (0.0, 0.0, 0.3), 0.3)
     modifier = plain.modifiers.new("Pyro", "NODES")
     modifier.node_group = simulation_group
+    set_input(modifier, "Preset", "Smoke")  # What adding it in Blender shows.
     set_input(modifier, "Voxel Size", 0.0625)
     plain.modifiers.new("Probe", "NODES").node_group = probe_group()
     early, late = run_until(plain, 3), run_until(plain, 15)
@@ -502,42 +513,47 @@ def test_turbulence_layers_chain_in_order():
 
 
 def test_viewport_shows_flame():
-    """Fire shows in the viewport: a 'glow' grid for the material, an orange flame outline for
-    Solid view (viewport only), and Smoke Density changes only the look, not the simulation."""
+    """Fire shows in the viewport: a 'glow' grid for the material, density as the first grid
+    (all Solid view draws), the flame as a second, orange volume for Solid view (viewport
+    only), and Smoke Density and Viewport Density change only the look."""
     reset()
     emitter, modifier = smoke_emitter(emitter={"Preset": "Campfire"}, Preset="Fire",
                                       **{"Voxel Size": 0.05})
     smoke = run_until(emitter, 10)
 
-    def outline_faces(frame):
-        """Faces with the flame preview material, without the test's probe."""
+    def solid_flame(frame):
+        """The grids of the orange flame volumes, without the test's probe, and the first
+        grid of the shaded volume."""
         emitter.modifiers["Probe"].show_viewport = False
         geometry = Smoke(emitter, frame).geometry
         emitter.modifiers["Probe"].show_viewport = True
-        mesh = geometry.mesh
-        if mesh is None:
-            return 0, []
-        names = [m.name if m else None for m in mesh.materials]
-        preview = {i for i, name in enumerate(names) if name == "Pyro Flame Preview"}
-        return sum(poly.material_index in preview for poly in mesh.polygons), geometry
+        flames = [[g.name for g in ref.volume.grids] for ref in geometry.instance_references()
+                  if ref.volume is not None and ref.volume.materials
+                  and ref.volume.materials[0].name == "Pyro Flame Preview"]
+        return flames, geometry.volume.grids[0].name, geometry.volume.materials[0].name
 
-    faces, geometry = outline_faces(10)
-    print(f"  grids {smoke.grids}; flame outline {faces} faces")
+    flames, first, material = solid_flame(10)
+    print(f"  grids {smoke.grids}; first grid {first}, material {material}; Solid view flame "
+          f"volumes {flames}")
     check("glow" in smoke.grids and "flame" in smoke.grids, "no flame or glow grid")
-    check(faces > 0, "no flame outline for Solid view")
-    material = geometry.volume.materials[0]
-    check(material and material.name == "Pyro Simulation", "the volume has no fire material")
+    check(first == "density", "Solid view would not draw the smoke")
+    check(material == "Pyro Simulation", "the volume has no fire material")
+    check(flames == [["flame"]], "no orange flame volume for Solid view")
     set_input(modifier, "Flame In Solid View", False)
-    check(outline_faces(11)[0] == 0, "the flame outline shows with Flame In Solid View off")
+    check(solid_flame(11)[0] == [], "the Solid view flame shows with Flame In Solid View off")
     bare = Smoke(emitter, 11)
-    # Smoke Density 0 hides the smoke, and the simulation carries on underneath.
+    # Smoke Density or Viewport Density 0 hides the smoke; the simulation carries on.
     set_input(modifier, "Smoke Density", 0.0)
     hidden = Smoke(emitter, 12)
     set_input(modifier, "Smoke Density", 1.0)
-    shown = Smoke(emitter, 13)
-    print(f"  smoke top: {bare.top:.2f} at frame 11, hidden at 12 ({hidden.top}), "
-          f"{shown.top:.2f} at 13")
+    set_input(modifier, "Viewport Density", 0.0)
+    hidden_in_viewport = Smoke(emitter, 13)
+    set_input(modifier, "Viewport Density", 1.0)
+    shown = Smoke(emitter, 14)
+    print(f"  smoke top: {bare.top:.2f} at frame 11, hidden at 12 and 13 ({hidden.top}, "
+          f"{hidden_in_viewport.top}), {shown.top:.2f} at 14")
     check(math.isnan(hidden.top), "Smoke Density 0 does not hide the smoke")
+    check(math.isnan(hidden_in_viewport.top), "Viewport Density 0 does not hide the smoke")
     check(shown.top >= bare.top - 0.05, "hiding the smoke changed the simulation")
 
 
@@ -546,10 +562,6 @@ def test_bake_from_the_pyro_tab():
     the saved file, playback then reads the bake (new settings change nothing), and Delete
     Bake brings the live simulation back."""
     reset()
-    try:
-        pyro_tools.register()
-    except ValueError:
-        pass  # Already registered by an earlier run in this Blender.
     emitter, modifier = smoke_emitter(**{"Voxel Size": 0.0625})
     scene = bpy.context.scene
     scene.frame_start, scene.frame_end = 1, 8
@@ -579,6 +591,59 @@ def test_bake_from_the_pyro_tab():
     check(abs(again.top - baked.top) > 1e-4, "Delete Bake did not bring the simulation back")
 
 
+def test_presets_fill_the_panel():
+    """Choosing a preset copies its values into the modifier's own inputs (on the next update,
+    through the Pyro tab's handler); edited values then count, Custom keeps them, and the
+    simulation uses what the panel shows."""
+    reset()
+    obj = add_cube("Emitter", (0.0, 0.0, 0.3), 0.3)
+    emitter_group, simulation_group = smoke_assets.build_assets(mark=False)
+    emitting = obj.modifiers.new("Pyro Emitter", "NODES")
+    emitting.node_group = emitter_group
+    bpy.context.view_layer.update()
+
+    def value(modifier, name):
+        return pyro_tools.modifier_input(modifier, name).value
+
+    explosion = smoke_assets.EMITTER_PRESETS["Explosion"]
+    print(f"  new Pyro Emitter: preset {value(emitting, 'Preset')}, Spikes "
+          f"{value(emitting, 'Spikes')}, Long Spikes {value(emitting, 'Long Spikes'):.2f}")
+    check(value(emitting, "Spikes") == explosion["Spikes"], "a new emitter shows no preset")
+    pyro_tools.modifier_input(emitting, "Preset").value = "Debris Trails"
+    bpy.context.view_layer.update()
+    debris = smoke_assets.EMITTER_PRESETS["Debris Trails"]
+    print(f"  Debris Trails: Emit Type {value(emitting, 'Emit Type')}, Trails "
+          f"{value(emitting, 'Trails')}, Trail Speed {value(emitting, 'Trail Speed'):.1f}")
+    check(value(emitting, "Emit Type") == "Trails" and value(emitting, "Trails") ==
+          debris["Trails"], "choosing a preset did not fill in its values")
+    pyro_tools.modifier_input(emitting, "Trails").value = 3
+    bpy.context.view_layer.update()
+    check(value(emitting, "Trails") == 3, "an edited value was put back")
+    trails = smoke_assets.input_item(emitter_group, "Trails").identifier
+    for modifier in obj.modifiers[1:]:
+        modifier.show_viewport = False
+    points = emitted_points(obj, 6)
+    print(f"  with Trails edited to 3: {len(points['position'])} points at frame 6")
+    check(0 < len(points["position"]) < debris["Trails"] * 60, "the edit was not used")
+    pyro_tools.modifier_input(emitting, "Preset").value = "Custom"
+    bpy.context.view_layer.update()
+    check(getattr(emitting.properties.inputs, trails).value == 3, "Custom changed the values")
+
+    simulating = obj.modifiers.new("Pyro", "NODES")
+    simulating.node_group = simulation_group
+    bpy.context.view_layer.update()
+    smoke = smoke_assets.SOLVER_PRESETS["Smoke"]
+    check(value(simulating, "Turbulence") == smoke["Turbulence"],
+          "a new Pyro Simulation shows no preset")
+    pyro_tools.modifier_input(simulating, "Preset").value = "Explosion"
+    bpy.context.view_layer.update()
+    print(f"  Pyro Simulation, Explosion: Gas Release {value(simulating, 'Gas Release'):.1f}, "
+          f"Disturbance {value(simulating, 'Disturbance'):.1f}")
+    check(abs(value(simulating, "Gas Release") -
+              smoke_assets.SOLVER_PRESETS["Explosion"]["Gas Release"]) < 1e-6,
+          "the simulation preset did not fill in its values")
+
+
 TESTS = [
     test_assets_install,
     test_modifier_emits_and_rises,
@@ -591,6 +656,7 @@ TESTS = [
     test_trails_fly_and_fall,
     test_viewport_shows_flame,
     test_bake_from_the_pyro_tab,
+    test_presets_fill_the_panel,
     test_emitter_motion_gives_velocity,
     test_initial_velocity_from_motion,
     test_emitters_collection_and_plain_smoke,

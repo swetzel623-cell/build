@@ -20,12 +20,15 @@ import bpy
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets"))
+import pyro_tools  # noqa: E402
 import smoke_assets  # noqa: E402
 
 
 def set_input(modifier, name, value):
     item = smoke_assets.input_item(modifier.node_group, name)
     getattr(modifier.properties.inputs, item.identifier).value = value
+    if name == "Preset":  # Fill in the preset's values, as the Pyro tab does in Blender.
+        pyro_tools.load_preset(modifier.id_data, modifier, force=True)
 
 
 def pyro(name, location, groups, emitter, look, **simulation):

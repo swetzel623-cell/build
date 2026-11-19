@@ -955,10 +955,24 @@ and Workbench, which is how the viewport draws Material Preview and Solid view:
   20. `Smoke Density` and `Flame Brightness` scale a copy of the grids after the simulation
   zone, so the state the next step reads is untouched (test: Smoke Density 0 hides the smoke,
   and at 1 the smoke is back where it would have been).
-- Solid view draws a volume's density in grey and nothing else. `Flame In Solid View` adds the
-  flame grid's surface (0.15) as a mesh, only when Is Viewport is true, with a material whose
-  viewport colour is orange and whose surface is transparent, so it neither renders nor shows
-  in Material Preview.
+- Solid view draws only a volume's *first* grid (`BKE_volume_grid_active_get_for_read`, index
+  0), tinted by its material's viewport colour. A first try drew the flame grid's surface as an
+  orange mesh, which looked like solid blobs; and storing the scaled density had moved it to
+  the end, so Solid view was drawing temperature. Store Named Grid appends (replacing a grid
+  moves it last, and storing a missing one adds an empty grid), so the display now builds a new
+  volume: the shown density first, then temperature, velocity, pressure, fuel and flame only
+  where the state has them (a repeat zone over Get Grid Names), then `glow`. The flame for
+  Solid view is a second volume, an instance holding only the flame grid with a material whose
+  viewport colour is orange and which has no volume shader; Workbench draws it as a soft
+  orange cloud, EEVEE and Cycles draw nothing of it.
+- `Viewport Density` multiplies the shown density where Is Viewport is true.
+- Presets: the modifiers' Preset menus no longer pick values inside the node tree, which hid
+  the numbers and ignored edits made with a preset chosen. The menu drives an unused Menu
+  Switch (for its items); the preset table is stored on the group as JSON, and `pyro_tools.py`
+  copies the chosen preset into the modifier's inputs on the next depsgraph update, remembering
+  per modifier (by `persistent_uid`, on the object) which preset it last loaded so later edits
+  stay. Test: a new emitter shows Explosion's 110 spikes; Debris Trails fills Emit Type Trails
+  and 24 trails; Trails edited to 3 stays 3 and gives 60 points; Custom keeps it.
 - Baking: the sidebar's Pyro tab sets each Pyro modifier of the selected objects to bake to
   `//pyro_bake/<object>_<modifier>` and runs Blender's own simulation bake over the scene
   range. Test: 33 files for 8 frames; the baked frame equals the live one; a new voxel size
@@ -967,7 +981,8 @@ and Workbench, which is how the viewport draws Material Preview and Solid view:
 ![Explosion Trails in EEVEE, and the flame outline in Solid view](images/viewport_flames.png)
 
   Above, EEVEE (as in Material Preview) at frames 5, 12, 24 and 40 of Explosion Trails. Below,
-  Workbench (Solid view) of the Explosion at frames 6 and 14: grey smoke, orange flame.
+  Workbench (Solid view) of the Explosion at frames 6 and 14 with the flame as an orange
+  volume in the grey smoke.
 
 ## Not verified, and known gaps
 

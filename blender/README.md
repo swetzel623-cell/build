@@ -100,20 +100,27 @@ Explosion, Large Plume, or Custom.
 - **Domain**: voxel size, domain size, Emitters and Colliders collections. The domain is centred
   on the emitters on the first frame, its floor a tenth of its height below them.
 
-- **Display**: `Smoke Density` and `Flame Brightness` change only the look. Flames glow in
-  Material Preview and Rendered view: the material colours the `flame` grid from dark red
-  through orange to yellow, with a `glow` grid (flame × Flame Brightness) for its strength.
-  Solid view draws volumes as grey smoke only, so `Flame In Solid View` adds the flame's
-  surface in orange there (from a viewport-only mesh with a material that never renders).
+- **Display**: `Smoke Density` (viewport and renders), `Viewport Density` (multiplies it in
+  the viewport only) and `Flame Brightness` change only the look. Flames glow in Material
+  Preview and Rendered view: the material colours the `flame` grid from dark red through
+  orange to yellow, with a `glow` grid (flame × Flame Brightness) for its strength. Solid view
+  draws only a volume's first grid, in its material's viewport colour, so the display keeps
+  the shown density first, and `Flame In Solid View` adds the flame as a second, orange volume
+  there (viewport only, and with no volume shader, so it never renders).
+
+**Presets fill in the panel.** Choosing a Preset on either modifier copies that preset's values
+into the modifier's own settings, so every preset shows the same panels with its numbers, and
+anything changed afterwards is used. Custom leaves the values as they are. The presets are
+stored on the modifier's node group; `pyro_tools.py` loads them when the menu changes.
 
 **Viewing and baking: the Pyro tab.** The 3D viewport's sidebar (N) has a **Pyro** tab, which
-`smoke_assets.py` installs into `scripts/startup`. **Show Flames** switches the view to Material
-Preview with sharper volumes and shadowed smoke. Once a simulation looks right, select its
-object, save the file and press **Bake Pyro**: every Pyro simulation zone of the selected
-objects is baked over the scene's frame range into a `pyro_bake` folder next to the file (a
-job with a progress bar; Esc stops it), and playback and renders read the bake. **Delete
-Bake** lets the simulation run again with new settings. The modifier's own Manage > Bake
-panel does the same per modifier.
+`smoke_assets.py` installs into `scripts/startup` (it also loads the presets). **Show Flames**
+switches the view to Material Preview with sharper volumes and shadowed smoke. Once a simulation
+looks right, select its object, save the file and press **Bake Pyro**: every Pyro simulation
+zone of the selected objects is baked over the scene's frame range into a `pyro_bake` folder
+next to the file (a job with a progress bar; Esc stops it), and playback and renders read the
+bake. **Delete Bake** lets the simulation run again with new settings. The modifier's own Manage
+> Bake panel does the same per modifier.
 
 Inside, each modifier is one row of blocks passing one Settings bundle; every block is in the node
 editor's **Add > Pyro** menu: Pyro Emitter Preset, Pyro Burst, Pyro Fill, Pyro Particles,

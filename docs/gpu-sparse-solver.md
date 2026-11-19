@@ -946,6 +946,29 @@ thrown up and out that arc down under gravity):
 
 ![Burst and trail gas](images/burst_trail_gas.png)
 
+**Flames in the viewport, and baking.** This headless build renders with EEVEE (offscreen EGL)
+and Workbench, which is how the viewport draws Material Preview and Solid view:
+
+- At first only a faint flame showed and no smoke: explosion densities are about 0.1 to 0.5
+  and the material's density was 5. It is now 12 (the shaded side views above used about the
+  same), and the flame's brightness comes from a `glow` grid, flame × Flame Brightness, times
+  20. `Smoke Density` and `Flame Brightness` scale a copy of the grids after the simulation
+  zone, so the state the next step reads is untouched (test: Smoke Density 0 hides the smoke,
+  and at 1 the smoke is back where it would have been).
+- Solid view draws a volume's density in grey and nothing else. `Flame In Solid View` adds the
+  flame grid's surface (0.15) as a mesh, only when Is Viewport is true, with a material whose
+  viewport colour is orange and whose surface is transparent, so it neither renders nor shows
+  in Material Preview.
+- Baking: the sidebar's Pyro tab sets each Pyro modifier of the selected objects to bake to
+  `//pyro_bake/<object>_<modifier>` and runs Blender's own simulation bake over the scene
+  range. Test: 33 files for 8 frames; the baked frame equals the live one; a new voxel size
+  changes nothing while baked; after Delete Bake the simulation runs again with it.
+
+![Explosion Trails in EEVEE, and the flame outline in Solid view](images/viewport_flames.png)
+
+  Above, EEVEE (as in Material Preview) at frames 5, 12, 24 and 40 of Explosion Trails. Below,
+  Workbench (Solid view) of the Explosion at frames 6 and 14: grey smoke, orange flame.
+
 ## Not verified, and known gaps
 
 - **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.

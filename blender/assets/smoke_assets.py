@@ -78,6 +78,8 @@ class Builder:
             self.set(node.inputs[1], b)
         if scale is not None:
             self.set(node.inputs["Scale"], scale)
+        if operation in ("DOT_PRODUCT", "LENGTH", "DISTANCE"):
+            return node.outputs["Value"]
         return node.outputs[0]
 
 
@@ -359,7 +361,8 @@ def tag_pyro_points(b, points, density, temperature, fuel, expansion, velocity):
 
 # (name, kind, custom default, description, minimum)
 EMITTER_ITEMS = (
-    ("Emit Type", "INT", 0, "0 burst, 1 the mesh's volume, 2 its surface, 3 particles", None),
+    ("Emit Type", "INT", 0, "0 burst, 1 the mesh's volume, 2 its surface, 3 particles, 4 "
+                            "trails only", None),
     ("Density", "FLOAT", 1.0, "Smoke emitted", 0.0),
     ("Temperature", "FLOAT", 1.0, "Heat emitted; with heat buoyancy it makes the smoke rise",
      None),
@@ -376,15 +379,27 @@ EMITTER_ITEMS = (
                                         "to", 1.0),
     ("Expansion Curve", "FLOAT", 3.0, "Burst: above 1 grows fast at first and then slows, as "
                                       "a blast does", 0.1),
-    ("Spikes", "INT", 40, "Burst: number of spikes (Houdini's trailings)", 1),
-    ("Roundness", "FLOAT", 0.4, "Burst: 1 gives spikes of equal length, lower gives ragged, "
-                                "random ones", 0.0),
-    ("Spike Length", "FLOAT", 0.7, "Burst: how far each spike reaches in from its tip; 1 runs "
+    ("Spikes", "INT", 60, "Burst: number of spikes (Houdini's trailings)", 1),
+    ("Roundness", "FLOAT", 0.3, "Burst: length of the shortest spikes relative to the longest; "
+                                "1 gives a ball, 0 ragged, random spikes", 0.0),
+    ("Long Spikes", "FLOAT", 2.0, "Burst: above 1 makes most spikes short with a few long "
+                                  "ones; below 1 most are long", 0.05),
+    ("Spike Length", "FLOAT", 0.8, "Burst: how far each spike reaches in from its tip; 1 runs "
                                    "to the centre", 0.0),
-    ("Thickness", "FLOAT", 0.3, "Burst: puff radius at the tips, relative to the burst's "
-                                "radius", 0.01),
-    ("Core Strength", "FLOAT", 1.5, "Burst: emission at the inner end of a spike relative to "
-                                    "its tip", 0.0),
+    ("Thickness", "FLOAT", 0.15, "Burst: a spike's radius at its base, relative to the burst's "
+                                 "radius", 0.01),
+    ("Tip Thickness", "FLOAT", 0.2, "Burst: a spike's radius at its tip relative to its base; "
+                                    "low gives sharp spikes", 0.0),
+    ("Thickness Variation", "FLOAT", 0.5, "Burst: how much thicker or thinner each spike is at "
+                                          "random", 0.0),
+    ("Spike Bend", "FLOAT", 0.1, "Burst: how far the spikes curve sideways towards their tips",
+     0.0),
+    ("Spike Fill", "FLOAT", 2.0, "Burst: points per point spacing along a spike; more fills "
+                                 "the spikes more evenly", 0.1),
+    ("Core Size", "FLOAT", 0.25, "Burst: radius of a solid ball at the centre relative to the "
+                                 "burst's radius; 0 has none", 0.0),
+    ("Core Strength", "FLOAT", 1.5, "Burst: emission of the core and the base of the spikes "
+                                    "relative to the tips", 0.0),
     ("Shape Noise", "FLOAT", 0.4, "Burst: lumpiness of the outline", 0.0),
     ("Direction", "VECTOR", (0.0, 0.0, 1.0), "Burst: the axis it blows along", None),
     ("Spread", "FLOAT", 180.0, "Burst: half-angle around the direction, in degrees: 180 is "
@@ -402,6 +417,27 @@ EMITTER_ITEMS = (
     ("Source", "FLOAT", 1.0, "Share of the emitter's own motion given to the gas", None),
     ("Normal", "FLOAT", 0.0, "Volume and surface: speed along the mesh's normals", None),
     ("Velocity", "VECTOR", (0.0, 0.0, 0.0), "Velocity added everywhere it emits", None),
+    ("Trails", "INT", 0, "Trails: number thrown out, with any emit type; 0 has none", 0),
+    ("Trail Speed", "FLOAT", 6.0, "Trails: launch speed, world units per second", 0.0),
+    ("Speed Variation", "FLOAT", 0.5, "Trails: how much slower some are at random; 1 ranges "
+                                      "down to standing still", 0.0),
+    ("Trail Spread", "FLOAT", 60.0, "Trails: half-angle around Direction they fly in, in "
+                                    "degrees", 0.0),
+    ("Trail Gravity", "FLOAT", 1.0, "Trails: share of gravity pulling them down", None),
+    ("Trail Drag", "FLOAT", 0.8, "Trails: how fast they slow down, per second", 0.0),
+    ("Trail Life", "FLOAT", 20.0, "Trails: frames each flies and emits for", 0.1),
+    ("Life Variation", "FLOAT", 0.5, "Trails: how much shorter some lives are at random", 0.0),
+    ("Launch Window", "FLOAT", 2.0, "Trails: frames after Start Frame over which they are "
+                                    "launched", 0.0),
+    ("Trail Length", "FLOAT", 3.0, "Trails: frames of path behind each head that emit; long "
+                                   "enough leaves no gaps", 0.01),
+    ("Trail Size", "FLOAT", 0.08, "Trails: puff radius at the head; it tapers along the trail",
+     0.001),
+    ("Trail Strength", "FLOAT", 1.0, "Trails: emission relative to the amounts above", 0.0),
+    ("Trail Fade", "FLOAT", 1.0, "Trails: how they die down over their lives: 0 stays full, "
+                                 "higher fades sooner", 0.0),
+    ("Trail Wobble", "FLOAT", 0.15, "Trails: smooth random sideways drift", 0.0),
+    ("Trail Push", "FLOAT", 0.5, "Trails: share of their velocity given to the gas", 0.0),
     ("Rate", "FLOAT", 200.0, "Particles: new particles per second", 0.0),
     ("Particle Burst", "INT", 0, "Particles: particles created on the first frame", 0),
     ("Particle Speed", "FLOAT", 1.0, "Particles: speed along the emitter's normals", None),
@@ -420,37 +456,71 @@ EMITTER_PRESETS = {
     "Explosion": {"Emit Type": 0, "Density": 0.3, "Temperature": 2.5, "Fuel": 2.0,
                   "Expansion": 6.0, "Start Frame": 1.0, "Duration": 6.0, "Fade": 1.5,
                   "Size": 0.15, "Outward Expansion": 6.0, "Expansion Curve": 3.0,
-                  "Spikes": 90, "Roundness": 0.15, "Spike Length": 0.6, "Thickness": 0.11,
-                  "Core Strength": 1.4, "Shape Noise": 0.7, "Direction": (0.0, 0.0, 1.0),
+                  "Spikes": 110, "Roundness": 0.2, "Long Spikes": 2.0, "Spike Length": 0.85,
+                  "Thickness": 0.18, "Tip Thickness": 0.1, "Thickness Variation": 0.5,
+                  "Spike Bend": 0.15, "Spike Fill": 3.0, "Core Size": 0.25,
+                  "Core Strength": 1.4, "Shape Noise": 0.3, "Direction": (0.0, 0.0, 1.0),
                   "Spread": 180.0, "Bursts": 3, "Burst Delay": 2.0, "Burst Scatter": 0.2,
                   "Outward Speed": 1.0, "Speed Noise": 1.5, "Initial Velocity": True,
                   "Source": 1.0, "Velocity": (0.0, 0.0, 1.0)},
+    "Explosion Trails": {"Emit Type": 0, "Density": 0.3, "Temperature": 2.5, "Fuel": 2.0,
+                         "Expansion": 6.0, "Start Frame": 1.0, "Duration": 6.0, "Fade": 1.5,
+                         "Size": 0.15, "Outward Expansion": 6.0, "Expansion Curve": 3.0,
+                         "Spikes": 110, "Roundness": 0.2, "Long Spikes": 2.0,
+                         "Spike Length": 0.85, "Thickness": 0.18, "Tip Thickness": 0.1,
+                         "Thickness Variation": 0.5, "Spike Bend": 0.15, "Spike Fill": 3.0,
+                         "Core Size": 0.25, "Core Strength": 1.4, "Shape Noise": 0.3,
+                         "Direction": (0.0, 0.0, 1.0), "Spread": 180.0, "Bursts": 2,
+                         "Burst Delay": 2.0, "Burst Scatter": 0.2, "Outward Speed": 1.0,
+                         "Speed Noise": 1.5, "Initial Velocity": True, "Source": 1.0,
+                         "Velocity": (0.0, 0.0, 1.0), "Trails": 14, "Trail Speed": 7.0,
+                         "Speed Variation": 0.5, "Trail Spread": 70.0, "Trail Gravity": 1.0,
+                         "Trail Drag": 0.6, "Trail Life": 24.0, "Life Variation": 0.5,
+                         "Launch Window": 2.0, "Trail Length": 3.0, "Trail Size": 0.07,
+                         "Trail Strength": 1.0, "Trail Fade": 1.0, "Trail Wobble": 0.15,
+                         "Trail Push": 0.4},
     "Fireball": {"Emit Type": 0, "Density": 0.3, "Temperature": 3.0, "Fuel": 2.0,
                  "Expansion": 4.0, "Start Frame": 1.0, "Duration": 8.0, "Fade": 1.5,
-                 "Size": 0.25, "Outward Expansion": 3.0, "Expansion Curve": 2.5, "Spikes": 40,
-                 "Roundness": 0.6, "Spike Length": 1.0, "Thickness": 0.3,
-                 "Core Strength": 1.2, "Shape Noise": 0.4, "Direction": (0.0, 0.0, 1.0),
-                 "Spread": 180.0, "Bursts": 1, "Outward Speed": 0.7, "Speed Noise": 0.8,
-                 "Initial Velocity": True, "Source": 1.0, "Velocity": (0.0, 0.0, 2.0)},
+                 "Size": 0.25, "Outward Expansion": 3.0, "Expansion Curve": 2.5, "Spikes": 50,
+                 "Roundness": 0.6, "Long Spikes": 1.0, "Spike Length": 1.0, "Thickness": 0.3,
+                 "Tip Thickness": 0.5, "Thickness Variation": 0.3, "Spike Bend": 0.0,
+                 "Spike Fill": 2.0, "Core Size": 0.4, "Core Strength": 1.2, "Shape Noise": 0.4,
+                 "Direction": (0.0, 0.0, 1.0), "Spread": 180.0, "Bursts": 1,
+                 "Outward Speed": 0.7, "Speed Noise": 0.8, "Initial Velocity": True,
+                 "Source": 1.0, "Velocity": (0.0, 0.0, 2.0)},
     "Ground Blast": {"Emit Type": 0, "Density": 1.0, "Temperature": 1.5, "Fuel": 1.2,
                      "Expansion": 6.0, "Start Frame": 1.0, "Duration": 7.0, "Fade": 1.5,
                      "Size": 0.15, "Outward Expansion": 6.0, "Expansion Curve": 3.0,
-                     "Spikes": 90, "Roundness": 0.2, "Spike Length": 0.7, "Thickness": 0.12,
-                     "Core Strength": 1.6, "Shape Noise": 0.7, "Direction": (0.0, 0.0, 1.0),
-                     "Spread": 75.0, "Bursts": 2, "Burst Delay": 2.0, "Burst Scatter": 0.25,
+                     "Spikes": 110, "Roundness": 0.15, "Long Spikes": 2.0, "Spike Length": 0.9,
+                     "Thickness": 0.18, "Tip Thickness": 0.1, "Thickness Variation": 0.5,
+                     "Spike Bend": 0.15, "Spike Fill": 3.0, "Core Size": 0.2,
+                     "Core Strength": 1.6, "Shape Noise": 0.3, "Direction": (0.0, 0.0, 1.0),
+                     "Spread": 80.0, "Bursts": 2, "Burst Delay": 2.0, "Burst Scatter": 0.25,
                      "Outward Speed": 1.2, "Speed Noise": 2.0, "Initial Velocity": True,
                      "Source": 1.0, "Velocity": (0.0, 0.0, 1.0)},
+    "Debris Trails": {"Emit Type": 4, "Density": 0.8, "Temperature": 1.5, "Fuel": 1.2,
+                      "Expansion": 0.5, "Start Frame": 1.0, "Direction": (0.0, 0.0, 1.0),
+                      "Trails": 24, "Trail Speed": 8.0, "Speed Variation": 0.5,
+                      "Trail Spread": 60.0, "Trail Gravity": 1.0, "Trail Drag": 0.5,
+                      "Trail Life": 30.0, "Life Variation": 0.5, "Launch Window": 3.0,
+                      "Trail Length": 3.0, "Trail Size": 0.06, "Trail Strength": 1.0,
+                      "Trail Fade": 0.7, "Trail Wobble": 0.15, "Trail Push": 0.4,
+                      "Initial Velocity": True, "Source": 1.0, "Velocity": (0.0, 0.0, 0.0)},
     "Muzzle Flash": {"Emit Type": 0, "Density": 0.2, "Temperature": 2.5, "Fuel": 2.0,
                      "Expansion": 8.0, "Start Frame": 1.0, "Duration": 3.0, "Fade": 1.0,
                      "Size": 0.06, "Outward Expansion": 8.0, "Expansion Curve": 2.0,
-                     "Spikes": 20, "Roundness": 0.3, "Spike Length": 1.0, "Thickness": 0.35,
+                     "Spikes": 20, "Roundness": 0.3, "Long Spikes": 1.0, "Spike Length": 1.0,
+                     "Thickness": 0.35, "Tip Thickness": 0.4, "Thickness Variation": 0.3,
+                     "Spike Bend": 0.0, "Spike Fill": 2.0, "Core Size": 0.0,
                      "Core Strength": 1.0, "Shape Noise": 0.3, "Direction": (0.0, 1.0, 0.0),
                      "Spread": 15.0, "Bursts": 1, "Outward Speed": 1.5, "Speed Noise": 1.0,
                      "Initial Velocity": True, "Source": 1.0, "Velocity": (0.0, 0.0, 0.0)},
     "Smoke Puff": {"Emit Type": 0, "Density": 1.5, "Temperature": 0.3, "Fuel": 0.0,
                    "Expansion": 3.0, "Start Frame": 1.0, "Duration": 6.0, "Fade": 1.0,
                    "Size": 0.2, "Outward Expansion": 3.0, "Expansion Curve": 2.5, "Spikes": 50,
-                   "Roundness": 0.4, "Spike Length": 0.9, "Thickness": 0.22,
+                   "Roundness": 0.4, "Long Spikes": 1.0, "Spike Length": 0.9,
+                   "Thickness": 0.3, "Tip Thickness": 0.5, "Thickness Variation": 0.4,
+                   "Spike Bend": 0.1, "Spike Fill": 2.0, "Core Size": 0.35,
                    "Core Strength": 1.2, "Shape Noise": 0.5, "Direction": (0.0, 0.0, 1.0),
                    "Spread": 180.0, "Bursts": 1, "Outward Speed": 0.8, "Speed Noise": 0.5,
                    "Initial Velocity": True, "Source": 1.0, "Velocity": (0.0, 0.0, 0.3)},
@@ -471,10 +541,10 @@ EMITTER_PRESETS = {
                     "Source": 1.0, "Velocity": (0.0, 0.0, 2.0), "Density": 1.0,
                     "Temperature": 2.0, "Fuel": 0.3, "Expansion": 0.0, "Duration": 0.0},
 }
-EMIT_TYPES = (("Burst", 0), ("Volume", 1), ("Surface", 2), ("Particles", 3))
+EMIT_TYPES = (("Burst", 0), ("Volume", 1), ("Surface", 2), ("Particles", 3), ("Trails", 4))
 EMITTER_STRENGTH = ("Density", "Temperature", "Fuel", "Expansion")
 EMITTER_SPEED = ("Normal", "Velocity", "Particle Speed", "Particle Spread", "Outward Speed",
-                 "Speed Noise")
+                 "Speed Noise", "Trail Speed")
 
 # Solver settings: the Pyro Simulation modifier and its look presets.
 SOLVER_ITEMS = (
@@ -603,42 +673,35 @@ def preset_block(name, description, table, user_table, presets, strength=(), spe
 # --------------------------------------------------------------------------------------------
 # Emitter blocks.
 
-def build_burst():
-    tree = new_group(
-        "Pyro Burst",
-        "Spiky burst points, after Houdini's Pyro Burst Source: random spikes from a centre "
-        "that grow fast and then slow, each a trail of puffs towards the centre")
-    socket(tree, "Centre", "NodeSocketVector", default=(0.0, 0.0, 0.0),
-           description="Where the burst starts, in the emitter's space")
-    settings_socket(tree)
-    socket(tree, "Frame", "NodeSocketFloat", default=1.0)
-    socket(tree, "Seconds Per Frame", "NodeSocketFloat", default=1.0 / 24.0, minimum=1.0e-6)
-    socket(tree, "Points", "NodeSocketGeometry", in_out="OUTPUT",
-           description="Points with radius and the pyro attributes; velocity in the emitter's "
-                       "space")
-    b = Builder(tree)
-    group_in = b.new("NodeGroupInput")
-    group_out = b.new("NodeGroupOutput")
-    inp = group_in.outputs
-    s = separate(b, inp["Settings"], items_of(EMITTER_ITEMS) + items_of(EMITTER_USER_ITEMS))
+def cone_direction(b, ident, seed, axis, spread):
+    """A random unit vector within `spread` degrees of `axis`, one per `ident`."""
+    cos_spread = b.math("COSINE", b.math("RADIANS", b.math("MINIMUM", spread, 180.0)))
+    u = random(b, "FLOAT", 0.0, 1.0, ident, b.math("ADD", seed, 11.0))
+    v = random(b, "FLOAT", 0.0, 1.0, ident, b.math("ADD", seed, 23.0))
+    cos_theta = b.math("SUBTRACT", 1.0, b.math("MULTIPLY", u, b.math("SUBTRACT", 1.0, cos_spread)))
+    sin_theta = b.math("SQRT", b.math("MAXIMUM", b.math(
+        "SUBTRACT", 1.0, b.math("MULTIPLY", cos_theta, cos_theta)), 0.0))
+    phi = b.math("MULTIPLY", v, 6.283185)
+    local = vector(b, b.math("MULTIPLY", sin_theta, b.math("COSINE", phi)),
+                   b.math("MULTIPLY", sin_theta, b.math("SINE", phi)), cos_theta)
+    align = b.new("FunctionNodeAlignRotationToVector", axis="Z")
+    b.link(b.vmath("NORMALIZE", axis), align.inputs["Vector"])
+    rotate = b.new("FunctionNodeRotateVector")
+    b.link(local, rotate.inputs["Vector"])
+    b.link(align.outputs["Rotation"], rotate.inputs["Rotation"])
+    return rotate.outputs[0]
 
-    # Points: burst b, spike k, point j along the spike from the tip inward.
-    per_spike = b.math("MAXIMUM", b.math("CEIL", b.math(
-        "DIVIDE", b.math("MULTIPLY", b.math("MULTIPLY", s["Size"], s["Outward Expansion"]),
-                         s["Spike Length"]),
-        s["Point Spacing"])), 1.0)
-    per_spike = b.math("MINIMUM", per_spike, 64.0)
-    per_burst = b.math("MULTIPLY", s["Spikes"], per_spike)
-    count = b.math("MULTIPLY", per_burst, s["Bursts"])
-    points = b.new("GeometryNodePoints")
-    b.link(b.math("MINIMUM", count, 200000.0), points.inputs["Count"])
-    index = b.new("GeometryNodeInputIndex").outputs[0]
-    burst = b.math("FLOOR", b.math("DIVIDE", index, per_burst))
-    spike_id = b.math("FLOOR", b.math("DIVIDE", index, per_spike))
-    along = b.math("SUBTRACT", index, b.math("MULTIPLY", spike_id, per_spike))
-    seed = s["Seed"]
 
-    # When: each burst starts Burst Delay frames after the one before, and lasts Duration.
+def random_in_ball(b, ident, seed):
+    """A random vector inside the unit ball, one per `ident`."""
+    raw = random(b, "FLOAT_VECTOR", (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0), ident, seed)
+    u = random(b, "FLOAT", 0.0, 1.0, ident, b.math("ADD", seed, 1.0))
+    return b.vmath("SCALE", b.vmath("NORMALIZE", raw), scale=b.math("POWER", u, 1.0 / 3.0))
+
+
+def burst_timing(b, s, inp, burst):
+    """For burst number `burst` (a field): whether it is live, the share of its duration
+    left, its radius now, its growth in world units per second, and its centre."""
     duration = switch(b, "FLOAT", b.math("GREATER_THAN", s["Duration"], 0.0), 8.0, s["Duration"])
     start = b.math("ADD", s["Start Frame"], b.math("MULTIPLY", burst, s["Burst Delay"]))
     age = b.math("SUBTRACT", inp["Frame"], start)
@@ -655,69 +718,28 @@ def build_burst():
                                    b.math("POWER", remaining,
                                           b.math("SUBTRACT", s["Expansion Curve"], 1.0))),
                   b.math("MULTIPLY", duration, inp["Seconds Per Frame"]))
-
-    # Where: a random direction in the cone around Direction, per spike.
-    cos_spread = b.math("COSINE", b.math("RADIANS", b.math("MINIMUM", s["Spread"], 180.0)))
-    u = random(b, "FLOAT", 0.0, 1.0, spike_id, b.math("ADD", seed, 11.0))
-    v = random(b, "FLOAT", 0.0, 1.0, spike_id, b.math("ADD", seed, 23.0))
-    cos_theta = b.math("SUBTRACT", 1.0, b.math("MULTIPLY", u, b.math("SUBTRACT", 1.0, cos_spread)))
-    sin_theta = b.math("SQRT", b.math("MAXIMUM", b.math(
-        "SUBTRACT", 1.0, b.math("MULTIPLY", cos_theta, cos_theta)), 0.0))
-    phi = b.math("MULTIPLY", v, 6.283185)
-    local = vector(b, b.math("MULTIPLY", sin_theta, b.math("COSINE", phi)),
-                   b.math("MULTIPLY", sin_theta, b.math("SINE", phi)), cos_theta)
-    align = b.new("FunctionNodeAlignRotationToVector", axis="Z")
-    b.link(b.vmath("NORMALIZE", s["Direction"]), align.inputs["Vector"])
-    rotate = b.new("FunctionNodeRotateVector")
-    b.link(local, rotate.inputs["Vector"])
-    b.link(align.outputs["Rotation"], rotate.inputs["Rotation"])
-    direction = rotate.outputs[0]
-    # How far: Roundness 1 gives equal spikes; shape noise varies them smoothly over the
-    # directions, which gives lobes rather than salt and pepper.
-    ragged = random(b, "FLOAT", 0.0, 1.0, spike_id, b.math("ADD", seed, 37.0))
-    length = b.math("SUBTRACT", 1.0, b.math("MULTIPLY", b.math("SUBTRACT", 1.0, s["Roundness"]),
-                                            ragged))
-    noise = b.new("ShaderNodeTexNoise", noise_dimensions="4D")
-    b.link(b.vmath("SCALE", direction, scale=1.7), noise.inputs["Vector"])
-    b.link(b.math("ADD", b.math("MULTIPLY", seed, 7.31), burst), noise.inputs["W"])
-    noise.inputs["Detail"].default_value = 2.0
-    lumps = b.math("MULTIPLY", b.math("SUBTRACT", noise.outputs["Fac"], 0.5), 2.0)
-    length = b.math("MAXIMUM", b.math("ADD", length, b.math("MULTIPLY", lumps, s["Shape Noise"])),
-                    0.15)
-    # Along the spike: 1 at the tip, 1 - Spike Length at the inner end.
-    step = b.math("DIVIDE", along, b.math("MAXIMUM", b.math("SUBTRACT", per_spike, 1.0), 1.0))
-    fraction = b.math("SUBTRACT", 1.0, b.math("MULTIPLY", step, s["Spike Length"]))
-    reach = b.math("MULTIPLY", length, fraction)
     # Bursts after the first start a little away from the centre.
     scatter = random(b, "FLOAT_VECTOR", (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0), burst,
-                     b.math("ADD", seed, 53.0))
+                     b.math("ADD", s["Seed"], 53.0))
     first = b.math("LESS_THAN", burst, 0.5)
     offset = b.vmath("SCALE", scatter, scale=b.math("MULTIPLY", s["Burst Scatter"],
                                                     b.math("SUBTRACT", 1.0, first)))
     centre = b.vmath("ADD", inp["Centre"], offset)
-    position = b.vmath("ADD", centre, b.vmath("SCALE", direction,
-                                              scale=b.math("MULTIPLY", radius_now, reach)))
-    # Velocity: the point's own outward motion, plus noise.
-    jitter = random(b, "FLOAT_VECTOR", (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0), index,
-                    b.math("ADD", seed, 71.0))
-    outward = b.vmath("SCALE", direction, scale=b.math("MULTIPLY", b.math(
-        "MULTIPLY", rate, reach), s["Outward Speed"]))
-    velocity = b.vmath("ADD", outward, b.vmath("SCALE", jitter, scale=s["Speed Noise"]))
-    # How much: fades over the duration, stronger towards the core of each spike.
-    fade = b.math("POWER", remaining, s["Fade"])
-    core = mix(b, s["Core Strength"], 1.0, fraction)
-    weight = b.math("MULTIPLY", b.math("MULTIPLY", fade, core), live)
-    radius = b.math("MULTIPLY", b.math("MULTIPLY", s["Thickness"], radius_now),
-                    b.math("ADD", 0.5, b.math("MULTIPLY", 0.5, fraction)))
-    # Never thinner than the points are apart, so a puff covers at least a voxel.
-    radius = b.math("MAXIMUM", radius, b.math("MULTIPLY", s["Point Spacing"], 0.6))
+    return live, remaining, radius_now, rate, centre
 
+
+def finish_points(b, points, position, radius, s, weight, velocity, live, strength=None):
+    """Place, size and tag points, and drop those that are not live."""
     placed = b.new("GeometryNodeSetPosition")
-    b.link(points.outputs[0], placed.inputs["Geometry"])
+    b.link(points, placed.inputs["Geometry"])
     b.link(position, placed.inputs["Position"])
     sized = b.new("GeometryNodeSetPointRadius")
     b.link(placed.outputs[0], sized.inputs["Points"])
-    b.link(radius, sized.inputs["Radius"])
+    # Never thinner than the points are apart, so a puff covers at least a voxel.
+    b.link(b.math("MAXIMUM", radius, b.math("MULTIPLY", s["Point Spacing"], 0.6)),
+           sized.inputs["Radius"])
+    if strength is not None:
+        weight = b.math("MULTIPLY", weight, strength)
     tagged = tag_pyro_points(b, sized.outputs[0],
                              b.math("MULTIPLY", s["Density"], weight),
                              b.math("MULTIPLY", s["Temperature"], weight),
@@ -726,7 +748,251 @@ def build_burst():
     dead = b.new("GeometryNodeDeleteGeometry", domain="POINT")
     b.link(tagged, dead.inputs["Geometry"])
     b.link(b.math("LESS_THAN", live, 0.5), dead.inputs["Selection"])
-    b.link(dead.outputs[0], group_out.inputs["Points"])
+    return dead.outputs[0]
+
+
+def build_burst():
+    tree = new_group(
+        "Pyro Burst",
+        "Spiky burst points, after Houdini's Pyro Burst Source: random spikes from a core that "
+        "grow fast and then slow, each a tapering cone of points, thick at the base and sharp "
+        "at the tip")
+    socket(tree, "Centre", "NodeSocketVector", default=(0.0, 0.0, 0.0),
+           description="Where the burst starts, in the emitter's space")
+    settings_socket(tree)
+    socket(tree, "Frame", "NodeSocketFloat", default=1.0)
+    socket(tree, "Seconds Per Frame", "NodeSocketFloat", default=1.0 / 24.0, minimum=1.0e-6)
+    socket(tree, "Points", "NodeSocketGeometry", in_out="OUTPUT",
+           description="Points with radius and the pyro attributes; velocity in the emitter's "
+                       "space")
+    b = Builder(tree)
+    group_in = b.new("NodeGroupInput")
+    group_out = b.new("NodeGroupOutput")
+    inp = group_in.outputs
+    s = separate(b, inp["Settings"], items_of(EMITTER_ITEMS) + items_of(EMITTER_USER_ITEMS))
+    seed = s["Seed"]
+    spacing = s["Point Spacing"]
+    biggest = b.math("MULTIPLY", s["Size"], s["Outward Expansion"])
+
+    # Spike points: burst, spike, point j along the spike from the tip inward.
+    per_spike = b.math("CEIL", b.math("DIVIDE", b.math(
+        "MULTIPLY", b.math("MULTIPLY", biggest, s["Spike Length"]), s["Spike Fill"]), spacing))
+    per_spike = b.math("MINIMUM", b.math("MAXIMUM", per_spike, 2.0), 160.0)
+    per_burst = b.math("MULTIPLY", s["Spikes"], per_spike)
+    points = b.new("GeometryNodePoints")
+    b.link(b.math("MINIMUM", b.math("MULTIPLY", per_burst, s["Bursts"]), 300000.0),
+           points.inputs["Count"])
+    index = b.new("GeometryNodeInputIndex").outputs[0]
+    burst = b.math("FLOOR", b.math("DIVIDE", index, per_burst))
+    spike_id = b.math("FLOOR", b.math("DIVIDE", index, per_spike))
+    along = b.math("SUBTRACT", index, b.math("MULTIPLY", spike_id, per_spike))
+    live, remaining, radius_now, rate, centre = burst_timing(b, s, inp, burst)
+    direction = cone_direction(b, spike_id, seed, s["Direction"], s["Spread"])
+
+    # How far: Roundness is the shortest spike; Long Spikes above 1 makes most spikes short
+    # and a few long. Shape noise varies them smoothly over the directions, giving lobes.
+    ragged = random(b, "FLOAT", 0.0, 1.0, spike_id, b.math("ADD", seed, 37.0))
+    ragged = b.math("POWER", ragged, s["Long Spikes"])
+    length = mix(b, s["Roundness"], 1.0, ragged)
+    noise = b.new("ShaderNodeTexNoise", noise_dimensions="4D")
+    b.link(b.vmath("SCALE", direction, scale=1.7), noise.inputs["Vector"])
+    b.link(b.math("ADD", b.math("MULTIPLY", seed, 7.31), burst), noise.inputs["W"])
+    noise.inputs["Detail"].default_value = 2.0
+    lumps = b.math("MULTIPLY", b.math("SUBTRACT", noise.outputs["Fac"], 0.5), 2.0)
+    length = b.math("MAXIMUM", b.math("ADD", length, b.math("MULTIPLY", lumps, s["Shape Noise"])),
+                    0.1)
+    # Along the spike: t = 1 at the tip, 0 at its inner end, Spike Length in from the tip.
+    t = b.math("SUBTRACT", 1.0, b.math("DIVIDE", along, b.math("MAXIMUM", b.math(
+        "SUBTRACT", per_spike, 1.0), 1.0)))
+    fraction = b.math("SUBTRACT", 1.0, b.math("MULTIPLY", b.math("SUBTRACT", 1.0, t),
+                                              s["Spike Length"]))
+    reach = b.math("MULTIPLY", b.math("MULTIPLY", length, fraction), radius_now)
+    # Bend: the spike curves sideways, more towards the tip.
+    side = random(b, "FLOAT_VECTOR", (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0), spike_id,
+                  b.math("ADD", seed, 41.0))
+    side = b.vmath("NORMALIZE", b.vmath("SUBTRACT", side, b.vmath(
+        "SCALE", direction, scale=b.vmath("DOT_PRODUCT", side, direction))))
+    bend = b.math("MULTIPLY", b.math("MULTIPLY", s["Spike Bend"], b.math("MULTIPLY", t, t)),
+                  b.math("MULTIPLY", length, radius_now))
+    # Thickness: Thickness × the burst's radius at the base, tapering to Tip Thickness of that
+    # at the tip; each spike a little thicker or thinner by Thickness Variation.
+    vary = random(b, "FLOAT", -1.0, 1.0, spike_id, b.math("ADD", seed, 43.0))
+    base = b.math("MULTIPLY", b.math("MULTIPLY", s["Thickness"], radius_now), b.math(
+        "ADD", 1.0, b.math("MULTIPLY", vary, b.math("MULTIPLY", s["Thickness Variation"], 0.6))))
+    thick = b.math("MULTIPLY", base, mix(b, 1.0, s["Tip Thickness"], t))
+    # The points fill the cone: each sits at random inside its cross-section.
+    scatter = random_in_ball(b, index, b.math("ADD", seed, 61.0))
+    position = b.vmath("ADD", b.vmath("ADD", centre, b.vmath("SCALE", direction, scale=reach)),
+                       b.vmath("ADD", b.vmath("SCALE", side, scale=bend),
+                               b.vmath("SCALE", scatter, scale=b.math("MULTIPLY", thick, 0.7))))
+    # Velocity: the point's own outward motion, plus noise.
+    jitter = random(b, "FLOAT_VECTOR", (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0), index,
+                    b.math("ADD", seed, 71.0))
+    outward = b.vmath("SCALE", direction, scale=b.math("MULTIPLY", b.math(
+        "MULTIPLY", b.math("MULTIPLY", rate, length), fraction), s["Outward Speed"]))
+    velocity = b.vmath("ADD", outward, b.vmath("SCALE", jitter, scale=s["Speed Noise"]))
+    # How much: fades over the duration, stronger towards the base of each spike.
+    fade = b.math("POWER", remaining, s["Fade"])
+    weight = b.math("MULTIPLY", fade, mix(b, s["Core Strength"], 1.0, t))
+    spikes = finish_points(b, points.outputs[0], position, b.math("MULTIPLY", thick, 0.6), s,
+                           weight, velocity, live)
+
+    # Core: a ball of points Core Size × the burst's radius across, filled evenly.
+    per_core = b.math("CEIL", b.math("MULTIPLY", 4.2, b.math("POWER", b.math(
+        "DIVIDE", b.math("MULTIPLY", biggest, s["Core Size"]), spacing), 3.0)))
+    per_core = b.math("MINIMUM", per_core, 40000.0)
+    core_points = b.new("GeometryNodePoints")
+    b.link(b.math("MULTIPLY", per_core, s["Bursts"]), core_points.inputs["Count"])
+    core_index = b.new("GeometryNodeInputIndex").outputs[0]
+    core_burst = b.math("FLOOR", b.math("DIVIDE", core_index, b.math("MAXIMUM", per_core, 1.0)))
+    core_live, core_remaining, core_radius, core_rate, core_centre = burst_timing(
+        b, s, inp, core_burst)
+    inside = random_in_ball(b, core_index, b.math("ADD", seed, 83.0))
+    # A burst that blows within a hemisphere or less has a half ball for a core.
+    axis = b.vmath("NORMALIZE", s["Direction"])
+    below = b.math("MINIMUM", b.vmath("DOT_PRODUCT", inside, axis), 0.0)
+    half = b.math("LESS_THAN", s["Spread"], 90.5)
+    inside = b.vmath("SUBTRACT", inside, b.vmath("SCALE", axis, scale=b.math(
+        "MULTIPLY", b.math("MULTIPLY", below, 2.0), half)))
+    core_size = b.math("MULTIPLY", core_radius, s["Core Size"])
+    core_velocity = b.vmath("ADD", b.vmath("SCALE", inside, scale=b.math(
+        "MULTIPLY", b.math("MULTIPLY", core_rate, s["Core Size"]), s["Outward Speed"])),
+        b.vmath("SCALE", random(b, "FLOAT_VECTOR", (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0),
+                                core_index, b.math("ADD", seed, 89.0)), scale=s["Speed Noise"]))
+    core = finish_points(
+        b, core_points.outputs[0],
+        b.vmath("ADD", core_centre, b.vmath("SCALE", inside, scale=core_size)),
+        b.math("MULTIPLY", spacing, 1.2), s,
+        b.math("MULTIPLY", b.math("POWER", core_remaining, s["Fade"]), s["Core Strength"]),
+        core_velocity, b.math("MULTIPLY", core_live, b.math("GREATER_THAN", s["Core Size"], 0.0)))
+
+    join = b.new("GeometryNodeJoinGeometry")
+    b.link(core, join.inputs[0])
+    b.link(spikes, join.inputs[0])
+    b.link(join.outputs[0], group_out.inputs["Points"])
+    arrange(tree)
+    return tree
+
+
+def trail_path(b, s, inp, seed, trail, seconds):
+    """Where trail number `trail` is `seconds` after its launch, and its velocity. Launched
+    along a random direction at a random speed, with drag k and gravity g:
+    x(t) = g t / k + (v0 - g / k)(1 - e^(-k t)) / k, v(t) = g / k + (v0 - g / k) e^(-k t)."""
+    direction = cone_direction(b, trail, seed, s["Direction"], s["Trail Spread"])
+    speed = b.math("MULTIPLY", s["Trail Speed"], b.math("SUBTRACT", 1.0, b.math(
+        "MULTIPLY", s["Speed Variation"], random(b, "FLOAT", 0.0, 1.0, trail,
+                                                 b.math("ADD", seed, 3.0)))))
+    v0 = b.vmath("SCALE", direction, scale=speed)
+    k = b.math("MAXIMUM", s["Trail Drag"], 0.05)
+    terminal = b.vmath("SCALE", inp["Gravity"], scale=b.math("DIVIDE", s["Trail Gravity"], k))
+    decay = b.math("EXPONENT", b.math("MULTIPLY", b.math("MULTIPLY", k, seconds), -1.0))
+    slowing = b.vmath("SUBTRACT", v0, terminal)
+    offset = b.vmath("ADD", b.vmath("SCALE", terminal, scale=seconds), b.vmath(
+        "SCALE", slowing, scale=b.math("DIVIDE", b.math("SUBTRACT", 1.0, decay), k)))
+    velocity = b.vmath("ADD", terminal, b.vmath("SCALE", slowing, scale=decay))
+    # Wobble: a smooth random sideways drift that grows with the distance flown.
+    noise = b.new("ShaderNodeTexNoise", noise_dimensions="4D")
+    b.link(vector(b, b.math("MULTIPLY", trail, 1.37), b.math("MULTIPLY", trail, 0.71), 0.0),
+           noise.inputs["Vector"])
+    b.link(b.math("MULTIPLY", seconds, 2.0), noise.inputs["W"])
+    noise.inputs["Scale"].default_value = 1.0
+    noise.inputs["Detail"].default_value = 1.0
+    drift = b.vmath("SCALE", b.vmath("SUBTRACT", noise.outputs["Color"], (0.5, 0.5, 0.5)),
+                    scale=b.math("MULTIPLY", b.math("MULTIPLY", s["Trail Wobble"], speed),
+                                 b.math("MULTIPLY", seconds, 2.0)))
+    return b.vmath("ADD", b.vmath("ADD", inp["Centre"], offset), drift), velocity
+
+
+def trail_timing(b, s, seed, trail):
+    """Trail number `trail`'s launch frame and life in frames."""
+    launch = b.math("ADD", s["Start Frame"], b.math("MULTIPLY", s["Launch Window"], random(
+        b, "FLOAT", 0.0, 1.0, trail, b.math("ADD", seed, 1.0))))
+    life = b.math("MULTIPLY", s["Trail Life"], b.math("SUBTRACT", 1.0, b.math(
+        "MULTIPLY", s["Life Variation"], random(b, "FLOAT", 0.0, 1.0, trail,
+                                                b.math("ADD", seed, 2.0)))))
+    return launch, life
+
+
+def build_trails():
+    tree = new_group(
+        "Pyro Trails",
+        "Ballistic trails, after Houdini's Pyro Trail Path and Pyro Trail Source: pieces "
+        "thrown out of the centre that slow down and fall, each leaving a tapering trail of "
+        "puffs behind it")
+    socket(tree, "Centre", "NodeSocketVector", default=(0.0, 0.0, 0.0),
+           description="Where the trails start, in the emitter's space")
+    settings_socket(tree)
+    socket(tree, "Frame", "NodeSocketFloat", default=1.0)
+    socket(tree, "Seconds Per Frame", "NodeSocketFloat", default=1.0 / 24.0, minimum=1.0e-6)
+    socket(tree, "Gravity", "NodeSocketVector", default=(0.0, 0.0, -9.81),
+           description="Gravity in the emitter's space")
+    socket(tree, "Points", "NodeSocketGeometry", in_out="OUTPUT",
+           description="Points with radius and the pyro attributes; velocity in the emitter's "
+                       "space")
+    socket(tree, "Paths", "NodeSocketGeometry", in_out="OUTPUT",
+           description="Each trail's whole flight as a curve, to see where they go")
+    b = Builder(tree)
+    group_in = b.new("NodeGroupInput")
+    group_out = b.new("NodeGroupOutput")
+    inp = group_in.outputs
+    s = separate(b, inp["Settings"], items_of(EMITTER_ITEMS) + items_of(EMITTER_USER_ITEMS))
+    seed = b.math("ADD", s["Seed"], 1000.0)
+    spf = inp["Seconds Per Frame"]
+    length_frames = b.math("MAXIMUM", s["Trail Length"], 0.01)
+
+    # Points: trail, then point j from the head back along the path. Enough points that the
+    # fastest trail's emitting length is covered at the point spacing.
+    longest = b.math("MULTIPLY", b.math("MULTIPLY", s["Trail Speed"], length_frames), spf)
+    per_trail = b.math("CEIL", b.math("DIVIDE", b.math("MULTIPLY", longest, 1.5),
+                                      s["Point Spacing"]))
+    per_trail = b.math("MINIMUM", b.math("MAXIMUM", per_trail, 2.0), 160.0)
+    points = b.new("GeometryNodePoints")
+    b.link(b.math("MINIMUM", b.math("MULTIPLY", s["Trails"], per_trail), 300000.0),
+           points.inputs["Count"])
+    index = b.new("GeometryNodeInputIndex").outputs[0]
+    trail = b.math("FLOOR", b.math("DIVIDE", index, per_trail))
+    behind = b.math("DIVIDE", b.math("SUBTRACT", index, b.math("MULTIPLY", trail, per_trail)),
+                    b.math("MAXIMUM", b.math("SUBTRACT", per_trail, 1.0), 1.0))
+
+    # Each trail: launched within Launch Window frames of Start Frame, lives Trail Life frames.
+    launch, life = trail_timing(b, s, seed, trail)
+    head = b.math("SUBTRACT", inp["Frame"], launch)
+    when = b.math("SUBTRACT", head, b.math("MULTIPLY", behind, length_frames))
+    live = b.math("MULTIPLY", b.math("MULTIPLY", b.math("GREATER_THAN", head, -1.0e-4),
+                                     b.math("LESS_THAN", head, life)),
+                  b.math("GREATER_THAN", when, -1.0e-4))
+    seconds = b.math("MULTIPLY", b.math("MAXIMUM", when, 0.0), spf)
+
+    position, velocity = trail_path(b, s, inp, seed, trail, seconds)
+
+    # Strongest at the head, fading along the trail and over the trail's life.
+    life_left = clamp01(b, b.math("SUBTRACT", 1.0, b.math("DIVIDE", head,
+                                                          b.math("MAXIMUM", life, 1.0e-3))))
+    weight = b.math("MULTIPLY", b.math("POWER", life_left, s["Trail Fade"]),
+                    mix(b, 1.0, 0.3, behind))
+    radius = b.math("MULTIPLY", s["Trail Size"], mix(b, 1.0, 0.45, behind))
+    trails = finish_points(b, points.outputs[0], position, radius, s, weight,
+                           b.vmath("SCALE", velocity, scale=s["Trail Push"]), live,
+                           strength=s["Trail Strength"])
+    b.link(trails, group_out.inputs["Points"])
+
+    # Paths: 48 points over each trail's life, joined into one curve per trail.
+    path_points = b.new("GeometryNodePoints")
+    b.link(b.math("MULTIPLY", s["Trails"], 48.0), path_points.inputs["Count"])
+    path_index = b.new("GeometryNodeInputIndex").outputs[0]
+    path_trail = b.math("FLOOR", b.math("DIVIDE", path_index, 48.0))
+    _launch, path_life = trail_timing(b, s, seed, path_trail)
+    share = b.math("DIVIDE", b.math("SUBTRACT", path_index, b.math("MULTIPLY", path_trail, 48.0)),
+                   47.0)
+    path_position, _velocity = trail_path(
+        b, s, inp, seed, path_trail, b.math("MULTIPLY", b.math("MULTIPLY", share, path_life), spf))
+    placed = b.new("GeometryNodeSetPosition")
+    b.link(path_points.outputs[0], placed.inputs["Geometry"])
+    b.link(path_position, placed.inputs["Position"])
+    curves = b.new("GeometryNodePointsToCurves")
+    b.link(placed.outputs[0], curves.inputs["Points"])
+    b.link(path_trail, curves.inputs["Curve Group ID"])
+    b.link(curves.outputs[0], group_out.inputs["Paths"])
     arrange(tree)
     return tree
 
@@ -885,9 +1151,9 @@ def build_particles():
 def build_emitter_modifier(blocks):
     tree = new_group(
         EMITTER_MODIFIER,
-        "Turn this mesh into pyro source points: spiky bursts, its volume or surface, or "
-        "particles. Follow it with Pyro Simulation, or put this object in another Pyro "
-        "Simulation's Emitters collection")
+        "Turn this mesh into pyro source points: spiky bursts, its volume or surface, "
+        "particles, and ballistic trails. Follow it with Pyro Simulation, or put this object "
+        "in another Pyro Simulation's Emitters collection")
     tree.is_modifier = True
     socket(tree, "Geometry", "NodeSocketGeometry")
     socket(tree, "Geometry", "NodeSocketGeometry", in_out="OUTPUT")
@@ -898,17 +1164,24 @@ def build_emitter_modifier(blocks):
         ("Preset", ["Preset", "Strength", "Speed", "Emit Type"]),
         ("Emission", ["Density", "Temperature", "Fuel", "Expansion", "Start Frame", "Duration",
                       "Fade"]),
-        ("Burst Shape", ["Size", "Outward Expansion", "Expansion Curve", "Spikes", "Roundness",
-                         "Spike Length", "Thickness", "Core Strength", "Shape Noise",
-                         "Direction", "Spread"]),
+        ("Burst Shape", ["Size", "Outward Expansion", "Expansion Curve", "Direction", "Spread",
+                         "Shape Noise", "Core Size", "Core Strength"]),
+        ("Spikes", ["Spikes", "Roundness", "Long Spikes", "Spike Length", "Thickness",
+                    "Tip Thickness", "Thickness Variation", "Spike Bend", "Spike Fill"]),
         ("Bursts", ["Bursts", "Burst Delay", "Burst Scatter"]),
+        ("Trails", ["Trails", "Trail Speed", "Speed Variation", "Trail Spread", "Trail Gravity",
+                    "Trail Drag", "Trail Life", "Life Variation", "Launch Window",
+                    "Trail Length", "Trail Size", "Trail Strength", "Trail Fade",
+                    "Trail Wobble", "Trail Push", "Show Paths"]),
         ("Velocity", ["Initial Velocity", "Outward Speed", "Speed Noise", "Source", "Normal",
                       "Velocity"]),
         ("Particles", ["Rate", "Particle Burst", "Particle Speed", "Particle Spread", "Drag",
                        "Particle Gravity", "Lifetime", "Particle Radius", "Gravity"]),
         ("Points", ["Point Spacing", "Seed", "Show Mesh"]),
     )
-    extra = {"Show Mesh": ("NodeSocketBool", True, "Keep the mesh visible")}
+    extra = {"Show Mesh": ("NodeSocketBool", True, "Keep the mesh visible"),
+             "Show Paths": ("NodeSocketBool", False, "Show each trail's whole flight as a "
+                                                     "line, to aim them (lines also render)")}
     copy_panels(tree, panels, preset_inputs, extra)
     b = Builder(tree)
     group_in = b.new("NodeGroupInput")
@@ -982,7 +1255,7 @@ def build_emitter_modifier(blocks):
     b.link(mesh, particles.inputs["Emitter"])
     b.link(settings, particles.inputs["Settings"])
     by_type = b.new("GeometryNodeIndexSwitch", data_type="GEOMETRY")
-    while len([x for x in by_type.inputs if x.name not in ("Index", "")]) < 4:
+    while len([x for x in by_type.inputs if x.name not in ("Index", "")]) < len(EMIT_TYPES):
         by_type.index_switch_items.new()
     b.link(s["Emit Type"], by_type.inputs["Index"])
     item_inputs = [x for x in by_type.inputs if x.name not in ("Index", "")]
@@ -1006,6 +1279,27 @@ def build_emitter_modifier(blocks):
     b.link(world, turn.inputs["Transform"])
     oriented = b.vmath("ADD", turn.outputs[0], carried)
     points = store_attribute(b, points, "velocity", oriented, "FLOAT_VECTOR")
+
+    # Trails, with any emit type. Gravity is world-oriented; they fly in the emitter's space.
+    to_local = b.new("FunctionNodeInvertMatrix")
+    b.link(world, to_local.inputs["Matrix"])
+    local_gravity = b.new("FunctionNodeTransformDirection")
+    b.link(s["Gravity"], local_gravity.inputs["Direction"])
+    b.link(to_local.outputs["Matrix"], local_gravity.inputs["Transform"])
+    trails = b.new("GeometryNodeGroup", node_tree=blocks["Pyro Trails"])
+    b.link(centre, trails.inputs["Centre"])
+    b.link(settings, trails.inputs["Settings"])
+    b.link(frame, trails.inputs["Frame"])
+    b.link(seconds_per_frame, trails.inputs["Seconds Per Frame"])
+    b.link(local_gravity.outputs[0], trails.inputs["Gravity"])
+    trail_turn = b.new("FunctionNodeTransformDirection")
+    b.link(named_attribute(b, "velocity", "FLOAT_VECTOR"), trail_turn.inputs["Direction"])
+    b.link(world, trail_turn.inputs["Transform"])
+    both = b.new("GeometryNodeJoinGeometry")
+    b.link(store_attribute(b, trails.outputs[0], "velocity", trail_turn.outputs[0],
+                           "FLOAT_VECTOR"), both.inputs[0])
+    b.link(points, both.inputs[0])
+    points = both.outputs[0]
     # Without Initial Velocity the points carry none, and the gas keeps its own.
     still = b.new("GeometryNodeRemoveAttribute")
     b.link(points, still.inputs["Geometry"])
@@ -1014,6 +1308,8 @@ def build_emitter_modifier(blocks):
 
     join = b.new("GeometryNodeJoinGeometry")
     b.link(switch(b, "GEOMETRY", inp["Show Mesh"], None, mesh), join.inputs[0])
+    b.link(switch(b, "GEOMETRY", inp["Show Paths"], None, trails.outputs["Paths"]),
+           join.inputs[0])
     b.link(points, join.inputs[0])
     b.link(join.outputs[0], group_out.inputs["Geometry"])
     input_item(tree, "Preset").default_value = "Explosion"
@@ -1463,6 +1759,9 @@ def build_display(material):
     join = b.new("GeometryNodeJoinGeometry")
     b.link(switch(b, "GEOMETRY", inp["Show Mesh"], None, mesh_only.outputs["Mesh"]),
            join.inputs[0])
+    # Curves, such as the Pyro Emitter's trail paths, are kept too.
+    b.link(switch(b, "GEOMETRY", inp["Show Mesh"], None, mesh_only.outputs["Curve"]),
+           join.inputs[0])
     b.link(to_local.outputs[0], join.inputs[0])
     b.link(join.outputs[0], group_out.inputs["Geometry"])
     input_item(tree, "Material").default_value = material
@@ -1573,9 +1872,10 @@ def build_simulation_modifier(blocks, material):
     return tree
 
 
-BLOCK_NAMES = ("Pyro Emitter Preset", "Pyro Burst", "Pyro Fill", "Pyro Particles",
-               "Pyro Preset", "Pyro Gather", "Pyro Domain", "Pyro Colliders", "Pyro Solver",
-               "Pyro Display", "Pyro Point Source", "Pyro Collider", "Turbulence Layer")
+BLOCK_NAMES = ("Pyro Emitter Preset", "Pyro Burst", "Pyro Trails", "Pyro Fill",
+               "Pyro Particles", "Pyro Preset", "Pyro Gather", "Pyro Domain", "Pyro Colliders",
+               "Pyro Solver", "Pyro Display", "Pyro Point Source", "Pyro Collider",
+               "Turbulence Layer")
 MODIFIER_NAMES = (EMITTER_MODIFIER, MODIFIER)
 
 
@@ -1590,6 +1890,7 @@ def build_assets(mark=True):
         "Pyro Collider": collider,
         "Pyro Emitter Preset": build_emitter_preset(),
         "Pyro Burst": build_burst(),
+        "Pyro Trails": build_trails(),
         "Pyro Fill": build_fill(),
         "Pyro Particles": build_particles(),
         "Pyro Preset": build_solver_preset(layer),

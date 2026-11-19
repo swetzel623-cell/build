@@ -913,6 +913,39 @@ emitter's trail.
 
 ![The burst presets after tuning](images/burst_presets.png)
 
+**Tapered spikes and trails.** Matched against Houdini viewport pictures of Burst Source
+points (dense core, many short spikes among a few long ones, each a cone thick at the base and
+sharp at the tip; in a ground blast a bushy hemisphere) and of Pyro Trail Path curves (pieces
+thrown up and out that arc down under gravity):
+
+- What SideFX documents ([Pyro Trail Path](https://www.sidefx.com/docs/houdini/nodes/sop/pyrotrailpath.html),
+  [Pyro Trail Source](https://www.sidefx.com/docs/houdini/nodes/sop/pyrotrailsource.html)):
+  trail paths are launched from points with a speed, a cone, drag and gravity; the trail
+  source emits along the most recent part of each path so fast trails leave no gaps.
+- Burst spikes are now filled cones: points at random inside a cross-section that tapers from
+  `Thickness` to `Tip Thickness` of it, bent sideways by `Spike Bend` toward the tip, with
+  lengths `Roundness + (1 − Roundness) × u^Long Spikes` (u uniform) plus shape noise, and an
+  optional solid core (`Core Size`; a half ball when `Spread` is 90° or less).
+- Trails are closed-form, so they need no simulation zone and scrub freely: with drag k and
+  gravity g, `x(t) = g t / k + (v0 − g/k)(1 − e^(−kt)) / k` and `v(t) = g/k + (v0 − g/k)
+  e^(−kt)`, plus a smooth noise drift growing with the time flown. Each trail emits from points
+  spread over its last `Trail Length` frames, spaced at the point spacing at the fastest
+  speed. Gravity is turned into the emitter's space, so trails fall in the world however the
+  emitter is turned. `Show Paths` adds each trail's whole flight as a curve.
+- Tests: the Explosion's outer points fill 20% of 400 direction bins (a ball fills all) and move
+  outward (alignment 0.99); Debris Trails rise to a mean 0.28 m by frame 6 and fall below
+  their start by frame 30; turned on its side the emitter throws them along its new up and
+  they still fall; Show Paths gives one curve per trail.
+
+![Burst and trail points](images/burst_trail_points.png)
+
+  Above: the Explosion's spikes all round and as a ground blast (Spread 80); Explosion Trails
+  with its paths at frames 3, 8 and 16; Debris Trails at frames 4, 12 and 24. Below, simulated
+  with the Explosion look: the star-shaped flash at frame 5, burning trails at 12 and their
+  smoke arcs at 24, and the Ground Blast.
+
+![Burst and trail gas](images/burst_trail_gas.png)
+
 ## Not verified, and known gaps
 
 - **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.

@@ -8,6 +8,7 @@ Exits non-zero if any test fails.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import traceback
@@ -294,8 +295,8 @@ def test_explosion_spreads():
 
 
 def test_burst_is_spiky():
-    """The Explosion burst: points along a few dozen spikes from the centre, growing fast and
-    then slower, moving outward, emitting fuel and expansion, and gone after its bursts."""
+    """The Explosion burst: points in about a hundred tapering spikes from a core, growing fast
+    and then slower, moving outward, emitting fuel and expansion, and gone after its bursts."""
     reset()
     obj, _modifier = smoke_emitter(emitter={"Preset": "Explosion", "Seed": 3})
     # The burst's own motion: one burst, no added noise or drift (Custom keeps the rest).
@@ -319,23 +320,72 @@ def test_burst_is_spiky():
         distance = np.linalg.norm(offset, axis=1)
         reach[frame] = float(distance.max())
         if frame == 3:
-            directions = offset / np.maximum(distance[:, None], 1e-9)
-            outward = np.einsum("ij,ij->i", directions,
-                                points["velocity"] / np.maximum(np.linalg.norm(
-                                    points["velocity"], axis=1)[:, None], 1e-9))
-            # Points on one spike share a direction: count distinct ones.
-            rounded = {tuple(np.round(d * 20).astype(int)) for d in directions}
-            print(f"  frame 3: {len(distance)} points along about {len(rounded)} directions, "
-                  f"mean outward alignment {outward.mean():.2f}, fuel {points['fuel'].sum():.0f}"
-                  f", expansion up to {points['expansion'].max():.1f} 1/s")
-            check(len(rounded) < len(distance) / 2, "the points are not along spikes")
-            check(outward.mean() > 0.95, "the burst does not move outward")
+            # The outer half of the burst: spikes fill only a few narrow cones of directions,
+            # where a ball would fill them all.
+            outer = distance > 0.5 * distance.max()
+            directions = offset[outer] / distance[outer][:, None]
+            heading = points["velocity"][outer]
+            outward = np.einsum("ij,ij->i", directions, heading / np.maximum(
+                np.linalg.norm(heading, axis=1)[:, None], 1e-9))
+            golden = np.pi * (3.0 - np.sqrt(5.0))
+            k = np.arange(400)
+            z = 1.0 - 2.0 * (k + 0.5) / 400
+            bins = np.column_stack([np.sqrt(1 - z * z) * np.cos(golden * k),
+                                    np.sqrt(1 - z * z) * np.sin(golden * k), z])
+            occupied = len(set(np.argmax(directions @ bins.T, axis=1))) / len(bins)
+            print(f"  frame 3: {len(distance)} points, the outer {len(directions)} in "
+                  f"{occupied:.0%} of the directions, mean outward alignment "
+                  f"{outward.mean():.2f}, fuel {points['fuel'].sum():.0f}, expansion up to "
+                  f"{points['expansion'].max():.1f} 1/s")
+            check(len(directions) > 200, "too few points in the spikes")
+            check(occupied < 0.6, "the points are not along spikes")
+            check(outward.mean() > 0.85, "the burst does not move outward")
             check(points["fuel"].sum() > 0 and points["expansion"].max() > 0,
                   "the burst emits no fuel or expansion")
     print(f"  reach by frame: {reach}")
     check(reach[3] > reach[1] and reach[5] > reach[3], "the burst does not grow")
     check(reach[3] - reach[1] > reach[5] - reach[3], "the burst does not slow down as it grows")
     check(reach[9] == 0.0, "the burst still emits after its duration")
+
+
+def test_trails_fly_and_fall():
+    """Debris Trails: trails thrown upward rise and then fall under world gravity, and turning
+    the emitter on its side throws them sideways while they still fall; Show Paths adds one
+    curve per trail."""
+    for turned in (False, True):
+        reset()
+        obj, _modifier = smoke_emitter(emitter={"Preset": "Debris Trails", "Seed": 2})
+        if turned:
+            obj.rotation_euler = (math.pi / 2, 0.0, 0.0)  # Its up is now world -y.
+        start = np.array(obj.location)
+        heights = {}
+        for frame in (6, 30):
+            points = emitted_points(obj, frame)
+            check(points and len(points["position"]) > 20, f"no trail points at frame {frame}")
+            offset = points["position"] - start
+            heights[frame] = float(offset[:, 2].mean())
+            if frame == 6:
+                sideways = float(-offset[:, 1].mean())
+                falling = float(points["velocity"][:, 2].mean())
+        print(f"  {'on its side' if turned else 'upright'}: mean height {heights[6]:.2f} at "
+              f"frame 6, {heights[30]:.2f} at frame 30; out along -y {sideways:.2f}; "
+              f"vertical speed at frame 6 {falling:.2f}")
+        if turned:
+            check(sideways > 0.15, "the turned emitter does not throw its trails sideways")
+            check(heights[30] < heights[6] - 0.2, "the trails do not fall under world gravity")
+        else:
+            check(heights[6] > 0.15, "the trails do not rise")
+            check(heights[30] < heights[6], "the trails do not come down")
+    set_input(obj.modifiers["Pyro Emitter"], "Show Paths", True)
+    for modifier in obj.modifiers[1:]:
+        modifier.show_viewport = False
+    bpy.context.scene.frame_set(6)
+    geometry = obj.evaluated_get(bpy.context.evaluated_depsgraph_get()).evaluated_geometry()
+    curves = geometry.curves
+    count = len(curves.curves) if curves is not None else 0
+    print(f"  Show Paths: {count} curves")
+    check(count == smoke_assets.EMITTER_PRESETS["Debris Trails"]["Trails"],
+          "Show Paths does not give one curve per trail")
 
 
 def test_emitter_motion_gives_velocity():
@@ -456,6 +506,7 @@ TESTS = [
     test_campfire_burns,
     test_explosion_spreads,
     test_burst_is_spiky,
+    test_trails_fly_and_fall,
     test_emitter_motion_gives_velocity,
     test_initial_velocity_from_motion,
     test_emitters_collection_and_plain_smoke,

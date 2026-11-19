@@ -56,17 +56,32 @@ Two modifiers, as Houdini splits sourcing from the solver:
 
 **Add Modifier > Physics > Pyro Emitter** turns a mesh into *pyro points*: points with a radius
 that emit density, temperature, fuel and expansion (1/s, the push of an explosion) and carry a
-velocity. Its Preset menu: Explosion, Fireball, Ground Blast, Muzzle Flash, Smoke Puff (bursts),
-Smoke, Campfire, Candle (the mesh's volume), Trail, Large Plume (particles), or Custom.
+velocity. Its Preset menu: Explosion, Explosion Trails, Fireball, Ground Blast, Muzzle Flash,
+Smoke Puff (bursts), Debris Trails (trails only), Smoke, Campfire, Candle (the mesh's volume),
+Trail, Large Plume (particles), or Custom.
 
-- **Burst** follows Houdini's Pyro Burst Source: random spikes (its "trailings") from the
-  mesh's centre, each a trail of puffs toward the centre. `Spikes`, `Roundness` (1 equal
-  spikes, lower ragged), `Spike Length`, `Thickness`, `Core Strength` (stronger toward the
-  centre), `Shape Noise` (lumpy outline), `Direction` and `Spread` (a cone; 180 is all round,
-  75 a ground blast, 15 a muzzle flash), `Size`, `Outward Expansion` and `Expansion Curve` (how
-  much it grows, fast at first), `Start Frame` and `Duration` (frames), `Fade`, and several
-  `Bursts` a few frames apart and a little scattered. Its points move outward at the burst's
-  own expansion speed (`Outward Speed`) plus `Speed Noise`.
+- **Burst** follows Houdini's Pyro Burst Source: random spikes (its "trailings") from a core at
+  the mesh's centre. Each spike is a cone of points, `Thickness` (of the burst's radius) at its
+  base and `Tip Thickness` of that at its tip. `Spikes`; `Roundness` (the shortest spike
+  relative to the longest: 1 a ball, 0 ragged); `Long Spikes` (above 1 most spikes are short
+  and a few long); `Spike Length` (how far in from the tip a spike reaches); `Thickness
+  Variation`; `Spike Bend` (spikes curve sideways toward their tips); `Spike Fill` (points
+  per spacing); `Core Size` and `Core Strength` (a solid ball at the centre, and how strongly
+  it and the spikes' bases emit); `Shape Noise` (lumpy outline); `Direction` and `Spread` (a
+  cone: 180 all round, 80 a ground blast with a half-ball core, 15 a muzzle flash); `Size`,
+  `Outward Expansion` and `Expansion Curve` (how much it grows, fast at first); `Start Frame`,
+  `Duration` (frames) and `Fade`; and several `Bursts` a few frames apart and a little
+  scattered. Its points move outward at the burst's own expansion speed (`Outward Speed`)
+  plus `Speed Noise`.
+- **Trails** follow Houdini's Pyro Trail Path and Trail Source: `Trails` pieces thrown out of
+  the centre at `Trail Speed` (less by up to `Speed Variation`) within `Trail Spread` degrees
+  of `Direction`, slowed by `Trail Drag` and pulled down by `Trail Gravity` (world gravity,
+  however the emitter is turned), each flying for `Trail Life` frames (less by up to `Life
+  Variation`), launched over `Launch Window` frames. The last `Trail Length` frames of each
+  path emit, `Trail Size` at the head and tapering behind it, at `Trail Strength` of the
+  amounts above, dying down by `Trail Fade`, drifting by `Trail Wobble`, and giving the gas
+  `Trail Push` of their velocity. Trails add to any emit type; Emit Type **Trails** emits
+  trails only. `Show Paths` draws each trail's whole flight as a line, to aim them.
 - **Volume** and **Surface** fill the mesh or cover its surface with points `Point Spacing`
   apart; **Particles** runs a particle simulation off the surface.
 - **Velocity**: `Initial Velocity`, `Source` (share of the emitter's own motion), `Normal` and

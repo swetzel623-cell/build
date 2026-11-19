@@ -3,9 +3,10 @@
 
     blender -b --factory-startup --python make_sparse_demo.py -- OUTPUT.blend
 
-Four small spheres, each with a Pyro Emitter followed by a Pyro Simulation: an Explosion, a
-Fireball and a Ground Blast (spiky bursts after Houdini's Pyro Burst Source, with the Explosion
-look) and a Campfire under a plate in the "Colliders" collection (with the Fire look). Press
+Four small spheres, each with a Pyro Emitter followed by a Pyro Simulation: an Explosion,
+Explosion Trails (with burning trails thrown out, paths shown) and a Ground Blast (spiky bursts
+and trails after Houdini's Pyro Burst Source and Trail Path, with the Explosion look) and a
+Campfire under a plate in the "Colliders" collection (with the Fire look). Press
 play from frame 1. The demo carries its own copy of the node groups, so it also opens in a build
 without the installed assets.
 """
@@ -52,16 +53,18 @@ def main():
 
     groups = smoke_assets.build_assets(mark=False)
     blast = {"Voxel Size": 0.05, "Domain Size": (4.5, 4.5, 5.5)}
-    pyro("Explosion", (-5.0, 0.0, 0.5), groups, "Explosion", "Explosion", **blast)
-    pyro("Fireball", (0.0, 0.0, 0.5), groups, "Fireball", "Explosion", **blast)
-    pyro("Ground Blast", (5.0, 0.0, 0.2), groups, "Ground Blast", "Explosion", **blast)
-    _fire, campfire = pyro("Campfire", (9.0, 0.0, 0.1), groups, "Campfire", "Fire",
+    pyro("Explosion", (-6.5, 0.0, 0.5), groups, "Explosion", "Explosion", **blast)
+    trails, _simulating = pyro("Explosion Trails", (0.0, 0.0, 0.5), groups, "Explosion Trails",
+                               "Explosion", **{"Voxel Size": 0.05, "Domain Size": (7.0, 7.0, 5.5)})
+    set_input(trails.modifiers[smoke_assets.EMITTER_MODIFIER], "Show Paths", True)
+    pyro("Ground Blast", (6.5, 0.0, 0.2), groups, "Ground Blast", "Explosion", **blast)
+    _fire, campfire = pyro("Campfire", (10.5, 0.0, 0.1), groups, "Campfire", "Fire",
                            **{"Voxel Size": 0.04, "Domain Size": (1.6, 1.6, 3.0),
                               "Show Mesh": True})
 
     colliders = bpy.data.collections.new("Colliders")
     scene.collection.children.link(colliders)
-    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(9.0, 0.0, 1.6))
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(10.5, 0.0, 1.6))
     plate = bpy.context.active_object
     plate.name = "Plate"
     plate.scale = (0.9, 0.9, 0.06)
@@ -70,7 +73,7 @@ def main():
     colliders.objects.link(plate)
     set_input(campfire, "Colliders", colliders)
 
-    bpy.ops.object.camera_add(location=(2.0, -22.0, 2.5), rotation=(np.radians(85), 0.0, 0.0))
+    bpy.ops.object.camera_add(location=(2.0, -25.0, 2.5), rotation=(np.radians(85), 0.0, 0.0))
     scene.camera = bpy.context.active_object
     bpy.ops.object.light_add(type="SUN", location=(0.0, 0.0, 6.0))
     bpy.ops.wm.save_as_mainfile(filepath=path)

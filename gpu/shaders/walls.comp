@@ -17,7 +17,7 @@ float solid_velocity(ivec3 c, int axis)
   if (P.flags.x == 0 || is_wall(c)) {
     return 0.0;
   }
-  int size = P.extent.w;
+  int size = brick_size();
   ivec3 b = c / size;
   if (any(greaterThanEqual(b, P.bricks.xyz))) {
     return 0.0;
@@ -59,7 +59,7 @@ void main()
   }
   ivec3 c = coords_of(index);
   bool here = cell_type[index] == CELL_SOLID;
-  U[index] = face(c, here, 0, U[index]);
-  V[index] = face(c, here, 1, V[index]);
-  W[index] = face(c, here, 2, W[index]);
+  U[index] = QV(face(c, here, 0, float(U[index])));
+  V[index] = QV(face(c, here, 1, float(V[index])));
+  W[index] = QV(face(c, here, 2, float(W[index])));
 }

@@ -12,17 +12,17 @@
 float fetch_u(ivec3 c)
 {
   int index = index_of(c);
-  return index < 0 ? 0.0 : U[index];
+  return index < 0 ? 0.0 : float(U[index]);
 }
 float fetch_v(ivec3 c)
 {
   int index = index_of(c);
-  return index < 0 ? 0.0 : V[index];
+  return index < 0 ? 0.0 : float(V[index]);
 }
 float fetch_w(ivec3 c)
 {
   int index = index_of(c);
-  return index < 0 ? 0.0 : W[index];
+  return index < 0 ? 0.0 : float(W[index]);
 }
 
 void main()
@@ -32,8 +32,8 @@ void main()
     return;
   }
   ivec3 c = coords_of(index);
-  float u = 0.5 * (U[index] + fetch_u(c + ivec3(1, 0, 0)));
-  float v = 0.5 * (V[index] + fetch_v(c + ivec3(0, 1, 0)));
-  float w = 0.5 * (W[index] + fetch_w(c + ivec3(0, 0, 1)));
-  SPEED[index] = sqrt(u * u + v * v + w * w);
+  float u = 0.5 * (float(U[index]) + fetch_u(c + ivec3(1, 0, 0)));
+  float v = 0.5 * (float(V[index]) + fetch_v(c + ivec3(0, 1, 0)));
+  float w = 0.5 * (float(W[index]) + fetch_w(c + ivec3(0, 0, 1)));
+  SPEED[index] = QS(sqrt(u * u + v * v + w * w));
 }

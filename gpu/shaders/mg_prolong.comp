@@ -17,5 +17,5 @@ void main()
     return;
   }
   int parent = level_index(P.lb, level_coords(P.la, index) >> 1);
-  x[index] += P.scale * (parent < 0 ? 0.0 : coarse_x[parent]);
+  x[index] = QPC(x[index] + P.scale * (parent < 0 ? 0.0 : coarse_x[parent]));
 }

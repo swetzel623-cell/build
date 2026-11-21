@@ -8,7 +8,9 @@
 void main()
 {
   int index;
-  if (voxel_in_range(index) && cell_type[index] != CELL_FLUID) {
-    PRESSURE[index] = 0.0;
+  if (!voxel_in_range(index)) {
+    return;
   }
+  /* a.x is 1 to keep the previous pressure as the initial guess, 0 to start from zero. */
+  PRESSURE[index] = QP(cell_type[index] != CELL_FLUID ? 0.0 : P.a.x * float(PRESSURE[index]));
 }

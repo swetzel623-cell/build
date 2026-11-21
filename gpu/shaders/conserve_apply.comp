@@ -17,9 +17,9 @@ void main()
   if (keep == 1.0) {
     return;
   }
-  float forward = b8[index];
-  float correction = b9[index] - forward;
+  float forward = float(b8[index]);
+  float correction = float(b9[index]) - forward;
   if (partials[1] > 0.0 ? correction > 0.0 : correction < 0.0) {
-    b9[index] = forward + keep * correction;
+    b9[index] = QS(forward + keep * correction);
   }
 }

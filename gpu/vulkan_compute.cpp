@@ -20,11 +20,22 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <map>
 #include <mutex>
 #include <stdexcept>
 #include <vector>
+
+#ifdef MANTA_PERF_COUNTERS
+#  include "perf_counters.hpp"
+PerfCounters g_perf;
+#  define MANTA_PERF(...) (__VA_ARGS__)
+#else
+#  define MANTA_PERF(...) ((void)0)
+#endif
 
 namespace {
 
@@ -183,6 +194,99 @@ VkBuffer to_vk(const Compute::Buffer &buffer)
   return reinterpret_cast<VkBuffer>(buffer.handle);
 }
 
+/** Which bindings (bit i = binding i + 1) a kernel reads and writes. */
+struct KernelAccess {
+  std::uint32_t reads = 0;
+  std::uint32_t writes = 0;
+};
+
+/**
+ * Find the storage buffers a SPIR-V compute shader loads from and stores to, by following every
+ * load, store and atomic back through its access chains to the descriptor variable. A binding the
+ * shader declares but never touches is in neither set. Anything not understood counts as both.
+ */
+KernelAccess reflect_access(const std::uint32_t *code, const std::size_t words)
+{
+  KernelAccess all;
+  all.reads = all.writes = (1u << binding_count) - 1u;
+  if (words < 5 || code[0] != 0x07230203u) {
+    return all;
+  }
+  std::unordered_map<std::uint32_t, std::uint32_t> binding_of; /* variable -> binding */
+  std::unordered_map<std::uint32_t, std::uint32_t> root;       /* pointer -> variable */
+  KernelAccess found;
+  const auto touch = [&](const std::uint32_t pointer, const bool read, const bool write) {
+    const auto r = root.find(pointer);
+    if (r == root.end()) {
+      return;
+    }
+    const auto b = binding_of.find(r->second);
+    if (b == binding_of.end() || b->second < 1 || b->second > binding_count) {
+      return;
+    }
+    const std::uint32_t bit = 1u << (b->second - 1);
+    if (read) {
+      found.reads |= bit;
+    }
+    if (write) {
+      found.writes |= bit;
+    }
+  };
+  for (std::size_t i = 5; i < words;) {
+    const std::uint32_t op = code[i] & 0xffffu, count = code[i] >> 16;
+    if (count == 0 || i + count > words) {
+      return all;
+    }
+    const std::uint32_t *w = code + i;
+    switch (op) {
+      case 71: /* OpDecorate target Binding n */
+        if (count >= 4 && w[2] == 33) {
+          binding_of[w[1]] = w[3];
+        }
+        break;
+      case 59: /* OpVariable */
+        root[w[2]] = w[2];
+        break;
+      case 65: /* OpAccessChain */
+      case 66: /* OpInBoundsAccessChain */
+      case 67: /* OpPtrAccessChain */
+      case 70: /* OpInBoundsPtrAccessChain */
+      case 83: /* OpCopyObject */
+        if (root.count(w[3])) {
+          root[w[2]] = root[w[3]];
+        }
+        break;
+      case 61:  /* OpLoad */
+      case 227: /* OpAtomicLoad */
+        touch(w[3], true, false);
+        break;
+      case 62:  /* OpStore */
+      case 228: /* OpAtomicStore */
+        touch(w[1], false, true);
+        break;
+      case 63: /* OpCopyMemory */
+        touch(w[1], false, true);
+        touch(w[2], true, false);
+        break;
+      default:
+        if ((op >= 229 && op <= 242) || op == 6035 /* OpAtomicFAddEXT */) {
+          touch(w[3], true, true);
+        }
+        else if (op == 57 || op == 4 /* OpFunctionCall with pointers, OpCapability Addresses */) {
+          if (op == 57) {
+            /* Pointers passed to functions: count the buffers as read and written. */
+            for (std::uint32_t k = 4; k < count; ++k) {
+              touch(w[k], true, true);
+            }
+          }
+        }
+        break;
+    }
+    i += count;
+  }
+  return found;
+}
+
 constexpr std::uint32_t sets_per_pool = 256;
 constexpr std::uint32_t profile_capacity = 4096;
 
@@ -197,6 +301,16 @@ struct Compute::Impl {
   std::uint32_t queue_family = 0;
   VkCommandPool command_pool = VK_NULL_HANDLE;
   VkCommandBuffer commands = VK_NULL_HANDLE;
+  /**
+   * MANTA_GPU_CHUNK=N (N > 0): after every N recorded commands the command buffer is submitted
+   * without waiting and recording continues in the next one, so the device starts on the first
+   * commands while the host still records the rest. submit() waits for the last chunk only.
+   */
+  std::size_t chunk_commands = 0;
+  bool half_storage = false;
+  std::size_t commands_in_chunk = 0;
+  std::vector<VkCommandBuffer> chunks;
+  std::size_t chunk_index = 0;
   VkFence fence = VK_NULL_HANDLE;
   VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
   VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
@@ -215,6 +329,126 @@ struct Compute::Impl {
 
   Buffer dummy;
   bool recording = false;
+
+  /** Read and write sets of each kernel, from its SPIR-V. */
+  std::vector<KernelAccess> access;
+  /**
+   * Barrier placement. Off (the default): a full barrier after every command. On
+   * (MANTA_GPU_TRACKED_BARRIERS=1): a barrier only before a command that reads a buffer written,
+   * or writes a buffer read or written, since the last barrier.
+   */
+  bool tracked = false;
+  std::vector<std::uint64_t> pending_reads, pending_writes;
+  VkPipelineStageFlags pending_stages = 0;
+
+  static bool contains(const std::vector<std::uint64_t> &set, const std::uint64_t handle)
+  {
+    return std::find(set.begin(), set.end(), handle) != set.end();
+  }
+
+  /** Record the hazard of a command about to be recorded; emits a barrier first if needed. */
+  void before_command(const std::uint64_t *reads, const std::size_t read_count,
+                      const std::uint64_t *writes, const std::size_t write_count,
+                      const VkPipelineStageFlags stage)
+  {
+    if (!tracked) {
+      return;
+    }
+    bool hazard = false;
+    for (std::size_t i = 0; i < read_count && !hazard; ++i) {
+      hazard = contains(pending_writes, reads[i]);
+    }
+    for (std::size_t i = 0; i < write_count && !hazard; ++i) {
+      hazard = contains(pending_writes, writes[i]) || contains(pending_reads, writes[i]);
+    }
+    if (hazard) {
+      barrier_between(pending_stages, stage);
+      pending_reads.clear();
+      pending_writes.clear();
+      pending_stages = 0;
+    }
+    pending_reads.insert(pending_reads.end(), reads, reads + read_count);
+    pending_writes.insert(pending_writes.end(), writes, writes + write_count);
+    pending_stages |= stage;
+  }
+
+  /** After a recorded command: the untracked mode's full barrier, and the chunking. */
+  void after_command()
+  {
+    if (!tracked) {
+      barrier();
+    }
+    if (chunk_commands && ++commands_in_chunk >= chunk_commands) {
+      next_chunk();
+    }
+  }
+
+  /** Submit the commands recorded so far without waiting and continue in a new buffer. */
+  void next_chunk()
+  {
+    flush_pending();
+    check(vkEndCommandBuffer(commands), "vkEndCommandBuffer");
+    VkSubmitInfo submit_info{};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &commands;
+    MANTA_PERF(g_perf.chunk_submits++);
+    MANTA_PERF(chunk_index == 0 ? (g_perf.start_delay_ms += std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - g_perf.record_start)
+                                       .count()) : 0.0);
+    check(vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE), "vkQueueSubmit");
+    ++chunk_index;
+    if (chunk_index == chunks.size()) {
+      VkCommandBufferAllocateInfo info{};
+      info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+      info.commandPool = command_pool;
+      info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+      info.commandBufferCount = 1;
+      VkCommandBuffer buffer = VK_NULL_HANDLE;
+      check(vkAllocateCommandBuffers(device, &info, &buffer), "vkAllocateCommandBuffers");
+      chunks.push_back(buffer);
+    }
+    commands = chunks[chunk_index];
+    check(vkResetCommandBuffer(commands, 0), "vkResetCommandBuffer");
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(commands, &begin_info), "vkBeginCommandBuffer");
+    commands_in_chunk = 0;
+  }
+
+  /** Before the command buffer ends: order everything against later submissions. */
+  void flush_pending()
+  {
+    if (tracked && !pending_writes.empty()) {
+      barrier();
+    }
+    pending_reads.clear();
+    pending_writes.clear();
+    pending_stages = 0;
+  }
+
+  void barrier_between(const VkPipelineStageFlags src, const VkPipelineStageFlags dst) const
+  {
+    VkMemoryBarrier memory_barrier{};
+    memory_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    memory_barrier.srcAccessMask = 0;
+    if (src & VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) {
+      memory_barrier.srcAccessMask |= VK_ACCESS_SHADER_WRITE_BIT;
+    }
+    if (src & VK_PIPELINE_STAGE_TRANSFER_BIT) {
+      memory_barrier.srcAccessMask |= VK_ACCESS_TRANSFER_WRITE_BIT;
+    }
+    memory_barrier.dstAccessMask = 0;
+    if (dst & VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) {
+      memory_barrier.dstAccessMask |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    }
+    if (dst & VK_PIPELINE_STAGE_TRANSFER_BIT) {
+      memory_barrier.dstAccessMask |= VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    }
+    MANTA_PERF(g_perf.barriers++);
+    vkCmdPipelineBarrier(commands, src, dst, 0, 1, &memory_barrier, 0, nullptr, 0, nullptr);
+  }
 
   struct Staging {
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -361,6 +595,7 @@ struct Compute::Impl {
   /** Make every earlier write visible to every later command. */
   void barrier() const
   {
+    MANTA_PERF(g_perf.barriers++);
     VkMemoryBarrier memory_barrier{};
     memory_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     memory_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -451,6 +686,9 @@ struct Compute::Impl {
 Compute::Compute() : impl_(std::make_unique<Impl>())
 {
   Impl &v = *impl_;
+  if (const char *mode = std::getenv("MANTA_GPU_TRACKED_BARRIERS")) {
+    v.tracked = mode[0] == '1';
+  }
   load_vulkan_loader();
 
   VkApplicationInfo app{};
@@ -513,6 +751,25 @@ Compute::Compute() : impl_(std::make_unique<Impl>())
   device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   device_info.queueCreateInfoCount = 1;
   device_info.pQueueCreateInfos = &queue_info;
+  /* Channels may be stored as fp16 (storageBuffer16BitAccess, Vulkan 1.1 core; arithmetic
+   * stays fp32, so shaderFloat16 is not needed). Enabled only where the device has it. */
+  VkPhysicalDevice16BitStorageFeatures storage16{};
+  storage16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+  const auto get_features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+      vkGetInstanceProcAddr(v.instance, "vkGetPhysicalDeviceFeatures2"));
+  if (get_features2) {
+    VkPhysicalDeviceFeatures2 features{};
+    features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features.pNext = &storage16;
+    get_features2(v.physical, &features);
+  }
+  v.half_storage = storage16.storageBuffer16BitAccess == VK_TRUE;
+  VkPhysicalDevice16BitStorageFeatures enabled16{};
+  enabled16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+  enabled16.storageBuffer16BitAccess = VK_TRUE;
+  if (v.half_storage) {
+    device_info.pNext = &enabled16;
+  }
   check(vkCreateDevice(v.physical, &device_info, nullptr, &v.device), "vkCreateDevice");
   vkGetDeviceQueue(v.device, v.queue_family, 0, &v.queue);
 
@@ -529,6 +786,7 @@ Compute::Compute() : impl_(std::make_unique<Impl>())
   command_info.commandBufferCount = 1;
   check(vkAllocateCommandBuffers(v.device, &command_info, &v.commands),
         "vkAllocateCommandBuffers");
+  v.chunks.push_back(v.commands);
   VkFenceCreateInfo fence_info{};
   fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
   check(vkCreateFence(v.device, &fence_info, nullptr, &v.fence), "vkCreateFence");
@@ -618,6 +876,16 @@ bool Compute::has_timestamps() const
   return impl_->timestamps != VK_NULL_HANDLE;
 }
 
+bool Compute::supports_half_storage() const
+{
+  return impl_->half_storage;
+}
+
+void Compute::set_command_batch(const std::size_t dispatches)
+{
+  impl_->chunk_commands = dispatches;
+}
+
 void Compute::set_profiling(const bool enabled)
 {
   if (impl_->recording) {
@@ -694,6 +962,7 @@ int Compute::create_kernel(const std::uint32_t *spirv, const std::size_t word_co
   check(vkCreateComputePipelines(v.device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline),
         "vkCreateComputePipelines");
   v.pipelines.push_back(pipeline);
+  v.access.push_back(reflect_access(spirv, word_count));
   return static_cast<int>(v.pipelines.size()) - 1;
 }
 
@@ -703,6 +972,9 @@ void Compute::begin()
   if (v.recording) {
     throw std::logic_error("begin while recording");
   }
+  v.chunk_index = 0;
+  v.commands_in_chunk = 0;
+  v.commands = v.chunks[0];
   check(vkResetCommandBuffer(v.commands, 0), "vkResetCommandBuffer");
   VkCommandBufferBeginInfo begin_info{};
   begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -717,7 +989,11 @@ void Compute::begin()
     vkCmdResetQueryPool(v.commands, v.profile_pool, 0, profile_capacity);
     vkCmdWriteTimestamp(v.commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, v.profile_pool, 0);
   }
+  v.pending_reads.clear();
+  v.pending_writes.clear();
+  v.pending_stages = 0;
   v.recording = true;
+  MANTA_PERF(g_perf.record_start = std::chrono::steady_clock::now());
 }
 
 void Compute::upload(const Buffer &target, const void *data, const std::size_t bytes)
@@ -732,11 +1008,13 @@ void Compute::upload(const Buffer &target, const void *data, const std::size_t b
   VkBuffer staging = VK_NULL_HANDLE;
   VkDeviceSize offset = 0;
   std::memcpy(v.staging_buffer(bytes, staging, offset), data, bytes);
+  MANTA_PERF((g_perf.uploads++, g_perf.upload_bytes += bytes));
+  v.before_command(nullptr, 0, &target.handle, 1, VK_PIPELINE_STAGE_TRANSFER_BIT);
   VkBufferCopy region{};
   region.srcOffset = offset;
   region.size = bytes;
   vkCmdCopyBuffer(v.commands, staging, to_vk(target), 1, &region);
-  v.barrier();
+  v.after_command();
   v.mark("upload");
 }
 
@@ -752,11 +1030,13 @@ void Compute::download(const Buffer &source, void *out, const std::size_t bytes)
   VkBuffer staging = VK_NULL_HANDLE;
   VkDeviceSize offset = 0;
   void *mapped = v.staging_buffer(bytes, staging, offset);
+  MANTA_PERF((g_perf.downloads++, g_perf.download_bytes += bytes));
+  v.before_command(&source.handle, 1, nullptr, 0, VK_PIPELINE_STAGE_TRANSFER_BIT);
   VkBufferCopy region{};
   region.dstOffset = offset;
   region.size = bytes;
   vkCmdCopyBuffer(v.commands, to_vk(source), staging, 1, &region);
-  v.barrier();
+  v.after_command();
   v.mark("download");
   v.downloads.push_back({mapped, out, bytes});
 }
@@ -764,8 +1044,10 @@ void Compute::download(const Buffer &source, void *out, const std::size_t bytes)
 void Compute::fill(const Buffer &target, const std::uint32_t value)
 {
   Impl &v = *impl_;
+  MANTA_PERF(g_perf.fills++);
+  v.before_command(nullptr, 0, &target.handle, 1, VK_PIPELINE_STAGE_TRANSFER_BIT);
   vkCmdFillBuffer(v.commands, to_vk(target), 0, VK_WHOLE_SIZE, value);
-  v.barrier();
+  v.after_command();
   v.mark("fill");
 }
 
@@ -787,6 +1069,23 @@ void Compute::dispatch(const int kernel,
   if (push_bytes) {
     std::memcpy(push.data(), push_constants, push_bytes);
   }
+  MANTA_PERF((g_perf.dispatches++, g_perf.groups += group_count,
+              g_perf.tiny_dispatches += group_count <= 8 ? 1 : 0));
+  if (v.tracked) {
+    const KernelAccess &access = v.access.at(static_cast<std::size_t>(kernel));
+    std::uint64_t reads[binding_count], writes[binding_count];
+    std::size_t read_count = 0, write_count = 0;
+    for (std::size_t i = 0; i < binding_count; ++i) {
+      const std::uint64_t handle = (buffers[i] ? *buffers[i] : v.dummy).handle;
+      if (access.reads & (1u << i)) {
+        reads[read_count++] = handle;
+      }
+      if (access.writes & (1u << i)) {
+        writes[write_count++] = handle;
+      }
+    }
+    v.before_command(reads, read_count, writes, write_count, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  }
   const VkDescriptorSet set = v.descriptor_set(buffers);
   vkCmdBindPipeline(v.commands,
                     VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -800,7 +1099,7 @@ void Compute::dispatch(const int kernel,
                      static_cast<std::uint32_t>(push_constant_bytes),
                      push.data());
   vkCmdDispatch(v.commands, group_count, 1, 1);
-  v.barrier();
+  v.after_command();
   v.mark(label);
 }
 
@@ -810,6 +1109,7 @@ double Compute::submit()
   if (!v.recording) {
     throw std::logic_error("submit without begin");
   }
+  v.flush_pending();
   if (v.timestamps) {
     vkCmdWriteTimestamp(v.commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, v.timestamps, 1);
   }
@@ -821,8 +1121,18 @@ double Compute::submit()
   submit_info.commandBufferCount = 1;
   submit_info.pCommandBuffers = &v.commands;
   check(vkResetFences(v.device, 1, &v.fence), "vkResetFences");
+  MANTA_PERF(v.chunk_index == 0 ? (g_perf.start_delay_ms += std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - g_perf.record_start)
+                                       .count()) : 0.0);
+  MANTA_PERF((g_perf.submits++, g_perf.record_ms += std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - g_perf.record_start)
+                                     .count()));
+  const auto wait_start = std::chrono::steady_clock::now();
   check(vkQueueSubmit(v.queue, 1, &submit_info, v.fence), "vkQueueSubmit");
   check(vkWaitForFences(v.device, 1, &v.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+  MANTA_PERF(g_perf.wait_ms += std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - wait_start).count());
+  (void)wait_start;
 
   for (const Impl::PendingDownload &pending : v.downloads) {
     std::memcpy(pending.out, pending.mapped, pending.bytes);

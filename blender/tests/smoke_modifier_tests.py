@@ -645,6 +645,24 @@ def test_presets_fill_the_panel():
           "the simulation preset did not fill in its values")
 
 
+def test_speed_settings():
+    """Every Speed panel setting at once: the Explosion still simulates, rises and burns."""
+    reset()
+    obj, modifier = smoke_emitter(
+        probe=("density", 0.02), emitter={"Preset": "Explosion"},
+        **{"Voxel Size": 0.0625, "Preset": "Explosion", "Domain Size": (3.0, 3.0, 3.0),
+           "Open Borders": True, "Smoke Fade": 0.5, "Heat Fade": 0.3,
+           "Pressure Quality": "Medium", "Smoke Threshold": 0.001,
+           "Directional Margin": True, "Fast Turbulence": True, "Half Precision": True,
+           "Store Velocity": False, "Batch GPU Work": False})
+    smoke = run_until(obj, 10)
+    print(f"  smoke from x {smoke.left:.2f} to {smoke.right:.2f}, top {smoke.top:.2f}; "
+          f"flame {smoke.has_flame}; {smoke.warnings}")
+    check(not [w for w in smoke.warnings if w[0] == "ERROR"], f"errors: {smoke.warnings}")
+    check(smoke.right - smoke.left > 0.3, "the explosion did not spread")
+    check(smoke.has_flame, "the explosion did not burn")
+
+
 TESTS = [
     test_assets_install,
     test_modifier_emits_and_rises,
@@ -662,6 +680,7 @@ TESTS = [
     test_initial_velocity_from_motion,
     test_emitters_collection_and_plain_smoke,
     test_turbulence_layers_chain_in_order,
+    test_speed_settings,
 ]
 
 

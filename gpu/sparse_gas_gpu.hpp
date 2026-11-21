@@ -43,6 +43,13 @@ class SparseGasGpu {
   bool has_timestamps() const;
   /** Time each kernel separately. Adds a timestamp per command, so totals rise slightly. */
   void set_profiling(bool enabled);
+  /**
+   * Store the channels as 16-bit floats (Settings::half_precision). Changing it drops the device
+   * state: upload() must follow. Returns whether half precision is in use, which it is not on a
+   * device without 16-bit storage buffers.
+   */
+  bool set_half_precision(bool enabled);
+  bool half_precision() const;
 
   /**
    * Multigrid levels of at most this many cells are cycled together in one dispatch; 0 gives

@@ -4,8 +4,8 @@
 #extension GL_GOOGLE_include_directive : enable
 #include "mg_common.glsl"
 layout(std430, binding = 3) readonly buffer Links { uint links[]; };
-layout(std430, binding = 4) readonly buffer Rhs { float rhs[]; };
-layout(std430, binding = 5) buffer Values { float x[]; };
+layout(std430, binding = 4) readonly buffer Rhs { CH_T rhs[]; };
+layout(std430, binding = 5) buffer Values { CH_T x[]; };
 
 void main()
 {
@@ -24,11 +24,11 @@ void main()
   float sum = 0.0;
   for (int axis = 0; axis < 3; ++axis) {
     if (fine_linked(packed, 2 * axis)) {
-      sum += x[level_index(P.la, c - AXES[axis])];
+      sum += float(x[level_index(P.la, c - AXES[axis])]);
     }
     if (fine_linked(packed, 2 * axis + 1)) {
-      sum += x[level_index(P.la, c + AXES[axis])];
+      sum += float(x[level_index(P.la, c + AXES[axis])]);
     }
   }
-  x[index] = (rhs[index] + sum) / fine_diagonal(packed);
+  x[index] = QP((float(rhs[index]) + sum) / fine_diagonal(packed));
 }

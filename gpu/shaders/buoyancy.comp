@@ -18,14 +18,14 @@ void main()
   ivec3 below;
   below = c - ivec3(1, 0, 0);
   if (type_at(below) == CELL_FLUID) {
-    U[index] += 0.5 * P.a.x * (FACTOR[index] + FACTOR[index_of(below)]);
+    U[index] = QV(float(U[index]) + 0.5 * P.a.x * (float(FACTOR[index]) + float(FACTOR[index_of(below)])));
   }
   below = c - ivec3(0, 1, 0);
   if (type_at(below) == CELL_FLUID) {
-    V[index] += 0.5 * P.a.y * (FACTOR[index] + FACTOR[index_of(below)]);
+    V[index] = QV(float(V[index]) + 0.5 * P.a.y * (float(FACTOR[index]) + float(FACTOR[index_of(below)])));
   }
   below = c - ivec3(0, 0, 1);
   if (type_at(below) == CELL_FLUID) {
-    W[index] += 0.5 * P.a.z * (FACTOR[index] + FACTOR[index_of(below)]);
+    W[index] = QV(float(W[index]) + 0.5 * P.a.z * (float(FACTOR[index]) + float(FACTOR[index_of(below)])));
   }
 }

@@ -12,9 +12,9 @@
 #define V b7
 #define W b8
 #define FUEL b9
-layout(std430, binding = 12) buffer B12 { float flame[]; };
-layout(std430, binding = 13) buffer B13 { float EXPANSION[]; };
-layout(std430, binding = 14) buffer B14 { float BURN[]; };
+layout(std430, binding = 12) buffer B12 { CH_T flame[]; };
+layout(std430, binding = 13) buffer B13 { CH_T EXPANSION[]; };
+layout(std430, binding = 14) buffer B14 { CH_T BURN[]; };
 /* Per brick of the domain: the source's slot, or -1. */
 layout(std430, binding = 10) readonly buffer SourceTable { int source_table[]; };
 layout(std430, binding = 11) readonly buffer SourceValues { float source[]; };
@@ -25,19 +25,19 @@ void main()
   if (!voxel_in_range(index)) {
     return;
   }
-  EXPANSION[index] = 0.0;
-  BURN[index] = 0.0;
+  EXPANSION[index] = QS(0.0);
+  BURN[index] = QS(0.0);
   if (cell_type[index] == CELL_SOLID) {
-    DENSITY[index] = 0.0;
-    TEMPERATURE[index] = 0.0;
-    FUEL[index] = 0.0;
-    flame[index] = 0.0;
+    DENSITY[index] = QS(0.0);
+    TEMPERATURE[index] = QS(0.0);
+    FUEL[index] = QS(0.0);
+    flame[index] = QS(0.0);
     return;
   }
   if (P.flags.y == 0) {
     return;
   }
-  int size = P.extent.w;
+  int size = brick_size();
   int per_brick = size * size * size;
   int slot = index / per_brick;
   int source_slot = source_table[brick_coords[slot].w];
@@ -50,28 +50,28 @@ void main()
   float temperature = source[stride + at];
   float fuel = source[2 * stride + at];
   float expansion = source[3 * stride + at];
-  EXPANSION[index] = expansion;
+  EXPANSION[index] = QS(expansion);
   if (P.flags.x == 0) {
     if (density != 0.0) {
-      DENSITY[index] = max(DENSITY[index], density);
+      DENSITY[index] = QS(max(float(float(DENSITY[index])), density));
     }
     if (temperature != 0.0) {
-      TEMPERATURE[index] = max(TEMPERATURE[index], temperature);
+      TEMPERATURE[index] = QS(max(float(float(TEMPERATURE[index])), temperature));
     }
     if (fuel != 0.0) {
-      FUEL[index] = max(FUEL[index], fuel);
+      FUEL[index] = QS(max(float(float(FUEL[index])), fuel));
     }
   }
   else {
-    DENSITY[index] += density * P.a.x;
-    TEMPERATURE[index] += temperature * P.a.x;
-    FUEL[index] += fuel * P.a.x;
+    DENSITY[index] = QS(float(DENSITY[index]) + density * P.a.x);
+    TEMPERATURE[index] = QS(float(TEMPERATURE[index]) + temperature * P.a.x);
+    FUEL[index] = QS(float(FUEL[index]) + fuel * P.a.x);
   }
   if (P.flags.y >= 7 &&
       (density != 0.0 || temperature != 0.0 || fuel != 0.0 || expansion != 0.0))
   {
-    U[index] = source[4 * stride + at];
-    V[index] = source[5 * stride + at];
-    W[index] = source[6 * stride + at];
+    U[index] = QV(source[4 * stride + at]);
+    V[index] = QV(source[5 * stride + at]);
+    W[index] = QV(source[6 * stride + at]);
   }
 }

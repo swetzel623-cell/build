@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: MIT
+// Forward semi-Lagrangian pass of up to four cell-centred scalars (density, temperature, fuel,
+// flame) with one shared backtrace and one shared set of corner lookups. P.a.w = dt (P.a.xyz is
+// the cell-centre offset), P.flags.x midpoint trace, P.flags.y keep bounds for MacCormack,
+// P.flags.z number of channels (1-4). Bindings: 4-6 velocity, 7-10 sources, 11-14 results,
+// 15 bounds (8 floats per voxel: lowest, highest per channel).
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#define NO_FLOAT_CHANNELS
+#include "common.glsl"
+#include "advect_trace.glsl"
+layout(std430, binding = 7) readonly buffer S0 { CH_T s0[]; };
+layout(std430, binding = 8) readonly buffer S1 { CH_T s1[]; };
+layout(std430, binding = 9) readonly buffer S2 { CH_T s2[]; };
+layout(std430, binding = 10) readonly buffer S3 { CH_T s3[]; };
+layout(std430, binding = 11) writeonly buffer R0 { CH_T r0[]; };
+layout(std430, binding = 12) writeonly buffer R1 { CH_T r1[]; };
+layout(std430, binding = 13) writeonly buffer R2 { CH_T r2[]; };
+layout(std430, binding = 14) writeonly buffer R3 { CH_T r3[]; };
+layout(std430, binding = 15) writeonly buffer Bounds { float bounds[]; };
+
+float source(int k, int i)
+{
+  return k == 0 ? float(s0[i]) : k == 1 ? float(s1[i]) : k == 2 ? float(s2[i]) : float(s3[i]);
+}
+void store(int k, int i, float v)
+{
+  if (k == 0) r0[i] = STORE(v);
+  else if (k == 1) r1[i] = STORE(v);
+  else if (k == 2) r2[i] = STORE(v);
+  else r3[i] = STORE(v);
+}
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index)) {
+    return;
+  }
+  int count = P.flags.z;
+  if (cell_type[index] == CELL_SOLID) {
+    for (int k = 0; k < 4; ++k) {
+      if (k < count) store(k, index, 0.0);
+    }
+    return;
+  }
+  vec3 p = vec3(coords_of(index)) + P.a.xyz;
+  vec3 from = trace(p, -P.a.w);
+  vec3 f = from - P.a.xyz;
+  vec3 base = floor(f);
+  ivec3 corner_base = ivec3(base);
+  vec3 t = f - base;
+  int corner_index[8];
+  bool stored = true;
+  for (int corner = 0; corner < 8; ++corner) {
+    int i = index_of(corner_base + ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1));
+    corner_index[corner] = i;
+    if (P.flags.y != 0) {
+      stored = stored && i >= 0 && cell_type[i] != CELL_SOLID;
+    }
+  }
+  for (int k = 0; k < 4; ++k) {
+    if (k >= count) {
+      break;
+    }
+    float value[8];
+    float lowest = 0.0, highest = 0.0;
+    for (int corner = 0; corner < 8; ++corner) {
+      int i = corner_index[corner];
+      value[corner] = i < 0 ? 0.0 : source(k, i);
+      lowest = corner == 0 ? value[corner] : min(lowest, value[corner]);
+      highest = corner == 0 ? value[corner] : max(highest, value[corner]);
+    }
+    store(k, index, lerp8(value, t));
+    if (P.flags.y != 0) {
+      bounds[8 * index + 2 * k] = stored ? lowest : 1.0;
+      bounds[8 * index + 2 * k + 1] = stored ? highest : 0.0;
+    }
+  }
+}

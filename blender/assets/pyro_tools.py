@@ -192,8 +192,9 @@ class VIEW3D_PT_pyro(bpy.types.Panel):
         col = box.column(align=True)
         col.label(text="Happy with it? Bake, then play or render.")
         col.label(text="To change settings, delete the bake first.")
-        col.label(text="Unbaked, Blender keeps every frame in memory:", icon="INFO")
-        col.label(text="bake long or large simulations to disk.")
+        col.label(text="Played frames stay in memory, baked or not.", icon="INFO")
+        col.label(text="To use less: Speed panel, Store Velocity off,")
+        col.label(text="Open Borders, Smoke Fade.")
 
 
 CLASSES = (PYRO_OT_bake, PYRO_OT_delete_bake, PYRO_OT_show_flames, VIEW3D_PT_pyro)

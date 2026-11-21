@@ -11,7 +11,7 @@ void main()
   if (!voxel_in_range(index)) {
     return;
   }
-  b7[index] = 2.0 * b4[index] - b7[index];
-  b8[index] = 2.0 * b5[index] - b8[index];
-  b9[index] = 2.0 * b6[index] - b9[index];
+  b7[index] = QV(2.0 * float(b4[index]) - float(b7[index]));
+  b8[index] = QV(2.0 * float(b5[index]) - float(b8[index]));
+  b9[index] = QV(2.0 * float(b6[index]) - float(b9[index]));
 }

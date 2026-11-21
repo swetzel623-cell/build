@@ -12,9 +12,9 @@
 #define EXPANSION b8
 #define BURN b9
 
-float fetch_u(ivec3 c) { int i = index_of(c); return i < 0 ? 0.0 : U[i]; }
-float fetch_v(ivec3 c) { int i = index_of(c); return i < 0 ? 0.0 : V[i]; }
-float fetch_w(ivec3 c) { int i = index_of(c); return i < 0 ? 0.0 : W[i]; }
+float fetch_u(ivec3 c) { int i = index_of(c); return i < 0 ? 0.0 : float(U[i]); }
+float fetch_v(ivec3 c) { int i = index_of(c); return i < 0 ? 0.0 : float(V[i]); }
+float fetch_w(ivec3 c) { int i = index_of(c); return i < 0 ? 0.0 : float(W[i]); }
 
 void main()
 {
@@ -23,15 +23,15 @@ void main()
     return;
   }
   if (cell_type[index] != CELL_FLUID) {
-    RESULT[index] = 0.0;
+    RESULT[index] = QP(0.0);
     return;
   }
   ivec3 c = coords_of(index);
-  float divergence = fetch_u(c + ivec3(1, 0, 0)) - U[index] + fetch_v(c + ivec3(0, 1, 0)) -
-                     V[index] + fetch_w(c + ivec3(0, 0, 1)) - W[index];
+  float divergence = fetch_u(c + ivec3(1, 0, 0)) - float(U[index]) + fetch_v(c + ivec3(0, 1, 0)) -
+                     float(V[index]) + fetch_w(c + ivec3(0, 0, 1)) - float(W[index]);
   if (P.flags.x != 0) {
-    float target = EXPANSION[index] + P.a.y * BURN[index];
+    float target = float(EXPANSION[index]) + P.a.y * float(BURN[index]);
     divergence = divergence - target;
   }
-  RESULT[index] = P.a.x * divergence;
+  RESULT[index] = QP(P.a.x * divergence);
 }

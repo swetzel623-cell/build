@@ -269,6 +269,12 @@ double median(std::vector<double> values)
 
 bool use_jacobi = false;
 bool first_order = false;
+bool cold_pressure = false;
+bool turbulence_once = false;
+int command_batch = 64;
+int half_precision = 0;
+bool open_borders = false;
+float fade_rate = 0.0f;
 float cfl = -1.0f;
 constexpr float frame_time = 1.0f / 30.0f;
 int multigrid_w_depth = -1;
@@ -337,6 +343,13 @@ sparse::Settings test_settings(const int resolution)
   if (first_order) {
     settings.advection = sparse::Advection::SemiLagrangian;
   }
+  settings.pressure_warm_start = !cold_pressure;
+  settings.turbulence_once = turbulence_once;
+  settings.command_batch = command_batch;
+  settings.half_precision = half_precision;
+  settings.open_borders = open_borders;
+  settings.density_fade = fade_rate;
+  settings.temperature_fade = fade_rate;
   if (use_jacobi) {
     settings.pressure_solver = sparse::PressureSolver::Jacobi;
     settings.pressure_iterations = 60;
@@ -394,7 +407,21 @@ int compare(gpu::SparseGasGpu &solver, const int resolution, const int steps)
       return 1;
     }
     if (cpu.topology.cell_type != device.topology.cell_type) {
-      std::cout << "FAIL: GPU cell classification differs from the CPU at step " << i << '\n';
+      std::size_t differ = 0, first = 0;
+      for (std::size_t k = 0; k < cpu.topology.cell_type.size() &&
+                              k < device.topology.cell_type.size();
+           ++k)
+      {
+        if (cpu.topology.cell_type[k] != device.topology.cell_type[k]) {
+          first = differ++ == 0 ? k : first;
+        }
+      }
+      std::cout << "FAIL: GPU cell classification differs from the CPU at step " << i << " ("
+                << differ << " cells; first: slot " << first / 512 << " voxel " << first % 512
+                << ", CPU " << (cpu.topology.cell_type.size() > first ? cpu.topology.cell_type[first] : 9)
+                << ", device "
+                << (device.topology.cell_type.size() > first ? device.topology.cell_type[first] : 9)
+                << ")\n";
       return 1;
     }
     const float scale = std::max(1.0f, max_abs(cpu.w));
@@ -410,7 +437,9 @@ int compare(gpu::SparseGasGpu &solver, const int resolution, const int steps)
               << " bricks, peak |w| " << max_abs(cpu.w)
               << ", divergence left " << relative_divergence(device)
               << ", largest CPU/device difference " << worst << '\n';
-    if (!(worst < 1.0e-4f)) {
+    /* 16-bit channels round every stored value to about 3 decimal digits. */
+    const float allowed = half_precision ? 2.0e-2f : 1.0e-4f;
+    if (!(worst < allowed)) {
       std::cout << "FAIL: device result differs from the CPU reference\n";
       return 1;
     }
@@ -531,6 +560,24 @@ int main(int argc, char **argv)
     else if (std::string(argv[i]) == "--cfl" && i + 1 < argc) {
       cfl = static_cast<float>(std::atof(argv[++i]));
     }
+    else if (std::string(argv[i]) == "--turbulence-once") {
+      turbulence_once = true;
+    }
+    else if (std::string(argv[i]) == "--batch" && i + 1 < argc) {
+      command_batch = std::atoi(argv[++i]);
+    }
+    else if (std::string(argv[i]) == "--open") {
+      open_borders = true;
+    }
+    else if (std::string(argv[i]) == "--fade" && i + 1 < argc) {
+      fade_rate = static_cast<float>(std::atof(argv[++i]));
+    }
+    else if (std::string(argv[i]) == "--half" && i + 1 < argc) {
+      half_precision = std::atoi(argv[++i]);
+    }
+    else if (std::string(argv[i]) == "--cold-pressure") {
+      cold_pressure = true;
+    }
     else if (std::string(argv[i]) == "--first-order") {
       first_order = true;
     }
@@ -622,6 +669,10 @@ int main(int argc, char **argv)
             << (solver->is_software_device() ? " (software)" : "")
             << (solver->has_timestamps() ? "" : " (no GPU timestamps)") << '\n';
 
+  if (half_precision && !solver->set_half_precision(true)) {
+    std::cout << "SKIP: the device has no 16-bit storage buffers\n";
+    return 77;
+  }
   if (tiny_limit >= 0) {
     solver->set_single_dispatch_cell_limit(static_cast<std::size_t>(tiny_limit));
     std::cout << "Single-dispatch level limit: " << tiny_limit << " cells\n";

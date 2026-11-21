@@ -18,16 +18,16 @@ void main()
     return;
   }
   float capacity = P.a.x;
-  float flame = max(FLAME[index] - P.a.y, 0.0);
-  float fuel = FUEL[index];
-  BURN[index] = 0.0;
+  float flame = max(float(FLAME[index]) - P.a.y, 0.0);
+  float fuel = float(FUEL[index]);
+  BURN[index] = QS(0.0);
   if (fuel > 0.0 && capacity > 0.0) {
     float burnt = min(fuel, capacity);
-    BURN[index] = burnt / intBitsToFloat(P.flags.x);
-    FUEL[index] = fuel - burnt;
-    TEMPERATURE[index] += P.a.z * burnt;
-    DENSITY[index] += P.a.w * burnt;
+    BURN[index] = QS(burnt / intBitsToFloat(P.flags.x));
+    FUEL[index] = QS(fuel - burnt);
+    TEMPERATURE[index] = QS(float(TEMPERATURE[index]) + P.a.z * burnt);
+    DENSITY[index] = QS(float(DENSITY[index]) + P.a.w * burnt);
     flame = max(flame, min(fuel, 1.0));
   }
-  FLAME[index] = flame;
+  FLAME[index] = QS(flame);
 }

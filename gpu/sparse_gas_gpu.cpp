@@ -4,47 +4,155 @@
 #include "vulkan_compute.hpp"
 
 #include "activity.comp.h"
+#include "activity_half.comp.h"
 #include "advect.comp.h"
+#include "advect_half.comp.h"
 #include "buoyancy.comp.h"
+#include "buoyancy_half.comp.h"
 #include "classify.comp.h"
+#include "classify_half.comp.h"
 #include "classify_links.comp.h"
+#include "classify_links_half.comp.h"
 #include "mask_pressure.comp.h"
+#include "mask_pressure_half.comp.h"
 #include "mg_smooth0.comp.h"
+#include "mg_smooth0_half.comp.h"
 #include "mg_restrict0.comp.h"
+#include "mg_restrict0_half.comp.h"
 #include "conserve_apply.comp.h"
+#include "conserve_apply_half.comp.h"
 #include "conserve_reduce.comp.h"
+#include "conserve_reduce_half.comp.h"
 #include "copy3.comp.h"
+#include "copy3_half.comp.h"
 #include "reflect.comp.h"
+#include "reflect_half.comp.h"
 #include "mg_residual.comp.h"
+#include "mg_residual_half.comp.h"
 #include "mg_smooth.comp.h"
+#include "mg_smooth_half.comp.h"
 #include "mg_restrict.comp.h"
+#include "mg_restrict_half.comp.h"
 #include "mg_prolong0.comp.h"
+#include "mg_prolong0_half.comp.h"
 #include "mg_prolong.comp.h"
+#include "mg_prolong_half.comp.h"
 #include "mg_build0.comp.h"
+#include "mg_build0_half.comp.h"
 #include "mg_build.comp.h"
+#include "mg_build_half.comp.h"
 #include "mg_dense_cycle.comp.h"
+#include "mg_dense_cycle_half.comp.h"
 #include "divergence.comp.h"
+#include "divergence_half.comp.h"
 #include "gradient.comp.h"
+#include "gradient_half.comp.h"
 #include "inject.comp.h"
+#include "inject_half.comp.h"
 #include "jacobi.comp.h"
+#include "jacobi_half.comp.h"
 #include "maccormack.comp.h"
+#include "maccormack_half.comp.h"
+#include "advect4.comp.h"
+#include "advect4_half.comp.h"
+#include "maccormack4.comp.h"
+#include "maccormack4_half.comp.h"
+#include "conserve_reduce4.comp.h"
+#include "conserve_reduce4_half.comp.h"
+#include "conserve_apply4.comp.h"
+#include "conserve_apply4_half.comp.h"
+#include "advect3.comp.h"
+#include "advect3_half.comp.h"
+#include "maccormack3.comp.h"
+#include "maccormack3_half.comp.h"
 #include "remap.comp.h"
+#include "remap_half.comp.h"
 #include "turbulence.comp.h"
+#include "turbulence_half.comp.h"
 #include "combust.comp.h"
+#include "combust_half.comp.h"
 #include "speed.comp.h"
+#include "speed_half.comp.h"
 #include "walls.comp.h"
+#include "fade.comp.h"
+#include "fade_half.comp.h"
+#include "walls_half.comp.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
+#define MANTA_GPU_KERNELS(X) \
+  X(advect) X(maccormack) X(buoyancy) X(walls) X(divergence) X(jacobi) \
+  X(gradient) X(activity) X(remap) X(classify) X(classify_links) X(mask_pressure) \
+  X(mg_smooth0) X(mg_restrict0) X(copy3) X(reflect) X(conserve_reduce) X(conserve_apply) \
+  X(advect4) X(maccormack4) X(conserve_reduce4) X(conserve_apply4) X(advect3) X(maccormack3) \
+  X(inject) X(turbulence) X(combust) X(speed) X(mg_residual) X(mg_smooth) \
+  X(mg_restrict) X(mg_prolong0) X(mg_prolong) X(mg_build0) X(mg_build) X(mg_dense_cycle) X(fade)
+
 namespace manta_improve::gpu {
 namespace {
+
+std::uint16_t float_to_half(const float value)
+{
+  std::uint32_t b;
+  std::memcpy(&b, &value, 4);
+  const std::uint32_t sign = (b >> 16) & 0x8000u;
+  const std::int32_t e = static_cast<std::int32_t>((b >> 23) & 0xff) - 127 + 15;
+  std::uint32_t m = b & 0x7fffffu;
+  if (((b >> 23) & 0xff) == 0xff) {
+    return static_cast<std::uint16_t>(sign | 0x7c00u | (m ? 0x200u : 0u));
+  }
+  if (e >= 31) {
+    return static_cast<std::uint16_t>(sign | 0x7bffu); /* saturate at 65504 */
+  }
+  if (e <= 0) {
+    if (e < -10) {
+      return static_cast<std::uint16_t>(sign);
+    }
+    m |= 0x800000u;
+    const int shift = 14 - e;
+    std::uint32_t h = m >> shift;
+    const std::uint32_t rest = m & ((1u << shift) - 1u), half = 1u << (shift - 1);
+    if (rest > half || (rest == half && (h & 1u))) {
+      ++h;
+    }
+    return static_cast<std::uint16_t>(sign | h);
+  }
+  std::uint32_t h = (static_cast<std::uint32_t>(e) << 10) | (m >> 13);
+  const std::uint32_t rest = m & 0x1fffu;
+  if (rest > 0x1000u || (rest == 0x1000u && (h & 1u))) {
+    ++h; /* may carry into the exponent, which is right */
+  }
+  if (h >= 0x7c00u) {
+    h = 0x7bffu;
+  }
+  return static_cast<std::uint16_t>(sign | h);
+}
+
+float half_to_float(const std::uint16_t h)
+{
+  const std::uint32_t sign = (h & 0x8000u) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ffu;
+  float value;
+  if (e == 0) {
+    value = std::ldexp(static_cast<float>(m), -24);
+    std::uint32_t b;
+    std::memcpy(&b, &value, 4);
+    b |= sign;
+    std::memcpy(&value, &b, 4);
+    return value;
+  }
+  const std::uint32_t b = sign | (e == 31 ? 0x7f800000u | (m << 13) : ((e + 112) << 23) | (m << 13));
+  std::memcpy(&value, &b, 4);
+  return value;
+}
+
 
 /** Push constants of the stencil kernels; matches Params in common.glsl. */
 struct Params {
@@ -59,6 +167,7 @@ struct ActivityParams {
   std::int32_t count;
   float scalar_threshold;
   float velocity_threshold;
+  std::int32_t reach;
 };
 
 /** Push constants of the multigrid kernels; matches Params in mg_common.glsl. */
@@ -124,8 +233,37 @@ struct SparseGasGpu::Impl {
   Compute compute;
   int advect, maccormack, buoyancy, walls, divergence, jacobi, gradient, activity, remap, classify;
   int classify_links, mask_pressure, mg_smooth0, mg_restrict0, mg_smooth, mg_residual, copy3, reflect;
+  int advect4, maccormack4, conserve_reduce4, conserve_apply4, advect3, maccormack3;
   int conserve_reduce, conserve_apply, inject, turbulence, combust, speed;
-  int mg_restrict, mg_prolong0, mg_prolong, mg_build0, mg_build, mg_dense_cycle;
+  int mg_restrict, mg_prolong0, mg_prolong, mg_build0, mg_build, mg_dense_cycle, fade;
+  /** Channels stored as 16-bit floats: the `_half` kernel variants and 2 bytes per voxel. */
+  bool half = false;
+  std::array<std::vector<int>, 2> kernel_sets;
+
+  std::size_t channel_bytes() const
+  {
+    return half ? 2 : 4;
+  }
+
+  /** Point the kernel ids at the full or half precision variants, creating them once. */
+  void use_kernels(const bool use_half)
+  {
+    std::vector<int> &set = kernel_sets[use_half ? 1 : 0];
+    if (set.empty()) {
+#define MANTA_CREATE(name) \
+  set.push_back(use_half ? \
+                    compute.create_kernel(name##_half_spv, \
+                                          sizeof(name##_half_spv) / sizeof(std::uint32_t)) : \
+                    compute.create_kernel(name##_spv, sizeof(name##_spv) / sizeof(std::uint32_t)));
+      MANTA_GPU_KERNELS(MANTA_CREATE)
+#undef MANTA_CREATE
+    }
+    std::size_t k = 0;
+#define MANTA_ASSIGN(name) name = set[k++];
+    MANTA_GPU_KERNELS(MANTA_ASSIGN)
+#undef MANTA_ASSIGN
+    half = use_half;
+  }
 
   /** One coarse multigrid level on the device. */
   struct Level {
@@ -172,40 +310,64 @@ struct SparseGasGpu::Impl {
   /** Largest velocity component at the start of the last step. */
   float last_speed = 0.0f;
 
+  /**
+   * MANTA_GPU_FUSE_SUBMITS=1: each step's submission ends with the activity pass of the next
+   * step, and the sources upload rides in the next step's submission, so a substep is one
+   * submit and wait instead of two (and a frame saves the sources submit).
+   */
+  bool fuse_submits = true;
+  /** Activity of the current state, read back at the end of the last step. */
+  std::vector<std::uint32_t> next_flags;
+  std::vector<float> next_speeds;
+  bool next_valid = false;
+  bool next_directional = false;
+  float next_scalar_threshold = 0.0f, next_velocity_threshold = 0.0f;
+  /** Sources to upload at the start of the next step's submission. */
+  const sparse::BrickField *pending_sources = nullptr;
+
+  /** Record the activity pass over the current topology, read back into the two vectors. */
+  void record_activity(const sparse::Settings &settings, std::vector<std::uint32_t> &out_flags,
+                       std::vector<float> &out_speeds)
+  {
+    const std::size_t slots = topology.brick_count();
+    out_flags.assign(slots, 0);
+    out_speeds.assign(slots, 0.0f);
+    const ActivityParams params = {static_cast<std::int32_t>(topology.voxels_per_brick()),
+                                   static_cast<std::int32_t>(topology.voxel_count()),
+                                   settings.thresholds.scalar,
+                                   settings.thresholds.velocity,
+                                   settings.directional_dilation ? 1 : 0};
+    compute.fill(flags, 0);
+    compute.fill(speeds, 0);
+    compute.dispatch(activity,
+                     &params,
+                     sizeof(params),
+                     {&channel(Density),
+                      &channel(Temperature),
+                      &channel(U),
+                      &channel(V),
+                      &channel(W),
+                      &flags,
+                      &speeds,
+                      &channel(Fuel),
+                      &channel(Flame)},
+                     groups_for(topology.voxel_count()),
+                     "activity");
+    compute.download(flags, out_flags.data(), slots * sizeof(std::uint32_t));
+    /* The speeds were accumulated as bit patterns; they are floats. */
+    compute.download(speeds, out_speeds.data(), slots * sizeof(float));
+  }
+
   Impl()
   {
-#define KERNEL(name) compute.create_kernel(name##_spv, sizeof(name##_spv) / sizeof(std::uint32_t))
-    advect = KERNEL(advect);
-    maccormack = KERNEL(maccormack);
-    buoyancy = KERNEL(buoyancy);
-    walls = KERNEL(walls);
-    divergence = KERNEL(divergence);
-    jacobi = KERNEL(jacobi);
-    gradient = KERNEL(gradient);
-    activity = KERNEL(activity);
-    remap = KERNEL(remap);
-    classify = KERNEL(classify);
-    classify_links = KERNEL(classify_links);
-    mask_pressure = KERNEL(mask_pressure);
-    mg_smooth0 = KERNEL(mg_smooth0);
-    mg_restrict0 = KERNEL(mg_restrict0);
-    copy3 = KERNEL(copy3);
-    reflect = KERNEL(reflect);
-    conserve_reduce = KERNEL(conserve_reduce);
-    conserve_apply = KERNEL(conserve_apply);
-    inject = KERNEL(inject);
-    turbulence = KERNEL(turbulence);
-    combust = KERNEL(combust);
-    speed = KERNEL(speed);
-    mg_residual = KERNEL(mg_residual);
-    mg_smooth = KERNEL(mg_smooth);
-    mg_restrict = KERNEL(mg_restrict);
-    mg_prolong0 = KERNEL(mg_prolong0);
-    mg_prolong = KERNEL(mg_prolong);
-    mg_build0 = KERNEL(mg_build0);
-    mg_build = KERNEL(mg_build);
-    mg_dense_cycle = KERNEL(mg_dense_cycle);
-#undef KERNEL
+use_kernels(false);
+    /* Exact; MANTA_GPU_FUSE_SUBMITS=0 turns it off for comparison. */
+    if (const char *fuse = std::getenv("MANTA_GPU_FUSE_SUBMITS")) {
+      fuse_submits = fuse[0] != '0';
+    }
+    if (const char *limit = std::getenv("MANTA_GPU_SINGLE_DISPATCH_CELLS")) {
+      single_dispatch_cell_limit = static_cast<std::size_t>(std::atol(limit));
+    }
   }
 
   ~Impl()
@@ -261,8 +423,8 @@ struct SparseGasGpu::Impl {
     }
     ensure(types, next.voxel_count() * sizeof(std::uint32_t));
     ensure(links, next.voxel_count() * sizeof(std::uint32_t));
-    ensure(bounds, next.voxel_count() * 2 * sizeof(float));
-    ensure(partials, (4 + 4 * groups_for(next.voxel_count())) * sizeof(float));
+    ensure(bounds, next.voxel_count() * 8 * sizeof(float));
+    ensure(partials, (8 + 12 * groups_for(next.voxel_count())) * sizeof(float));
 
     const std::vector<sparse::MultigridLevel> layout = sparse::multigrid_layout(next);
     bool same_shape = layout.size() == levels.size();
@@ -524,7 +686,11 @@ struct SparseGasGpu::Impl {
 
   Params params(const float a0, const float a1, const float a2, const float a3) const
   {
-    return {{topology.extent.x, topology.extent.y, topology.extent.z, topology.brick_size},
+    /* The brick size, with bit 8 set for open borders (see is_wall in common.glsl). */
+    return {{topology.extent.x,
+             topology.extent.y,
+             topology.extent.z,
+             topology.brick_size | (topology.extent.open ? 256 : 0)},
             {topology.brick_extent.x,
              topology.brick_extent.y,
              topology.brick_extent.z,
@@ -588,6 +754,28 @@ struct SparseGasGpu::Impl {
                      groups ? groups : groups_for(topology.voxel_count()),
                      label);
   }
+
+  /** Dispatch with logical channels (or -1) at bindings 4-14 and raw buffers at 15 and 16. */
+  void fused(const int kernel,
+             const char *label,
+             const Params &p,
+             const std::array<int, 11> &channels,
+             const Compute::Buffer *c15,
+             const Compute::Buffer *c16,
+             const std::uint32_t groups = 0)
+  {
+    Compute::Bindings b{};
+    b[0] = &table;
+    b[1] = &coords;
+    b[2] = &types;
+    for (std::size_t i = 0; i < channels.size(); ++i) {
+      b[3 + i] = channels[i] < 0 ? nullptr : &channel(channels[i]);
+    }
+    b[14] = c15;
+    b[15] = c16;
+    compute.dispatch(kernel, &p, sizeof(p), b,
+                     groups ? groups : groups_for(topology.voxel_count()), label);
+  }
 };
 
 SparseGasGpu::SparseGasGpu() : impl_(std::make_unique<Impl>()) {}
@@ -613,6 +801,28 @@ void SparseGasGpu::set_single_dispatch_cell_limit(const std::size_t cells)
   impl_->single_dispatch_cell_limit = cells;
 }
 
+bool SparseGasGpu::set_half_precision(const bool enabled)
+{
+  Impl &g = *impl_;
+  const bool wanted = enabled && g.compute.supports_half_storage();
+  if (wanted != g.half) {
+    /* The channel buffers change size: the state must be uploaded again. */
+    for (Compute::Buffer &buffer : g.buffers) {
+      g.compute.destroy_buffer(buffer);
+    }
+    g.buffers.clear();
+    g.voxel_capacity = 0;
+    g.next_valid = false;
+    g.use_kernels(wanted);
+  }
+  return g.half;
+}
+
+bool SparseGasGpu::half_precision() const
+{
+  return impl_->half;
+}
+
 void SparseGasGpu::set_profiling(const bool enabled)
 {
   impl_->compute.set_profiling(enabled);
@@ -635,12 +845,13 @@ void SparseGasGpu::upload(const sparse::State &state)
     g.voxel_capacity = count + count / 2;
     g.buffers.assign(AllChannels, {});
     for (Compute::Buffer &buffer : g.buffers) {
-      buffer = g.compute.create_buffer(g.voxel_capacity * sizeof(float));
+      buffer = g.compute.create_buffer(g.voxel_capacity * g.channel_bytes());
     }
   }
   for (int i = 0; i < AllChannels; ++i) {
     g.role[static_cast<std::size_t>(i)] = i;
   }
+  g.next_valid = false;
   g.topology = state.topology;
   g.topology.cell_type.clear();
   const std::vector<std::uint32_t> &mask = g.topology.obstacle;
@@ -664,9 +875,18 @@ void SparseGasGpu::upload(const sparse::State &state)
                                                        &state.flame,
                                                        &state.expansion,
                                                        &state.burn};
+  std::vector<std::uint16_t> packed(g.half ? count : 0);
   for (int i = 0; i < StateChannels; ++i) {
     if (channels[i]->size() == count) {
-      g.compute.upload(g.channel(i), channels[i]->data(), count * sizeof(float));
+      if (g.half) {
+        for (std::size_t k = 0; k < count; ++k) {
+          packed[k] = float_to_half((*channels[i])[k]);
+        }
+        g.compute.upload(g.channel(i), packed.data(), count * g.channel_bytes());
+      }
+      else {
+        g.compute.upload(g.channel(i), channels[i]->data(), count * sizeof(float));
+      }
     }
     else if (count > 0) {
       /* A state from before fire existed: no fuel or flame. */
@@ -713,6 +933,7 @@ void SparseGasGpu::use_sources(const sparse::Sources *sources)
   Impl &g = *impl_;
   g.source_bricks.clear();
   g.source_channels = 0;
+  g.pending_sources = nullptr;
   if (!sources || sources->field.empty()) {
     return;
   }
@@ -728,6 +949,10 @@ void SparseGasGpu::use_sources(const sparse::Sources *sources)
     if (field.table[brick] >= 0) {
       g.source_bricks.push_back(static_cast<std::int32_t>(brick));
     }
+  }
+  if (g.fuse_submits) {
+    g.pending_sources = &field;
+    return;
   }
   g.compute.begin();
   g.record_field(field, g.source_table, g.source_values);
@@ -758,10 +983,25 @@ void SparseGasGpu::download(sparse::State &state)
   state.topology.cell_type.assign(count, 0);
   g.compute.begin();
   g.compute.download(g.types, state.topology.cell_type.data(), count * sizeof(std::uint32_t));
+  std::vector<std::vector<std::uint16_t>> packed(
+      StateChannels, std::vector<std::uint16_t>(g.half ? count : 0));
   for (int i = 0; i < StateChannels; ++i) {
-    g.compute.download(g.channel(i), channels[i]->data(), count * sizeof(float));
+    if (g.half) {
+      g.compute.download(
+          g.channel(i), packed[static_cast<std::size_t>(i)].data(), count * g.channel_bytes());
+    }
+    else {
+      g.compute.download(g.channel(i), channels[i]->data(), count * sizeof(float));
+    }
   }
   g.compute.submit();
+  if (g.half) {
+    for (int i = 0; i < StateChannels; ++i) {
+      for (std::size_t k = 0; k < count; ++k) {
+        (*channels[i])[k] = half_to_float(packed[static_cast<std::size_t>(i)][k]);
+      }
+    }
+  }
 }
 
 void SparseGasGpu::download_shown(sparse::State &state, const bool fire, const bool pressure)
@@ -803,12 +1043,27 @@ void SparseGasGpu::download_shown(sparse::State &state, const bool fire, const b
     return;
   }
   g.compute.begin();
+  std::vector<std::vector<std::uint16_t>> packed(StateChannels);
   for (const Wanted &item : channels) {
-    if (item.wanted) {
+    if (item.wanted && g.half) {
+      packed[static_cast<std::size_t>(item.channel)].resize(count);
+      g.compute.download(g.channel(item.channel),
+                         packed[static_cast<std::size_t>(item.channel)].data(),
+                         count * g.channel_bytes());
+    }
+    else if (item.wanted) {
       g.compute.download(g.channel(item.channel), item.values->data(), count * sizeof(float));
     }
   }
   g.compute.submit();
+  for (const Wanted &item : channels) {
+    if (item.wanted && g.half) {
+      const std::vector<std::uint16_t> &from = packed[static_cast<std::size_t>(item.channel)];
+      for (std::size_t k = 0; k < count; ++k) {
+        (*item.values)[k] = half_to_float(from[k]);
+      }
+    }
+  }
 }
 
 sparse::StepInfo SparseGasGpu::step(const sparse::Settings &settings,
@@ -861,6 +1116,8 @@ sparse::FrameInfo SparseGasGpu::advance(const sparse::Settings &settings,
 
 sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const float *remaining)
 {
+  impl_->compute.set_command_batch(
+      static_cast<std::size_t>(std::max(0, settings.command_batch)));
   if (settings.pressure_solver == sparse::PressureSolver::ConjugateGradient ||
       settings.pressure_iterations < 1)
   {
@@ -883,11 +1140,22 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
   const std::size_t old_slots = old_topology.brick_count();
   std::vector<std::uint32_t> slot_flags(old_slots, 0);
   std::vector<float> slot_speeds(old_slots, 0.0f);
-  if (old_slots > 0) {
+  /* With fused submits the previous step already read the activity at its end. */
+  const bool cached = g.fuse_submits && g.next_valid && g.next_flags.size() == old_slots &&
+                      g.next_scalar_threshold == settings.thresholds.scalar &&
+                      g.next_velocity_threshold == settings.thresholds.velocity &&
+                      g.next_directional == settings.directional_dilation;
+  g.next_valid = false;
+  if (cached) {
+    slot_flags.swap(g.next_flags);
+    slot_speeds.swap(g.next_speeds);
+  }
+  else if (old_slots > 0) {
     const ActivityParams params = {static_cast<std::int32_t>(old_topology.voxels_per_brick()),
                                    static_cast<std::int32_t>(old_topology.voxel_count()),
                                    settings.thresholds.scalar,
-                                   settings.thresholds.velocity};
+                                   settings.thresholds.velocity,
+                                   settings.directional_dilation ? 1 : 0};
     g.compute.begin();
     g.compute.fill(g.flags, 0);
     g.compute.fill(g.speeds, 0);
@@ -922,18 +1190,81 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
   /* 2. The next topology, built on the CPU exactly as the reference does. */
   const auto topology_start = std::chrono::steady_clock::now();
   std::vector<std::uint8_t> brick_flags(old_topology.brick_table.size(), 0);
-  for (std::size_t slot = 0; slot < old_slots; ++slot) {
-    if (slot_flags[slot]) {
-      brick_flags[static_cast<std::size_t>(old_topology.brick_coords[slot * 4 + 3])] = 1;
+  const int reach_extra = std::max(0, settings.directional_margin_extra);
+  int reach = static_cast<int>(std::ceil(g.last_speed * dt)) + reach_extra;
+  if (settings.directional_dilation) {
+    /* Directional dilation: a neighbor brick is activated only if content lies closer than
+     *  voxels to the faces facing it. Source bricks keep the full one-brick dilation. */
+    const sparse::Extent &bricks = old_topology.brick_extent;
+    const auto mark = [&](const int x, const int y, const int z, const std::uint32_t bits) {
+      for (int d = 0; d < 27; ++d) {
+        const int o[3] = {d % 3 - 1, (d / 3) % 3 - 1, d / 9 - 1};
+        bool reached = true;
+        for (int axis = 0; axis < 3 && reached; ++axis) {
+          if (o[axis] != 0 && reach <= 5) {
+            reached = bits >> (10 * axis + (o[axis] > 0 ? 5 : 0) + reach - 1) & 1u;
+          }
+        }
+        const int nx = x + o[0], ny = y + o[1], nz = z + o[2];
+        if (!reached || nx < 0 || ny < 0 || nz < 0 || nx >= bricks.x || ny >= bricks.y ||
+            nz >= bricks.z)
+        {
+          continue;
+        }
+        brick_flags[static_cast<std::size_t>(nx + bricks.x * (ny + bricks.y * nz))] = 1;
+      }
+    };
+    /* The reach of each brick comes from the largest speed in it and its 26 neighbors (which
+     * hold the velocities that can carry its content across a face). */
+    const bool local = true;
+    const int global_reach = reach;
+    for (std::size_t slot = 0; slot < old_slots; ++slot) {
+      if (slot_flags[slot]) {
+        const int x = old_topology.brick_coords[slot * 4], y = old_topology.brick_coords[slot * 4 + 1],
+                  z = old_topology.brick_coords[slot * 4 + 2];
+        if (local) {
+          float speed = 0.0f;
+          for (int d = 0; d < 27; ++d) {
+            const int nx = x + d % 3 - 1, ny = y + (d / 3) % 3 - 1, nz = z + d / 9 - 1;
+            if (nx < 0 || ny < 0 || nz < 0 || nx >= bricks.x || ny >= bricks.y || nz >= bricks.z) {
+              continue;
+            }
+            const std::int32_t other = old_topology.brick_table[static_cast<std::size_t>(
+                nx + bricks.x * (ny + bricks.y * nz))];
+            if (other >= 0) {
+              speed = std::max(speed, slot_speeds[static_cast<std::size_t>(other)]);
+            }
+          }
+          reach = static_cast<int>(std::ceil(speed * dt)) + reach_extra;
+        }
+        mark(x, y, z, reach > 5 ? ~0u : slot_flags[slot]);
+        reach = global_reach;
+      }
+    }
+    for (const std::int32_t brick : g.source_bricks) {
+      const int x = brick % bricks.x, y = (brick / bricks.x) % bricks.y,
+                z = brick / (bricks.x * bricks.y);
+      mark(x, y, z, ~0u);
     }
   }
-  for (const std::int32_t brick : g.source_bricks) {
-    brick_flags.at(static_cast<std::size_t>(brick)) = 1;
+  else {
+    for (std::size_t slot = 0; slot < old_slots; ++slot) {
+      if (slot_flags[slot]) {
+        brick_flags[static_cast<std::size_t>(old_topology.brick_coords[slot * 4 + 3])] = 1;
+      }
+    }
+    for (const std::int32_t brick : g.source_bricks) {
+      brick_flags.at(static_cast<std::size_t>(brick)) = 1;
+    }
   }
+  /* A change of the border setting reclassifies the cells, even on unchanged bricks. */
+  const bool reborder = old_topology.extent.open != settings.open_borders;
+  sparse::Extent next_extent = old_topology.extent;
+  next_extent.open = settings.open_borders;
   sparse::Topology next = sparse::build_topology(
-      old_topology.extent, old_topology.brick_size, brick_flags, settings.dilation, false,
-      old_topology.obstacle);
-  const bool changed = next.brick_table != old_topology.brick_table;
+      next_extent, old_topology.brick_size, brick_flags,
+      settings.directional_dilation ? 0 : settings.dilation, false, old_topology.obstacle);
+  const bool changed = reborder || next.brick_table != old_topology.brick_table;
   std::vector<std::int32_t> old_slot_of;
   if (changed) {
     old_slot_of.resize(next.brick_count());
@@ -955,7 +1286,7 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
       std::vector<Compute::Buffer> grown(AllChannels);
       const std::size_t capacity = count + count / 2;
       for (Compute::Buffer &buffer : grown) {
-        buffer = g.compute.create_buffer(capacity * sizeof(float));
+        buffer = g.compute.create_buffer(capacity * g.channel_bytes());
       }
       retired = std::move(g.buffers);
       g.buffers.resize(AllChannels);
@@ -978,6 +1309,10 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
 
   /* 3. Move onto the new topology and run the step, in one submission. */
   g.compute.begin();
+  if (g.pending_sources) {
+    g.record_field(*g.pending_sources, g.source_table, g.source_values);
+    g.pending_sources = nullptr;
+  }
   if (changed) {
     g.compute.upload(g.slot_map, old_slot_of.data(), old_slot_of.size() * sizeof(std::int32_t));
     const RemapParams params = {static_cast<std::int32_t>(next.voxels_per_brick()),
@@ -1061,13 +1396,34 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
                   target, nullptr, &g.partials);
       }
     };
+    /* With turbulence_once a reflection step stirs once, for the whole step, in its second half
+     * (before the final projection). */
+    int force_call = 0;
     const auto add_forces = [&](const float step) {
+      const int call = force_call++;
+      const float turbulence_step = settings.reflection && settings.turbulence_once ?
+                                        (call == 0 ? 0.0f : 2.0f * step) :
+                                        step;
       if (settings.fire.enabled) {
         const sparse::Fire &fire = settings.fire;
         Params p = g.params(
             fire.burn_rate * step, fire.flame_cooling * step, fire.heat, fire.smoke);
         std::memcpy(&p.flags[0], &step, sizeof(float));
         g.stencil(g.combust, "combust", p, Density, Temperature, Fuel, Flame, Burn);
+      }
+      if (settings.density_fade > 0.0f || settings.temperature_fade > 0.0f) {
+        /* The same factors as fade() in the CPU reference. */
+        const float keep_density = settings.density_fade > 0.0f ?
+                                       std::exp(-settings.density_fade * step) :
+                                       1.0f;
+        const float keep_temperature = settings.temperature_fade > 0.0f ?
+                                           std::exp(-settings.temperature_fade * step) :
+                                           1.0f;
+        g.stencil(g.fade,
+                  "fade",
+                  g.params(keep_density, keep_temperature, 0.0f, 0.0f),
+                  Density,
+                  Temperature);
       }
       const auto buoyancy = [&](const int factor, const float coefficient) {
         if (coefficient != 0.0f) {
@@ -1088,13 +1444,14 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
       /* Mirrors add_turbulence for the first layer and then the others, in order. MacCormack's
        * forward scratch is free here and holds a speed mask. */
       const auto layer = [&](const sparse::Turbulence &noise) {
-        if (noise.strength == 0.0f) {
+        if (noise.strength == 0.0f || turbulence_step == 0.0f) {
           return;
         }
         int slice = 0;
         float blend = 0.0f;
         sparse::turbulence_time(noise, settings.time, slice, blend);
-        Params p = g.params(noise.strength * step, 1.0f / noise.scale, blend, noise.mask_level);
+        Params p = g.params(
+            noise.strength * turbulence_step, 1.0f / noise.scale, blend, noise.mask_level);
         int mask = Density;
         switch (noise.mask) {
           case sparse::TurbulenceMask::None:
@@ -1135,7 +1492,10 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
       target.flags[0] = 1;
       g.stencil(g.divergence, "divergence", target, U, V, W, rhs, Expansion, Burn);
       if (settings.pressure_solver == sparse::PressureSolver::Multigrid) {
-        g.stencil(g.mask_pressure, "mask pressure", g.params(0, 0, 0, 0), Pressure);
+        g.stencil(g.mask_pressure,
+                  "mask pressure",
+                  g.params(settings.pressure_warm_start ? 1.0f : 0.0f, 0, 0, 0),
+                  Pressure);
         g.record_multigrid(settings, rhs);
       }
       else {
@@ -1166,7 +1526,95 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
       }
     };
 
-    if (!settings.reflection) {
+    /* The cell-centred scalars share one trace (advect4/maccormack4, the correction written in
+     * place) and the velocity components go in one dispatch per pass. Bit-identical to the
+     * per-channel path, which MANTA_FUSED_ADVECT=0 selects for comparison. */
+    static const bool fused_advect = [] {
+      const char *e = std::getenv("MANTA_FUSED_ADVECT");
+      return !(e && e[0] == '0');
+    }();
+    const int S = StateChannels;
+    const auto advect_scalars = [&](const float step) {
+      std::array<int, 4> scalars = {Density, Temperature, fire ? Fuel : -1, fire ? Flame : -1};
+      const int n = fire ? 4 : 2;
+      Params p = g.params(0.5f, 0.5f, 0.5f, step);
+      p.flags[0] = settings.midpoint_trace ? 1 : 0;
+      p.flags[1] = second_order ? 1 : 0;
+      p.flags[2] = n;
+      const std::array<int, 4> scratch = {S + 5, S + 6, fire ? S + 7 : -1, fire ? S + 8 : -1};
+      g.fused(g.advect4, "advect", p,
+              {U, V, W, scalars[0], scalars[1], scalars[2], scalars[3], scratch[0], scratch[1],
+               scratch[2], scratch[3]},
+              second_order ? &g.bounds : nullptr, nullptr);
+      if (!second_order) {
+        for (int k = 0; k < n; ++k) {
+          std::swap(g.role[static_cast<std::size_t>(scalars[k])],
+                    g.role[static_cast<std::size_t>(scratch[k])]);
+        }
+        return;
+      }
+      const bool conserve = settings.conserve_mass;
+      p.flags[1] = conserve ? 1 : 0;
+      const std::array<int, 11> io = {U, V, W, scalars[0], scalars[1], scalars[2], scalars[3],
+                                      scratch[0], scratch[1], scratch[2], scratch[3]};
+      g.fused(g.maccormack4, "maccormack", p, io, &g.bounds, &g.partials);
+      if (conserve) {
+        Params reduce = g.params(0, 0, 0, 0);
+        reduce.flags[0] = static_cast<std::int32_t>(groups_for(g.topology.voxel_count()));
+        g.fused(g.conserve_reduce4, "conserve", reduce, {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+                nullptr, &g.partials, static_cast<std::uint32_t>(n));
+        Params apply = g.params(0, 0, 0, 0);
+        apply.flags[2] = n;
+        g.fused(g.conserve_apply4, "conserve", apply, io, nullptr, &g.partials);
+      }
+    };
+    /* Advect velocity sources src[3] through U, V, W into logical channels dst[3]. */
+    const auto advect_velocity = [&](const std::array<int, 3> &src, const std::array<int, 3> &dst,
+                                     const float step) {
+      Params p = g.params(0, 0, 0, step);
+      p.flags[0] = settings.midpoint_trace ? 1 : 0;
+      p.flags[1] = second_order ? 1 : 0;
+      if (!second_order) {
+        g.fused(g.advect3, "advect", p, {U, V, W, src[0], src[1], src[2], dst[0], dst[1], dst[2], -1, -1},
+                nullptr, nullptr);
+        return;
+      }
+      g.fused(g.advect3, "advect", p, {U, V, W, src[0], src[1], src[2], S + 5, S + 6, S + 7, -1, -1},
+              &g.bounds, nullptr);
+      g.fused(g.maccormack3, "maccormack", p,
+              {U, V, W, src[0], src[1], src[2], S + 5, S + 6, S + 7, dst[0], dst[1]}, &g.bounds,
+              &g.channel(dst[2]));
+    };
+    const auto advect_state_fused = [&](const float step) {
+      advect_scalars(step);
+      advect_velocity({U, V, W}, {S, S + 1, S + 2}, step);
+      for (int i = U; i <= W; ++i) {
+        std::swap(g.role[static_cast<std::size_t>(i)], g.role[static_cast<std::size_t>(S + i - U)]);
+      }
+    };
+
+    if (fused_advect && !settings.reflection) {
+      advect_state_fused(dt);
+      add_forces(dt);
+      project();
+    }
+    else if (fused_advect) {
+      const float half = 0.5f * dt;
+      advect_state_fused(half);
+      add_forces(half);
+      const int kept = S + 2;
+      g.stencil(g.copy3, "reflect", g.params(0, 0, 0, 0), U, V, W, kept, kept + 1, kept + 2);
+      project();
+      g.stencil(g.reflect, "reflect", g.params(0, 0, 0, 0), U, V, W, kept, kept + 1, kept + 2);
+      advect_scalars(half);
+      advect_velocity({kept, kept + 1, kept + 2}, {S, S + 1, S + 8}, half);
+      std::swap(g.role[U], g.role[S]);
+      std::swap(g.role[V], g.role[S + 1]);
+      std::swap(g.role[W], g.role[S + 8]);
+      add_forces(half);
+      project();
+    }
+    else if (!settings.reflection) {
       advect_state(dt);
       add_forces(dt);
       project();
@@ -1207,8 +1655,18 @@ sparse::StepInfo SparseGasGpu::impl_step(const sparse::Settings &settings, const
       project();
     }
   }
+  const bool read_activity = g.fuse_submits && count > 0;
+  if (read_activity) {
+    g.record_activity(settings, g.next_flags, g.next_speeds);
+  }
   add_gpu_time(g.compute.submit());
   g.collect_profile();
+  if (read_activity) {
+    g.next_valid = true;
+    g.next_scalar_threshold = settings.thresholds.scalar;
+    g.next_velocity_threshold = settings.thresholds.velocity;
+    g.next_directional = settings.directional_dilation;
+  }
 
   if (!retired.empty()) {
     for (Compute::Buffer &buffer : retired) {

@@ -122,13 +122,36 @@ next to the file (a job with a progress bar; Esc stops it), and playback and ren
 bake. **Delete Bake** lets the simulation run again with new settings. The modifier's own Manage
 > Bake panel does the same per modifier.
 
-**Memory and speed.** Until it is baked, Blender keeps every simulated frame in memory, so a long
-or large simulation grows by tens of megabytes per frame (the state at about 30 bytes per stored
-voxel; pressure is not kept, it stays on the GPU). Bake it to disk from the Pyro tab once it looks
-right. Each frame the node downloads only the channels it shows and continues from the GPU,
-transfers reuse one staging buffer, unchanged colliders are not set up again, the Pyro Point
-Source evaluates all five source grids in one pass, and emitters stop producing points once
-their bursts and trails are over.
+**Memory and speed.** Blender keeps every simulated frame in memory, and in this Blender a disk
+bake does not change that: playing a bake loads each frame and keeps it. A frame takes about
+25 bytes per stored voxel (velocity is half of it; pressure stays on the GPU). Baking still saves
+simulating again, and bake files are written in 16-bit precision (half the size, differences of
+about 5e-4; `MANTA_BAKE_HALF=0` writes full precision).
+
+The Pyro Simulation modifier's **Speed** panel holds the settings that trade look for time and
+memory (all GPU only; the defaults change nothing):
+
+- **Open Borders**: smoke and heat leave through the sides and top; the floor stays solid. With
+  closed borders a long explosion fills the whole box, and every filled brick costs time.
+- **Smoke Fade** and **Heat Fade**: fractions lost per second. Thin smoke disappears and stops
+  being simulated; cooling gas stops accelerating, which keeps the substeps down.
+- **Pressure Quality**: High (6 multigrid cycles), Medium (4, about a quarter faster per step with
+  under 1% difference) or Low (3).
+- **Smoke Threshold**: what counts as empty. 0.001 is hardly visible, 0.01 drops faint wisps.
+- **Directional Margin**: pads the simulated bricks only where smoke is heading (10-20% fewer
+  while a plume grows; fine swirls differ slightly).
+- **Fast Turbulence**: turbulence once per step instead of twice.
+- **Half Precision**: 16-bit storage on the GPU; half the GPU memory and less memory traffic,
+  differences like one pressure cycle fewer. Use Pressure Quality Medium or Low with it.
+- **Store Velocity**: off halves the frame cache, without render motion blur of the smoke.
+- **Batch GPU Work**: on by default; identical results.
+
+Always on, with identical results: output grids are built and sources read leaf by leaf on all
+CPU cores, the advected channels share one trace, the activity readback rides on the step's own
+submission, the node downloads only the channels it shows, transfers reuse one staging buffer,
+unchanged colliders are not set up again, the Pyro Point Source evaluates all five source grids
+in one pass, the Pyro Emitter builds only the bursts that are live, and emitters stop producing
+points once their bursts and trails are over.
 
 Inside, each modifier is one row of blocks passing one Settings bundle; every block is in the node
 editor's **Add > Pyro** menu: Pyro Emitter Preset, Pyro Burst, Pyro Fill, Pyro Particles,

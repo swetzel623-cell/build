@@ -61,19 +61,34 @@ if(MANTA_IMPROVE_BUILD_GPU)
     file(MAKE_DIRECTORY "${MANTA_IMPROVE_SHADER_DIR}")
     set(MANTA_IMPROVE_SHADER_HEADERS)
     foreach(KERNEL advect maccormack buoyancy walls divergence jacobi gradient activity remap classify
-            classify_links mask_pressure mg_smooth0 mg_restrict0 mg_smooth mg_residual mg_restrict copy3 reflect conserve_reduce conserve_apply inject turbulence combust speed mg_prolong0 mg_prolong mg_build0 mg_build mg_dense_cycle)
+            classify_links mask_pressure mg_smooth0 mg_restrict0 mg_smooth mg_residual mg_restrict copy3 reflect conserve_reduce conserve_apply advect4 maccormack4 conserve_reduce4 conserve_apply4 advect3 maccormack3 inject turbulence combust speed mg_prolong0 mg_prolong mg_build0 mg_build mg_dense_cycle fade)
       set(SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/${KERNEL}.comp")
-      set(SHADER_HEADER "${MANTA_IMPROVE_SHADER_DIR}/${KERNEL}.comp.h")
-      add_custom_command(
-        OUTPUT "${SHADER_HEADER}"
-        COMMAND "${MANTA_IMPROVE_GLSLANG}" -V "-I${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders"
-                --vn "${KERNEL}_spv" -o "${SHADER_HEADER}" "${SHADER_SOURCE}"
-        DEPENDS "${SHADER_SOURCE}" "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/common.glsl"
-                "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/mg_common.glsl"
-                "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/mg_coarse.glsl"
-        VERBATIM
-      )
-      list(APPEND MANTA_IMPROVE_SHADER_HEADERS "${SHADER_HEADER}")
+      set(SHADER_DEPENDS "${SHADER_SOURCE}" "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/common.glsl"
+          "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/mg_common.glsl"
+          "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/mg_coarse.glsl"
+          "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/advect_trace.glsl"
+          "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/quant.glsl"
+          "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/quant_config.glsl")
+      # Each kernel twice: 32-bit channels, and 16-bit channels (Half Precision).
+      foreach(PRECISION full half)
+        if(PRECISION STREQUAL "half")
+          set(VARIANT "_half")
+          set(SHADER_DEFINES "-DCHANNEL_HALF=1")
+        else()
+          set(VARIANT "")
+          set(SHADER_DEFINES "-DCHANNEL_HALF=0")
+        endif()
+        set(SHADER_HEADER "${MANTA_IMPROVE_SHADER_DIR}/${KERNEL}${VARIANT}.comp.h")
+        add_custom_command(
+          OUTPUT "${SHADER_HEADER}"
+          COMMAND "${MANTA_IMPROVE_GLSLANG}" -V "-I${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders"
+                  ${SHADER_DEFINES} --vn "${KERNEL}${VARIANT}_spv" -o "${SHADER_HEADER}"
+                  "${SHADER_SOURCE}"
+          DEPENDS ${SHADER_DEPENDS}
+          VERBATIM
+        )
+        list(APPEND MANTA_IMPROVE_SHADER_HEADERS "${SHADER_HEADER}")
+      endforeach()
     endforeach()
 
     add_library(manta_improve_sparse_gpu
@@ -124,6 +139,18 @@ if(MANTA_IMPROVE_BUILD_GPU)
                COMMAND sparse_gas_gpu_tests 32 10 --empty --sources fire)
       add_test(NAME sparse_gas_gpu_layers_tests
                COMMAND sparse_gas_gpu_tests 32 10 --turbulence 300 --layers --sources fire)
+      add_test(NAME sparse_gas_gpu_cold_pressure_tests
+               COMMAND sparse_gas_gpu_tests 32 10 --empty --sources fire --expansion --cold-pressure)
+      # Turbulence once per reflection step, and recording without batched submits.
+      add_test(NAME sparse_gas_gpu_turbulence_once_tests
+               COMMAND sparse_gas_gpu_tests 32 10 --turbulence 300 --layers --sources fire
+                       --turbulence-once --batch 0)
+      # 16-bit channels, with their own tolerance.
+      add_test(NAME sparse_gas_gpu_half_tests
+               COMMAND sparse_gas_gpu_tests 32 8 --half 1 --sources fire --expansion)
+      # Open borders and fading smoke and heat.
+      add_test(NAME sparse_gas_gpu_open_fade_tests
+               COMMAND sparse_gas_gpu_tests 32 12 --open --fade 0.5 --sources fire)
       add_test(NAME sparse_gas_gpu_expansion_tests
                COMMAND sparse_gas_gpu_tests 32 10 --empty --sources fire --expansion)
       set_tests_properties(
@@ -133,6 +160,9 @@ if(MANTA_IMPROVE_BUILD_GPU)
         sparse_gas_gpu_sources_tests sparse_gas_gpu_add_sources_tests sparse_gas_gpu_moving_tests
         sparse_gas_gpu_turbulence_tests sparse_gas_gpu_masked_turbulence_tests
         sparse_gas_gpu_fire_tests sparse_gas_gpu_layers_tests sparse_gas_gpu_expansion_tests
+        sparse_gas_gpu_turbulence_once_tests sparse_gas_gpu_half_tests
+        sparse_gas_gpu_open_fade_tests
+        sparse_gas_gpu_cold_pressure_tests
         PROPERTIES SKIP_RETURN_CODE 77
       )
     endif()

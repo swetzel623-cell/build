@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Shared layout of the sparse brick grid. Mirrors manta_improve::sparse::Topology: every buffer
 // is one of its flat arrays, uploaded unchanged.
+#include "quant.glsl"
 
 layout(local_size_x = 64) in;
 
@@ -19,20 +20,30 @@ layout(std430, binding = 3) buffer CellTypes { uint cell_type[]; };
 
 #ifndef NO_FLOAT_CHANNELS
 /* Float channels. Each kernel names the ones it uses. */
-layout(std430, binding = 4) buffer B4 { float b4[]; };
-layout(std430, binding = 5) buffer B5 { float b5[]; };
-layout(std430, binding = 6) buffer B6 { float b6[]; };
-layout(std430, binding = 7) buffer B7 { float b7[]; };
-layout(std430, binding = 8) buffer B8 { float b8[]; };
-layout(std430, binding = 9) buffer B9 { float b9[]; };
+layout(std430, binding = 4) buffer B4 { CH_T b4[]; };
+layout(std430, binding = 5) buffer B5 { CH_T b5[]; };
+layout(std430, binding = 6) buffer B6 { CH_T b6[]; };
+layout(std430, binding = 7) buffer B7 { CH_T b7[]; };
+layout(std430, binding = 8) buffer B8 { CH_T b8[]; };
+layout(std430, binding = 9) buffer B9 { CH_T b9[]; };
 #endif
 
 const uint CELL_OPEN = 0u;
 const uint CELL_FLUID = 1u;
 const uint CELL_SOLID = 2u;
 
+/* P.extent.w: the brick size in its low 8 bits; bit 8 set for open borders. */
+int brick_size()
+{
+  return P.extent.w & 255;
+}
+
+/* Open borders: only the floor is a wall. Otherwise every outer layer is. */
 bool is_wall(ivec3 c)
 {
+  if ((P.extent.w & 256) != 0) {
+    return c.z <= 0;
+  }
   return any(lessThanEqual(c, ivec3(0))) || any(greaterThanEqual(c, P.extent.xyz - 1));
 }
 
@@ -42,7 +53,7 @@ int index_of(ivec3 c)
   if (any(lessThan(c, ivec3(0)))) {
     return -1;
   }
-  int size = P.extent.w;
+  int size = brick_size();
   ivec3 b = c / size;
   if (any(greaterThanEqual(b, P.bricks.xyz))) {
     return -1;
@@ -67,7 +78,7 @@ uint type_at(ivec3 c)
 /* Domain coordinates of a stored voxel. */
 ivec3 coords_of(int index)
 {
-  int size = P.extent.w;
+  int size = brick_size();
   int per_brick = size * size * size;
   int slot = index / per_brick;
   int local = index - slot * per_brick;

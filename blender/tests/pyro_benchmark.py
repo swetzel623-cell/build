@@ -3,13 +3,16 @@
 
     blender -b --factory-startup --python pyro_benchmark.py -- [--voxel 0.06] [--frames 40]
         [--emitter Explosion] [--sim Explosion] [--variant full|nodisplay] [--out FILE.json]
+        [--set "Open Borders=1" --set "Pressure Quality=Medium" ...]
 
 Builds a fresh scene from this tree's assets (a small sphere with a Pyro Emitter and a Pyro
 Simulation, both on the chosen presets) and plays it from frame 1. Each frame it prints, as one
 JSON line: the wall time of the frame, the gas node's own Import/Solve/Export times, substeps,
 active bricks and the process memory; at the end a summary, including the device the solver ran
 on (or why it fell back to the CPU). `nodisplay` skips Pyro Display, to separate the display's
-cost from the solver's. Works on Windows and Linux.
+cost from the solver's. --set changes a Pyro Simulation input after the preset is loaded
+(booleans as 0/1, menus by name), for example the Speed panel's settings. Works on Windows and
+Linux.
 """
 
 from __future__ import annotations
@@ -90,6 +93,19 @@ def build_scene(args):
     sim.node_group = sim_group
     set_inputs(sim, {"Voxel Size": args.voxel, "Domain Size": (5.0, 5.0, 6.0),
                      "Show Mesh": False, "Preset": args.sim})
+    for assignment in args.set:
+        name, _, text = assignment.partition("=")
+        target = getattr(sim.properties.inputs, sa.input_item(sim_group, name.strip()).identifier)
+        current = target.value
+        if isinstance(current, bool):
+            value = text.strip() not in ("0", "false", "False", "")
+        elif isinstance(current, int):
+            value = int(text)
+        elif isinstance(current, float):
+            value = float(text)
+        else:
+            value = text.strip()
+        target.value = value
     tap_diagnostics(sim_group, args.variant)
     return scene, obj, sim
 
@@ -135,6 +151,8 @@ def main():
     parser.add_argument("--sim", default="Explosion")
     parser.add_argument("--variant", choices=("full", "nodisplay"), default="full")
     parser.add_argument("--out", default=None)
+    parser.add_argument("--set", action="append", default=[],
+                        help='"Input Name=value" for the Pyro Simulation modifier')
     args = parser.parse_args(argv)
 
     scene, obj, sim = build_scene(args)
@@ -164,7 +182,7 @@ def main():
 
     summary = {
         "voxel": args.voxel, "frames": args.frames, "variant": args.variant,
-        "emitter": args.emitter, "sim": args.sim, "total_s": round(time.perf_counter() - start, 2),
+        "emitter": args.emitter, "sim": args.sim, "set": args.set, "total_s": round(time.perf_counter() - start, 2),
         "mean_wall_ms": mean("wall_ms"), "median_wall_ms":
             round(statistics.median(r["wall_ms"] for r in rows[1:]), 2) if len(rows) > 1 else None,
         "mean_solve_ms": mean("Solve Time"), "mean_import_ms": mean("Import Time"),

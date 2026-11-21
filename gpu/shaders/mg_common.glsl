@@ -4,6 +4,7 @@
 // A level is described by an ivec4. For levels stored per brick slot, w is the number of cells
 // per brick side (the voxel level uses the brick size). For dense levels, xyz is the grid size and
 // w is minus the level's first cell in the buffers that all dense levels share.
+#include "quant.glsl"
 
 layout(local_size_x = 64) in;
 

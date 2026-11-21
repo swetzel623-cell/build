@@ -16,6 +16,9 @@ int ceil_div(const int value, const int divisor)
 
 bool is_wall(const Extent &extent, const int x, const int y, const int z)
 {
+  if (extent.open) {
+    return z <= 0;
+  }
   return x <= 0 || y <= 0 || z <= 0 || x >= extent.x - 1 || y >= extent.y - 1 ||
          z >= extent.z - 1;
 }
@@ -1353,7 +1356,7 @@ StepInfo project(State &state, const Settings &settings)
   for (std::size_t i = 0; i < rhs.size(); ++i) {
     rhs[i] = -(rhs[i] - target[i]);
     /* The previous pressure is the initial guess. Cells that are no longer fluid have none. */
-    if (topology.cell_type[i] != CellFluid) {
+    if (topology.cell_type[i] != CellFluid || !settings.pressure_warm_start) {
       state.pressure[i] = 0.0f;
     }
   }
@@ -1386,8 +1389,31 @@ StepInfo project(State &state, const Settings &settings)
   return info;
 }
 
+/* The factors are computed once, as the GPU path computes them, so both multiply alike. */
+static void fade(State &state, const Settings &settings, const float dt)
+{
+  if (settings.density_fade > 0.0f) {
+    const float keep = std::exp(-settings.density_fade * dt);
+    for (float &value : state.density) {
+      value *= keep;
+    }
+  }
+  if (settings.temperature_fade > 0.0f) {
+    const float keep = std::exp(-settings.temperature_fade * dt);
+    for (float &value : state.temperature) {
+      value *= keep;
+    }
+  }
+}
+
 StepInfo step(State &state, const Settings &settings, const Sources *sources)
 {
+  if (state.topology.extent.open != settings.open_borders) {
+    /* Reclassify the cells along the borders, on the same bricks. */
+    state.topology.extent.open = settings.open_borders;
+    BrickField velocity = std::move(state.obstacle_velocity);
+    set_obstacles(state, state.topology.obstacle, std::move(velocity));
+  }
   retopologize(state, settings.thresholds, settings.dilation, sources);
   if (state.topology.voxel_count() == 0) {
     return {};
@@ -1431,17 +1457,27 @@ StepInfo step(State &state, const Settings &settings, const Sources *sources)
     state.v.swap(v);
     state.w.swap(w);
   };
+  /* As the GPU path: with turbulence_once a reflection step stirs once, for the whole step,
+   * in its second half. */
+  int force_call = 0;
   const auto add_forces = [&](const float dt) {
+    const int call = force_call++;
+    const float turbulence_dt = settings.reflection && settings.turbulence_once ?
+                                    (call == 0 ? 0.0f : 2.0f * dt) :
+                                    dt;
     combust(state, settings.fire, dt);
+    fade(state, settings, dt);
     if (settings.heat_buoyancy != 0.0f) {
       add_buoyancy(state, state.temperature, settings.heat_buoyancy, dt, settings.gravity);
     }
     if (settings.density_buoyancy != 0.0f) {
       add_buoyancy(state, state.density, settings.density_buoyancy, dt, settings.gravity);
     }
-    add_turbulence(state, settings.turbulence, settings.time, dt);
-    for (const Turbulence &layer : settings.turbulence_layers) {
-      add_turbulence(state, layer, settings.time, dt);
+    if (turbulence_dt > 0.0f) {
+      add_turbulence(state, settings.turbulence, settings.time, turbulence_dt);
+      for (const Turbulence &layer : settings.turbulence_layers) {
+        add_turbulence(state, layer, settings.time, turbulence_dt);
+      }
     }
     enforce_walls(state);
   };

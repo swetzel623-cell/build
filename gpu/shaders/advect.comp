@@ -6,6 +6,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
+#define QA(x) STORE(x)
 #define U b4
 #define V b5
 #define W b6
@@ -20,7 +21,7 @@ layout(std430, binding = 10) writeonly buffer Bounds { float bounds[]; };
   float name##_at(ivec3 c) \
   { \
     int i = index_of(c); \
-    return i < 0 ? 0.0 : channel[i]; \
+    return i < 0 ? 0.0 : float(channel[i]); \
   } \
   float name(vec3 p, vec3 offset) \
   { \
@@ -77,13 +78,13 @@ void main()
     return;
   }
   if (cell_type[index] == CELL_SOLID) {
-    RESULT[index] = 0.0;
+    RESULT[index] = QA(0.0);
     return;
   }
   vec3 p = vec3(coords_of(index)) + P.a.xyz;
   vec3 from = trace(p, -P.a.w);
   if (P.flags.y == 0) {
-    RESULT[index] = sample_source(from, P.a.xyz);
+    RESULT[index] = QA(sample_source(from, P.a.xyz));
     return;
   }
 
@@ -99,7 +100,7 @@ void main()
     int i = index_of(corner_base + ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1));
     /* Solid cells hold zero; next to them the correction is not applied either. */
     stored = stored && i >= 0 && cell_type[i] != CELL_SOLID;
-    value[corner] = i < 0 ? 0.0 : SOURCE[i];
+    value[corner] = i < 0 ? 0.0 : float(SOURCE[i]);
     lowest = corner == 0 ? value[corner] : min(lowest, value[corner]);
     highest = corner == 0 ? value[corner] : max(highest, value[corner]);
   }
@@ -109,7 +110,7 @@ void main()
   float c11 = value[6] + (value[7] - value[6]) * t.x;
   float c0 = c00 + (c10 - c00) * t.y;
   float c1 = c01 + (c11 - c01) * t.y;
-  RESULT[index] = c0 + (c1 - c0) * t.z;
+  RESULT[index] = QA(c0 + (c1 - c0) * t.z);
   bounds[2 * index] = stored ? lowest : 1.0;
   bounds[2 * index + 1] = stored ? highest : 0.0;
 }

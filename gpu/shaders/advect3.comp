@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: MIT
+// Forward semi-Lagrangian pass of the three staggered velocity components in one dispatch (each
+// with its own face position and trace). P.a.w = dt, P.flags.x midpoint trace, P.flags.y keep
+// bounds. Bindings: 4-6 advecting velocity, 7-9 sources (u, v, w), 10-12 results,
+// 15 bounds (8 floats per voxel, pairs 0-2 used).
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#define NO_FLOAT_CHANNELS
+#include "common.glsl"
+#include "advect_trace.glsl"
+layout(std430, binding = 7) readonly buffer S0 { CH_T s0[]; };
+layout(std430, binding = 8) readonly buffer S1 { CH_T s1[]; };
+layout(std430, binding = 9) readonly buffer S2 { CH_T s2[]; };
+layout(std430, binding = 10) writeonly buffer R0 { CH_T r0[]; };
+layout(std430, binding = 11) writeonly buffer R1 { CH_T r1[]; };
+layout(std430, binding = 12) writeonly buffer R2 { CH_T r2[]; };
+layout(std430, binding = 15) writeonly buffer Bounds { float bounds[]; };
+
+float source(int k, int i)
+{
+  return k == 0 ? float(s0[i]) : k == 1 ? float(s1[i]) : float(s2[i]);
+}
+void store(int k, int i, float v)
+{
+  if (k == 0) r0[i] = STORE(v);
+  else if (k == 1) r1[i] = STORE(v);
+  else r2[i] = STORE(v);
+}
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index)) {
+    return;
+  }
+  if (cell_type[index] == CELL_SOLID) {
+    for (int k = 0; k < 3; ++k) store(k, index, 0.0);
+    return;
+  }
+  ivec3 c = coords_of(index);
+  for (int k = 0; k < 3; ++k) {
+    vec3 offset = vec3(0.5);
+    offset[k] = 0.0;
+    vec3 from = trace(vec3(c) + offset, -P.a.w);
+    vec3 f = from - offset;
+    vec3 base = floor(f);
+    ivec3 corner_base = ivec3(base);
+    vec3 t = f - base;
+    float value[8];
+    bool stored = true;
+    float lowest = 0.0, highest = 0.0;
+    for (int corner = 0; corner < 8; ++corner) {
+      int i = index_of(corner_base + ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1));
+      stored = stored && i >= 0 && cell_type[i] != CELL_SOLID;
+      value[corner] = i < 0 ? 0.0 : source(k, i);
+      lowest = corner == 0 ? value[corner] : min(lowest, value[corner]);
+      highest = corner == 0 ? value[corner] : max(highest, value[corner]);
+    }
+    store(k, index, lerp8(value, t));
+    if (P.flags.y != 0) {
+      bounds[8 * index + 2 * k] = stored ? lowest : 1.0;
+      bounds[8 * index + 2 * k + 1] = stored ? highest : 0.0;
+    }
+  }
+}

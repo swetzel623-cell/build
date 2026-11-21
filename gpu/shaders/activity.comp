@@ -3,6 +3,8 @@
 // each slot's largest velocity component. Mirrors the CPU reference's activity test and
 // max_speed(); the flags decide the next topology and the speeds the next time step.
 #version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "quant.glsl"
 layout(local_size_x = 64) in;
 
 layout(push_constant) uniform Params
@@ -11,18 +13,22 @@ layout(push_constant) uniform Params
   int count;
   float scalar_threshold;
   float velocity_threshold;
+  /* 0: one flag bit per brick (the brick is dilated on the host by whole bricks). >0: bit
+   * 13+dx+3*dy+9*dz (d in -1..1) is set when content lies within this many voxels of the
+   * neighbor (dx,dy,dz), so the host activates only the neighbors content can reach. */
+  int reach;
 }
 P;
-layout(std430, binding = 1) readonly buffer Density { float density[]; };
-layout(std430, binding = 2) readonly buffer Temperature { float temperature[]; };
-layout(std430, binding = 3) readonly buffer U { float u[]; };
-layout(std430, binding = 4) readonly buffer V { float v[]; };
-layout(std430, binding = 5) readonly buffer W { float w[]; };
+layout(std430, binding = 1) readonly buffer Density { CH_T density[]; };
+layout(std430, binding = 2) readonly buffer Temperature { CH_T temperature[]; };
+layout(std430, binding = 3) readonly buffer U { CH_T u[]; };
+layout(std430, binding = 4) readonly buffer V { CH_T v[]; };
+layout(std430, binding = 5) readonly buffer W { CH_T w[]; };
 layout(std430, binding = 6) buffer Flags { uint flags[]; };
 /* Bit patterns of non-negative floats order like the floats, so an integer maximum works. */
 layout(std430, binding = 7) buffer Speeds { uint speed_bits[]; };
-layout(std430, binding = 8) readonly buffer Fuel { float fuel[]; };
-layout(std430, binding = 9) readonly buffer Flame { float flame[]; };
+layout(std430, binding = 8) readonly buffer Fuel { CH_T fuel[]; };
+layout(std430, binding = 9) readonly buffer Flame { CH_T flame[]; };
 
 void main()
 {
@@ -30,15 +36,30 @@ void main()
   if (i >= P.count) {
     return;
   }
-  bool has_content = abs(density[i]) > P.scalar_threshold ||
-                abs(temperature[i]) > P.scalar_threshold ||
-                abs(fuel[i]) > P.scalar_threshold || abs(flame[i]) > P.scalar_threshold ||
-                abs(u[i]) > P.velocity_threshold || abs(v[i]) > P.velocity_threshold ||
-                abs(w[i]) > P.velocity_threshold;
+  bool has_content = abs(float(density[i])) > P.scalar_threshold ||
+                abs(float(temperature[i])) > P.scalar_threshold ||
+                abs(float(fuel[i])) > P.scalar_threshold || abs(float(flame[i])) > P.scalar_threshold ||
+                abs(float(u[i])) > P.velocity_threshold || abs(float(v[i])) > P.velocity_threshold ||
+                abs(float(w[i])) > P.velocity_threshold;
   if (has_content) {
-    atomicOr(flags[i / P.voxels_per_brick], 1u);
+    uint mask = 1u;
+    if (P.reach > 0) {
+      /* Bit 30: content. Bit 5*face+(r-1), r=1..5: content lies closer than r voxels to the
+       * face (-x,+x,-y,+y,-z,+z) of its brick. The host picks r once it knows the time step. */
+      int local = i % P.voxels_per_brick;
+      ivec3 l = ivec3(local & 7, (local >> 3) & 7, local >> 6);
+      mask = 1u << 30;
+      for (int axis = 0; axis < 3; ++axis) {
+        int lo = l[axis], hi = 7 - l[axis];
+        for (int r = 1; r <= 5; ++r) {
+          if (lo < r) mask |= 1u << uint(10 * axis + r - 1);
+          if (hi < r) mask |= 1u << uint(10 * axis + 5 + r - 1);
+        }
+      }
+    }
+    atomicOr(flags[i / P.voxels_per_brick], mask);
   }
-  float speed = max(abs(u[i]), max(abs(v[i]), abs(w[i])));
+  float speed = max(abs(float(u[i])), max(abs(float(v[i])), abs(float(w[i]))));
   if (speed > 0.0) {
     atomicMax(speed_bits[i / P.voxels_per_brick], floatBitsToUint(speed));
   }

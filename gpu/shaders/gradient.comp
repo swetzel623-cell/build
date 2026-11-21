@@ -11,7 +11,7 @@
 
 float pressure_at(ivec3 c)
 {
-  return type_at(c) == CELL_FLUID ? PRESSURE[index_of(c)] : 0.0;
+  return type_at(c) == CELL_FLUID ? float(PRESSURE[index_of(c)]) : 0.0;
 }
 
 float corrected(float face, uint here, float upper, ivec3 below)
@@ -34,8 +34,8 @@ void main()
   }
   ivec3 c = coords_of(index);
   uint here = cell_type[index];
-  float upper = here == CELL_FLUID ? PRESSURE[index] : 0.0;
-  U[index] = corrected(U[index], here, upper, c - ivec3(1, 0, 0));
-  V[index] = corrected(V[index], here, upper, c - ivec3(0, 1, 0));
-  W[index] = corrected(W[index], here, upper, c - ivec3(0, 0, 1));
+  float upper = here == CELL_FLUID ? float(PRESSURE[index]) : 0.0;
+  U[index] = QV(corrected(float(U[index]), here, upper, c - ivec3(1, 0, 0)));
+  V[index] = QV(corrected(float(V[index]), here, upper, c - ivec3(0, 1, 0)));
+  W[index] = QV(corrected(float(W[index]), here, upper, c - ivec3(0, 0, 1)));
 }

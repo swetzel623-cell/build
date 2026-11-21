@@ -18,8 +18,8 @@
 
 namespace manta_improve::gpu {
 
-/** Kernels see storage buffers at bindings 1 to 14. */
-constexpr std::size_t binding_count = 14;
+/** Kernels see storage buffers at bindings 1 to 16. */
+constexpr std::size_t binding_count = 16;
 /** Every kernel receives up to this many bytes of push constants. */
 constexpr std::size_t push_constant_bytes = 64;
 
@@ -49,6 +49,10 @@ class Compute {
    * command, so leave it off when measuring total time.
    */
   void set_profiling(bool enabled);
+  /** Submit recorded work every `dispatches` dispatches without waiting; 0 waits for submit(). */
+  void set_command_batch(std::size_t dispatches);
+  /** Whether storage buffers may hold 16-bit floats on this device. */
+  bool supports_half_storage() const;
   /** GPU milliseconds per label in the last submission, in order of first appearance. */
   const std::vector<std::pair<std::string, double>> &last_profile() const;
 

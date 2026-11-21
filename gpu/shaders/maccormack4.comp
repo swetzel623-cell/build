@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: MIT
+// MacCormack correction of up to four cell-centred scalars advected by advect4, sharing one
+// backward trace and one set of corner lookups. Writes the corrected value in place over the
+// source (each invocation reads only its own source voxel). P.a.w = dt, P.flags.x midpoint
+// trace, P.flags.y write conserve sums, P.flags.z channel count. Bindings: 4-6 velocity,
+// 7-10 source in / result out, 11-14 forward results, 15 bounds, 16 partials (8 header floats,
+// then 12 per work group: 3 sums per channel).
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#define NO_FLOAT_CHANNELS
+#include "common.glsl"
+#include "advect_trace.glsl"
+layout(std430, binding = 7) buffer S0 { CH_T s0[]; };
+layout(std430, binding = 8) buffer S1 { CH_T s1[]; };
+layout(std430, binding = 9) buffer S2 { CH_T s2[]; };
+layout(std430, binding = 10) buffer S3 { CH_T s3[]; };
+layout(std430, binding = 11) readonly buffer F0 { CH_T f0[]; };
+layout(std430, binding = 12) readonly buffer F1 { CH_T f1[]; };
+layout(std430, binding = 13) readonly buffer F2 { CH_T f2[]; };
+layout(std430, binding = 14) readonly buffer F3 { CH_T f3[]; };
+layout(std430, binding = 15) readonly buffer Bounds { float bounds[]; };
+layout(std430, binding = 16) writeonly buffer Partials { float partials[]; };
+
+float source(int k, int i)
+{
+  return k == 0 ? float(s0[i]) : k == 1 ? float(s1[i]) : k == 2 ? float(s2[i]) : float(s3[i]);
+}
+void store(int k, int i, float v)
+{
+  if (k == 0) s0[i] = STORE(v);
+  else if (k == 1) s1[i] = STORE(v);
+  else if (k == 2) s2[i] = STORE(v);
+  else s3[i] = STORE(v);
+}
+float forward_at(int k, int i)
+{
+  return k == 0 ? float(f0[i]) : k == 1 ? float(f1[i]) : k == 2 ? float(f2[i]) : float(f3[i]);
+}
+
+shared float group_sums[12][64];
+
+void main()
+{
+  int index;
+  bool in_range = voxel_in_range(index);
+  int count = P.flags.z;
+  float old_value[4] = float[4](0.0, 0.0, 0.0, 0.0);
+  float forward[4] = float[4](0.0, 0.0, 0.0, 0.0);
+  float value[4] = float[4](0.0, 0.0, 0.0, 0.0);
+  if (in_range) {
+    for (int k = 0; k < 4; ++k) {
+      if (k < count) {
+        old_value[k] = source(k, index);
+        forward[k] = forward_at(k, index);
+        value[k] = forward[k];
+      }
+    }
+    uint type = cell_type[index];
+    if (type == CELL_SOLID) {
+      for (int k = 0; k < 4; ++k) value[k] = 0.0;
+    }
+    else if (type == CELL_FLUID) {
+      ivec3 c = coords_of(index);
+      vec3 to = trace(vec3(c) + P.a.xyz, P.a.w);
+      vec3 f = to - P.a.xyz;
+      vec3 base = floor(f);
+      ivec3 corner_base = ivec3(base);
+      vec3 t = f - base;
+      int corner_index[8];
+      bool clear = true;
+      for (int corner = 0; corner < 8; ++corner) {
+        int i = index_of(corner_base + ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1));
+        corner_index[corner] = i;
+        clear = clear && i >= 0 && cell_type[i] != CELL_SOLID;
+      }
+      for (int k = 0; k < 4; ++k) {
+        if (k >= count) break;
+        float lowest = bounds[8 * index + 2 * k], highest = bounds[8 * index + 2 * k + 1];
+        if (lowest > highest || !clear) continue;
+        float corner_value[8];
+        for (int corner = 0; corner < 8; ++corner) {
+          corner_value[corner] = forward_at(k, corner_index[corner]);
+        }
+        float backward = lerp8(corner_value, t);
+        float corrected = forward[k] + 0.5 * (old_value[k] - backward);
+        value[k] = min(max(corrected, lowest), highest);
+      }
+    }
+    for (int k = 0; k < 4; ++k) {
+      if (k < count) store(k, index, value[k]);
+    }
+  }
+  if (P.flags.y == 0) {
+    return;
+  }
+  uint l = gl_LocalInvocationID.x;
+  for (int k = 0; k < 4; ++k) {
+    float correction = in_range ? value[k] - forward[k] : 0.0;
+    group_sums[3 * k][l] = in_range ? value[k] - old_value[k] : 0.0;
+    group_sums[3 * k + 1][l] = max(correction, 0.0);
+    group_sums[3 * k + 2][l] = max(-correction, 0.0);
+  }
+  for (uint width = 32u; width > 0u; width >>= 1) {
+    barrier();
+    if (l < width) {
+      for (int k = 0; k < 12; ++k) {
+        group_sums[k][l] += group_sums[k][l + width];
+      }
+    }
+  }
+  if (l == 0u) {
+    uint base = 8u + 12u * gl_WorkGroupID.x;
+    for (int k = 0; k < 12; ++k) {
+      partials[base + k] = group_sums[k][0];
+    }
+  }
+}

@@ -17,9 +17,9 @@ void main()
   }
   float diagonal = op[index].x;
   if (!(diagonal > 0.0)) {
-    residual[index] = 0.0;
+    residual[index] = QPC(0.0);
     return;
   }
   ivec3 c = level_coords(P.la, index);
-  residual[index] = rhs[index] - (diagonal * x[index] - coarse_neighbor_sum(index, c));
+  residual[index] = QPC(rhs[index] - (diagonal * x[index] - coarse_neighbor_sum(index, c)));
 }

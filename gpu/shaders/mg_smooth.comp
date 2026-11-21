@@ -22,5 +22,5 @@ void main()
   if (((c.x + c.y + c.z) & 1) != P.color) {
     return;
   }
-  x[index] = (rhs[index] + coarse_neighbor_sum(index, c)) / diagonal;
+  x[index] = QPC((rhs[index] + coarse_neighbor_sum(index, c)) / diagonal);
 }

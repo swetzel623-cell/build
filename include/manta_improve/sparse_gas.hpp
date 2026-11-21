@@ -19,6 +19,11 @@ struct Extent {
   int x = 0;
   int y = 0;
   int z = 0;
+  /**
+   * Open borders: only the floor (the bottom layer of voxels) is a wall; smoke and heat leave
+   * through the sides and the top. Closed (the default): every outer layer is a wall.
+   */
+  bool open = false;
 };
 
 enum CellType : std::uint32_t {
@@ -394,10 +399,48 @@ struct Settings {
   int multigrid_w_depth = 1;
   /** Multigrid: factor applied to coarse corrections; aggregation underestimates them. */
   float multigrid_overcorrection = 1.4f;
+  /**
+   * Start each pressure solve from the previous pressure. Measured on a fire scene with
+   * reflection, the previous pressure is nearly orthogonal to the next solve's correction: the
+   * reflection's second projection starts 2.3 times further from its solution than from zero, and
+   * the first gains under 10%. With false the solve starts at zero and pressure is not state.
+   */
+  bool pressure_warm_start = true;
 
   ActivityThresholds thresholds;
   /** Bricks of padding around active content. Smoke must not cross it within one step. */
   int dilation = 1;
+  /**
+   * GPU only. Pad active content only toward the faces it lies near: a neighbouring brick is
+   * activated only if content is within the distance the flow around it can carry it in one
+   * step, plus `directional_margin_extra` voxels. About 10-20% fewer bricks while a plume
+   * grows; the fine swirls differ slightly because the open boundary sits closer to the smoke.
+   */
+  bool directional_dilation = false;
+  int directional_margin_extra = 2;
+  /**
+   * GPU only. Apply the turbulence once per substep, before the final projection, instead of in
+   * both halves of a reflection step. Half the turbulence work; the fine detail changes.
+   */
+  bool turbulence_once = false;
+  /**
+   * GPU only. Store the channels on the device in 16-bit floats (arithmetic stays 32-bit):
+   * 0 full precision, 1 smoke, heat, fire and velocity, 2 also pressure. Less memory traffic and
+   * half the memory; differences are like one multigrid cycle fewer. With 2, more than about 4
+   * pressure cycles no longer reduce the divergence.
+   */
+  int half_precision = 0;
+  /**
+   * GPU only. Submit recorded commands every this many dispatches, so the device starts working
+   * while the rest is recorded; 0 records a whole step before submitting it. Same results.
+   */
+  int command_batch = 64;
+  /** Let smoke out through the domain's sides and top; the floor stays solid. See Extent::open. */
+  bool open_borders = false;
+  /** Fraction of the smoke density lost per second, as exp(-density_fade * t). 0 keeps it. */
+  float density_fade = 0.0f;
+  /** The same for temperature: hot gas cools, so buoyancy stops accelerating the plume. */
+  float temperature_fade = 0.0f;
 };
 
 struct StepInfo {

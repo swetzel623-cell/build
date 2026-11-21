@@ -25,10 +25,15 @@
 #  include "openvdb/tools/GridTransformer.h"
 #  include "openvdb/tools/Interpolation.h"
 
+#  include "BLI_task.hh"
+
 #  include <algorithm>
 #  include <array>
 #  include <chrono>
 #  include <cmath>
+#  include <cstdio>
+#  include <cstdlib>
+#  include <cstring>
 #  include <memory>
 #  include <mutex>
 #  include <optional>
@@ -193,6 +198,58 @@ static void node_declare(NodeDeclarationBuilder &b)
       .min(0.0f)
       .description("Sparse GPU only. How much burning fuel expands: the volume grows by this "
                    "much per unit of fuel burnt, pushing the fire outward like an explosion");
+  b.add_input<decl::Bool>("Open Borders"_ustr)
+      .default_value(false)
+      .description("Sparse GPU only. Let smoke and heat leave through the sides and top of the "
+                   "domain; the floor stays solid. Closed, smoke gathers in the box until it "
+                   "fills it, and every filled brick costs time");
+  b.add_input<decl::Float>("Smoke Fade"_ustr)
+      .default_value(0.0f)
+      .min(0.0f)
+      .description("Sparse GPU only. Fraction of the smoke lost per second (exponentially); thin "
+                   "smoke then disappears and stops being simulated. 0 keeps it all");
+  b.add_input<decl::Float>("Heat Fade"_ustr)
+      .default_value(0.0f)
+      .min(0.0f)
+      .description("Sparse GPU only. Fraction of the heat lost per second, so hot gas cools and "
+                   "stops accelerating upward. 0 keeps it all");
+  b.add_input<decl::Int>("Pressure Cycles"_ustr)
+      .default_value(6)
+      .min(1)
+      .max(16)
+      .description("Sparse GPU only. Multigrid cycles per pressure solve. Fewer is faster: 4 cuts "
+                   "the solve by a third with differences of under 1%; 3 or fewer start to show");
+  b.add_input<decl::Float>("Smoke Threshold"_ustr)
+      .default_value(1.0e-5f)
+      .min(0.0f)
+      .max(1.0f)
+      .description("Sparse GPU only. Smoke, heat, fuel or flame below this is treated as empty, "
+                   "and bricks holding nothing more are not simulated. Higher drops faint smoke "
+                   "sooner (0.001 is hardly visible; 0.01 loses the faintest wisps)");
+  b.add_input<decl::Bool>("Directional Margin"_ustr)
+      .default_value(false)
+      .description("Sparse GPU only. Pad the simulated region only on the sides smoke can reach "
+                   "within a step, instead of all around: 10-20% fewer bricks while a plume "
+                   "grows. The fine swirls differ slightly");
+  b.add_input<decl::Bool>("Fast Turbulence"_ustr)
+      .default_value(false)
+      .description("Sparse GPU only. Apply the turbulence once per step instead of twice; half "
+                   "its cost. The fine detail changes");
+  b.add_input<decl::Bool>("Half Precision"_ustr)
+      .default_value(false)
+      .description("Sparse GPU only. Store the simulation on the GPU in 16-bit numbers: half the "
+                   "GPU memory and less memory traffic, with differences like one pressure cycle "
+                   "fewer. More than about 4 Pressure Cycles then stop helping. Ignored on GPUs "
+                   "without 16-bit storage. Changing it restarts the simulation from its cache");
+  b.add_input<decl::Bool>("Store Velocity"_ustr)
+      .default_value(true)
+      .description("Sparse GPU only. Keep the velocity grid in every simulated frame. Off, the "
+                   "frame cache needs about half the memory, but render motion blur of the "
+                   "volume has no velocity");
+  b.add_input<decl::Bool>("Batch GPU Work"_ustr)
+      .default_value(true)
+      .description("Sparse GPU only. Start the GPU on recorded work while the rest of the step is "
+                   "still recorded. Same results; turn off only to compare timings");
 
   b.add_output<decl::Int>("Substeps"_ustr).description("Number of internal solver steps executed");
   b.add_output<decl::Float>("Max Velocity"_ustr)
@@ -374,6 +431,19 @@ static void tag_output(openvdb::GridBase &grid)
   grid.insertMeta(output_key, openvdb::BoolMetadata(true));
 }
 
+/**
+ * State grids are written to bakes as 16-bit floats: half the file size, with differences of
+ * about 5e-4 relative. MANTA_BAKE_HALF=0 writes full precision.
+ */
+static bool bake_half()
+{
+  static const bool on = [] {
+    const char *value = std::getenv("MANTA_BAKE_HALF");
+    return !(value && value[0] == '0');
+  }();
+  return on;
+}
+
 static openvdb::FloatGrid::Ptr make_scalar_grid(const std::vector<float> &values,
                                                 const int3 &resolution,
                                                 const openvdb::math::Transform &transform,
@@ -454,6 +524,9 @@ struct SparseSlot {
   std::uint64_t last_used = 0;
   /** The last frame's downloaded state, kept so its vectors are reused. */
   sparse::State shown;
+  /** Where `shown` lives, to rebuild its velocity grid when the slot is given away. */
+  openvdb::math::Transform::Ptr transform;
+  float voxel_size = 0.0f;
 };
 
 struct SparseDevice {
@@ -462,6 +535,9 @@ struct SparseDevice {
   bool tried = false;
   std::string error;
   std::uint64_t clock = 0;
+  /** Without Store Velocity: the velocity of states whose solver was given to another simulation,
+   * by state id, oldest first. */
+  std::vector<std::pair<std::int64_t, openvdb::GridBase::Ptr>> held;
 };
 
 static constexpr std::size_t sparse_slot_limit = 4;
@@ -556,8 +632,335 @@ static openvdb::Vec3f velocity_at(
   return sampler.wsSample(domain.indexToWorld(openvdb::Vec3d(x, y, z))) / voxel_size;
 }
 
+/* ---- Leaf-parallel state export and source import ----
+ * A solver brick is 8x8x8 with origins at multiples of 8, exactly one OpenVDB LeafNode<float,3>,
+ * so leaves are built and read in parallel. For checking, the environment variable
+ * MANTA_GAS_FAST_VDB=0 runs the original voxel-by-voxel code instead, and =2 runs both and
+ * prints whether they give identical grids. */
+
+static int fast_vdb_mode()
+{
+  static const int mode = [] {
+    const char *value = std::getenv("MANTA_GAS_FAST_VDB");
+    return value ? std::atoi(value) : 1;
+  }();
+  return mode;
+}
+
+using FloatLeaf = openvdb::FloatTree::LeafNodeType;
+using VectorLeaf = openvdb::Vec3STree::LeafNodeType;
+
+/** Per brick, the voxels inside the domain as leaf mask words (word = local x, bit = y * 8 + z). */
+static void brick_inside_mask(const openvdb::Coord &origin, const int3 &limit, std::uint64_t inside[8])
+{
+  const int nx = std::min(8, limit.x - origin.x()), ny = std::min(8, limit.y - origin.y()),
+            nz = std::min(8, limit.z - origin.z());
+  std::uint64_t word = 0;
+  for (int y = 0; y < ny; ++y) {
+    word |= (nz >= 8 ? 0xffull : ((1ull << std::max(nz, 0)) - 1)) << (8 * y);
+  }
+  for (int x = 0; x < 8; ++x) {
+    inside[x] = x < nx ? word : 0;
+  }
+}
+
+/**
+ * The leaf of one brick's values (512, X-fastest) with the voxels `get` reports as set active,
+ * or null when there are none. Inactive voxels hold the zero background, as with setValue.
+ */
+template<typename LeafT, typename Get>
+static LeafT *build_brick_leaf(const openvdb::Coord &origin,
+                               const std::uint64_t inside[8],
+                               const Get &get)
+{
+  using ValueT = typename LeafT::ValueType;
+  const ValueT zero = openvdb::zeroVal<ValueT>();
+  alignas(64) ValueT values[512];
+  std::uint64_t words[8];
+  std::uint64_t any = 0;
+  for (int x = 0; x < 8; ++x) {
+    std::uint64_t word = 0;
+    for (int bit = 0; bit < 64; ++bit) {
+      bool on = false;
+      const ValueT value = get(x + 8 * (bit >> 3) + 64 * (bit & 7), on);
+      on = on && ((inside[x] >> bit) & 1u);
+      values[x * 64 + bit] = on ? value : zero;
+      word |= std::uint64_t(on) << bit;
+    }
+    words[x] = word;
+    any |= word;
+  }
+  if (!any) {
+    return nullptr;
+  }
+  LeafT *leaf = new LeafT(origin, zero, false);
+  std::memcpy(leaf->buffer().data(), values, sizeof(values));
+  for (int x = 0; x < 8; ++x) {
+    leaf->getValueMask().template getWord<std::uint64_t>(x) = words[x];
+  }
+  return leaf;
+}
+
+/** Fill the (empty) output trees from the state, leaves built in parallel. */
+static void export_leaves(const sparse::State &state,
+                          const int3 &resolution,
+                          const float voxel_size,
+                          const bool fire,
+                          const bool with_pressure,
+                          openvdb::FloatTree *const scalars[5],
+                          openvdb::Vec3STree &velocity)
+{
+  const std::size_t count = state.topology.brick_count();
+  /* Per slot: density, temperature, pressure, fuel, flame. */
+  std::vector<FloatLeaf *> leaves(count * 5, nullptr);
+  std::vector<VectorLeaf *> vectors(count, nullptr);
+  threading::parallel_for(IndexRange(count), 16, [&](const IndexRange range) {
+    for (const int64_t slot : range) {
+      const std::int32_t *c = &state.topology.brick_coords[slot * 4];
+      const openvdb::Coord origin(c[0] * 8, c[1] * 8, c[2] * 8);
+      std::uint64_t inside[8];
+      brick_inside_mask(origin, resolution, inside);
+      const std::size_t base = std::size_t(slot) * 512;
+      const auto scalar = [&](const std::vector<float> &channel) {
+        const float *values = &channel[base];
+        /* Most bricks of a plume are empty (the dilation shell): skip them with a cheap scan. */
+        if (std::all_of(values, values + 512, [](const float v) { return v == 0.0f; })) {
+          return (FloatLeaf *)nullptr;
+        }
+        return build_brick_leaf<FloatLeaf>(origin, inside, [values](const int i, bool &on) {
+          on = values[i] != 0.0f;
+          return values[i];
+        });
+      };
+      leaves[slot * 5 + 0] = scalar(state.density);
+      leaves[slot * 5 + 1] = scalar(state.temperature);
+      if (with_pressure) {
+        leaves[slot * 5 + 2] = scalar(state.pressure);
+      }
+      if (fire) {
+        leaves[slot * 5 + 3] = scalar(state.fuel);
+        leaves[slot * 5 + 4] = scalar(state.flame);
+      }
+      const float *u = &state.u[base], *v = &state.v[base], *w = &state.w[base];
+      bool moving = false;
+      for (int i = 0; i < 512; ++i) {
+        moving |= (u[i] != 0.0f) | (v[i] != 0.0f) | (w[i] != 0.0f);
+      }
+      if (!moving) {
+        continue;
+      }
+      vectors[slot] = build_brick_leaf<VectorLeaf>(origin, inside, [&](const int i, bool &on) {
+        on = u[i] != 0.0f || v[i] != 0.0f || w[i] != 0.0f;
+        return openvdb::Vec3f(u[i] * voxel_size, v[i] * voxel_size, w[i] * voxel_size);
+      });
+    }
+  });
+  for (std::size_t slot = 0; slot < count; ++slot) {
+    for (int grid = 0; grid < 5; ++grid) {
+      if (FloatLeaf *leaf = leaves[slot * 5 + grid]) {
+        scalars[grid]->addLeaf(leaf);
+      }
+    }
+    if (vectors[slot]) {
+      velocity.addLeaf(vectors[slot]);
+    }
+  }
+}
+
+/** Whether two trees hold the same leaves, masks and bit-identical values (and no tiles). */
+template<typename TreeT> static bool same_tree(const TreeT &a, const TreeT &b)
+{
+  if (a.leafCount() != b.leafCount() || a.activeVoxelCount() != b.activeVoxelCount() ||
+      a.activeTileCount() != b.activeTileCount())
+  {
+    return false;
+  }
+  for (auto leaf = a.cbeginLeaf(); leaf; ++leaf) {
+    const auto *other = b.probeConstLeaf(leaf->origin());
+    if (!other || other->getValueMask() != leaf->getValueMask() ||
+        std::memcmp(leaf->buffer().data(),
+                    other->buffer().data(),
+                    sizeof(typename TreeT::ValueType) * 512) != 0)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The integer offset from a grid's index space to the domain's when every grid voxel lands
+ * exactly on a domain voxel (same voxel size, no rotation, integer translation), else nullopt.
+ */
+static std::optional<openvdb::Coord> aligned_offset(const openvdb::math::Transform &grid,
+                                                    const openvdb::math::Transform &domain)
+{
+  if (!grid.isLinear() || !domain.isLinear()) {
+    return std::nullopt;
+  }
+  const auto map = [&](const openvdb::Vec3d &c) {
+    return domain.worldToIndex(grid.indexToWorld(c));
+  };
+  const openvdb::Vec3d origin = map(openvdb::Vec3d(0.0));
+  const openvdb::Vec3d axes[3] = {map(openvdb::Vec3d(1, 0, 0)) - origin,
+                                  map(openvdb::Vec3d(0, 1, 0)) - origin,
+                                  map(openvdb::Vec3d(0, 0, 1)) - origin};
+  for (int a = 0; a < 3; ++a) {
+    for (int b = 0; b < 3; ++b) {
+      if (std::abs(axes[a][b] - (a == b ? 1.0 : 0.0)) > 1e-9) {
+        return std::nullopt;
+      }
+    }
+  }
+  openvdb::Coord offset;
+  for (int a = 0; a < 3; ++a) {
+    const double rounded = std::round(origin[a]);
+    /* Far from a rounding tie, so every voxel rounds as the general path rounds it. */
+    if (std::abs(origin[a] - rounded) > 1e-4 || std::abs(rounded) > 1e8) {
+      return std::nullopt;
+    }
+    offset[a] = int(rounded);
+  }
+  return offset;
+}
+
+/**
+ * Raise one channel of a source field to a grid's values, leaf by leaf in parallel when the
+ * grid is aligned with the domain; else the general per-voxel path. Same result as that path.
+ */
+static void add_source_channel_fast(sparse::BrickField &field,
+                                    const std::size_t channel,
+                                    const openvdb::FloatGrid &grid,
+                                    const openvdb::math::Transform &domain,
+                                    const int3 &resolution)
+{
+  const std::optional<openvdb::Coord> offset = aligned_offset(grid.transform(), domain);
+  if (!offset) {
+    for_each_active_voxel(grid, domain, resolution, [&](int x, int y, int z, float value) {
+      float &target = field.touch(channel, x, y, z);
+      target = std::max(target, value);
+    });
+    return;
+  }
+  const openvdb::Coord off = *offset;
+  const sparse::Extent bricks = field.brick_extent;
+  const auto inside = [&](const openvdb::Coord &c) {
+    return c.x() >= 0 && c.y() >= 0 && c.z() >= 0 && c.x() < resolution.x &&
+           c.y() < resolution.y && c.z() < resolution.z;
+  };
+  const auto brick_of = [&](const openvdb::Coord &c) {
+    return std::size_t(c.x() >> 3) +
+           std::size_t(bricks.x) * (std::size_t(c.y() >> 3) + std::size_t(bricks.y) *
+                                                                  std::size_t(c.z() >> 3));
+  };
+  /* Active tiles (rare): voxel by voxel. */
+  {
+    openvdb::FloatGrid::ValueOnCIter iter = grid.cbeginValueOn();
+    iter.setMaxDepth(openvdb::FloatGrid::ValueOnCIter::LEAF_DEPTH - 1);
+    for (; iter; ++iter) {
+      const float value = *iter;
+      if (value == 0.0f) {
+        continue;
+      }
+      openvdb::CoordBBox box;
+      iter.getBoundingBox(box);
+      box.translate(off);
+      box.intersect(openvdb::CoordBBox(
+          openvdb::Coord(0),
+          openvdb::Coord(resolution.x - 1, resolution.y - 1, resolution.z - 1)));
+      for (auto c = box.begin(); c; ++c) {
+        float &target = field.touch(channel, (*c).x(), (*c).y(), (*c).z());
+        target = std::max(target, value);
+      }
+    }
+  }
+  std::vector<const FloatLeaf *> leaves;
+  leaves.reserve(grid.tree().leafCount());
+  for (auto leaf = grid.tree().cbeginLeaf(); leaf; ++leaf) {
+    leaves.push_back(&*leaf);
+  }
+  /* 1. Per leaf, the bricks its nonzero values land in (at most 8), in first-touch order. */
+  std::vector<std::array<std::int64_t, 8>> touched(leaves.size());
+  threading::parallel_for(IndexRange(int64_t(leaves.size())), 32, [&](const IndexRange range) {
+    for (const int64_t l : range) {
+      std::array<std::int64_t, 8> &list = touched[l];
+      list.fill(-1);
+      int n = 0;
+      for (auto value = leaves[l]->cbeginValueOn(); value && n < 8; ++value) {
+        const openvdb::Coord c = value.getCoord() + off;
+        if (*value == 0.0f || !inside(c)) {
+          continue;
+        }
+        const std::int64_t brick = std::int64_t(brick_of(c));
+        if (std::find(list.begin(), list.begin() + n, brick) == list.begin() + n) {
+          list[n++] = brick;
+        }
+      }
+    }
+  });
+  /* 2. Storage in the order the general path would allocate it. */
+  std::size_t slots = field.slot_count();
+  for (const std::array<std::int64_t, 8> &list : touched) {
+    for (const std::int64_t brick : list) {
+      if (brick < 0) {
+        break;
+      }
+      if (field.table[brick] < 0) {
+        field.table[brick] = std::int32_t(slots++);
+      }
+    }
+  }
+  for (std::vector<float> &values : field.channels) {
+    values.resize(slots * 512, 0.0f);
+  }
+  /* 3. The mapping is one to one, so no two leaves write the same voxel. */
+  float *target = field.channels[channel].data();
+  const std::int32_t *table = field.table.data();
+  threading::parallel_for(IndexRange(int64_t(leaves.size())), 32, [&](const IndexRange range) {
+    for (const int64_t l : range) {
+      for (auto value = leaves[l]->cbeginValueOn(); value; ++value) {
+        const float v = *value;
+        const openvdb::Coord c = value.getCoord() + off;
+        if (v == 0.0f || !inside(c)) {
+          continue;
+        }
+        float &t = target[std::size_t(table[brick_of(c)]) * 512 + std::size_t(c.x() & 7) +
+                          8 * (std::size_t(c.y() & 7) + 8 * std::size_t(c.z() & 7))];
+        t = std::max(t, v);
+      }
+    }
+  });
+}
+
+/** Whether two source fields hold the same bricks and bit-identical values. */
+static bool same_field(const sparse::BrickField &a, const sparse::BrickField &b)
+{
+  if (a.slot_count() != b.slot_count() || a.channels.size() != b.channels.size() ||
+      a.table.size() != b.table.size())
+  {
+    return false;
+  }
+  for (std::size_t brick = 0; brick < a.table.size(); ++brick) {
+    if ((a.table[brick] < 0) != (b.table[brick] < 0)) {
+      return false;
+    }
+    if (a.table[brick] < 0) {
+      continue;
+    }
+    for (std::size_t c = 0; c < a.channels.size(); ++c) {
+      if (std::memcmp(&a.channels[c][std::size_t(a.table[brick]) * 512],
+                      &b.channels[c][std::size_t(b.table[brick]) * 512],
+                      512 * sizeof(float)) != 0)
+      {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 /** The sources of one frame, on bricks, straight from their grids. */
-static sparse::Sources make_sources(const openvdb::FloatGrid *density,
+static sparse::Sources make_sources_impl(const openvdb::FloatGrid *density,
                                     const openvdb::FloatGrid *temperature,
                                     const openvdb::FloatGrid *fuel,
                                     const openvdb::FloatGrid *expansion,
@@ -565,7 +968,8 @@ static sparse::Sources make_sources(const openvdb::FloatGrid *density,
                                     const openvdb::math::Transform &domain,
                                     const int3 &resolution,
                                     const float voxel_size,
-                                    const bool add)
+                                    const bool add,
+                                    const bool fast)
 {
   sparse::Sources sources;
   sources.mode = add ? sparse::SourceMode::Add : sparse::SourceMode::Raise;
@@ -581,19 +985,30 @@ static sparse::Sources make_sources(const openvdb::FloatGrid *density,
     if (!grid) {
       continue;
     }
+    if (fast) {
+      add_source_channel_fast(field, std::size_t(channel), *grid, domain, resolution);
+      continue;
+    }
     for_each_active_voxel(*grid, domain, resolution, [&](int x, int y, int z, float value) {
       float &target = field.touch(std::size_t(channel), x, y, z);
       target = std::max(target, value);
     });
   }
   if (velocity) {
+    /* The bricks with storage, sampled in parallel with the fast path (each task its own
+     * sampler, whose accessor is not thread safe). */
+    std::vector<std::size_t> stored;
+    for (std::size_t brick = 0; brick < field.table.size(); ++brick) {
+      if (field.table[brick] >= 0) {
+        stored.push_back(brick);
+      }
+    }
+    const auto sample = [&](const IndexRange range) {
     openvdb::tools::GridSampler<openvdb::Vec3SGrid, openvdb::tools::BoxSampler> sampler(
         *velocity);
-    for (std::size_t brick = 0; brick < field.table.size(); ++brick) {
+    for (const int64_t k : range) {
+      const std::size_t brick = stored[k];
       const std::int32_t slot = field.table[brick];
-      if (slot < 0) {
-        continue;
-      }
       const int bx = int(brick % std::size_t(field.brick_extent.x));
       const int by = int(brick / std::size_t(field.brick_extent.x) %
                          std::size_t(field.brick_extent.y));
@@ -616,8 +1031,51 @@ static sparse::Sources make_sources(const openvdb::FloatGrid *density,
         field.channels[6][i] = value[2];
       }
     }
+    };
+    if (fast) {
+      threading::parallel_for(IndexRange(int64_t(stored.size())), 8, sample);
+    }
+    else {
+      sample(IndexRange(int64_t(stored.size())));
+    }
   }
   return sources;
+}
+
+static sparse::Sources make_sources(const openvdb::FloatGrid *density,
+                                    const openvdb::FloatGrid *temperature,
+                                    const openvdb::FloatGrid *fuel,
+                                    const openvdb::FloatGrid *expansion,
+                                    const openvdb::Vec3SGrid *velocity,
+                                    const openvdb::math::Transform &domain,
+                                    const int3 &resolution,
+                                    const float voxel_size,
+                                    const bool add)
+{
+  const int mode = fast_vdb_mode();
+  if (mode != 2) {
+    return make_sources_impl(density, temperature, fuel, expansion, velocity, domain,
+                             resolution, voxel_size, add, mode == 1);
+  }
+  auto start = std::chrono::steady_clock::now();
+  sparse::Sources reference = make_sources_impl(
+      density, temperature, fuel, expansion, velocity, domain, resolution, voxel_size, add, false);
+  const double reference_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  start = std::chrono::steady_clock::now();
+  sparse::Sources fast = make_sources_impl(
+      density, temperature, fuel, expansion, velocity, domain, resolution, voxel_size, add, true);
+  const double fast_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  std::fprintf(stderr,
+               "MANTA_GAS_FAST_VDB sources: %zu bricks, original %.2f ms, fast %.2f ms, "
+               "identical %d, same order %d\n",
+               reference.field.slot_count(),
+               reference_ms,
+               fast_ms,
+               int(same_field(reference.field, fast.field)),
+               int(reference.field.table == fast.field.table));
+  return fast;
 }
 
 /** The colliders of one frame: an obstacle bit per domain voxel and their velocity on bricks. */
@@ -806,6 +1264,7 @@ static Volume *export_sparse_state(const sparse::State &state,
                                    const float voxel_size,
                                    const std::int64_t state_id,
                                    const bool fire,
+                                   const bool with_velocity,
                                    std::array<const void *, 6> &trees)
 {
   const auto scalar = [&](const bool fog) {
@@ -813,6 +1272,7 @@ static Volume *export_sparse_state(const sparse::State &state,
     grid->setTransform(transform.copy());
     grid->setGridClass(fog ? openvdb::GRID_FOG_VOLUME : openvdb::GRID_UNKNOWN);
     tag_output(*grid);
+    grid->setSaveFloatAsHalf(bake_half());
     return grid;
   };
   /* Pressure only when the state has it: the GPU path keeps it on the device. */
@@ -822,10 +1282,24 @@ static Volume *export_sparse_state(const sparse::State &state,
   openvdb::Vec3SGrid::Ptr velocity = openvdb::Vec3SGrid::create(openvdb::Vec3f::zero());
   velocity->setTransform(transform.copy());
   velocity->setGridClass(openvdb::GRID_STAGGERED);
+  velocity->setSaveFloatAsHalf(bake_half());
   tag_output(*velocity);
   density->insertMeta(sparse_state_key, openvdb::Int64Metadata(state_id));
 
-  {
+  const int mode = fast_vdb_mode();
+  const auto fast_export = [&](openvdb::FloatTree *const scalars[5], openvdb::Vec3STree &vectors) {
+    export_leaves(state, resolution, voxel_size, fire, with_pressure, scalars, vectors);
+  };
+  if (mode == 1) {
+    openvdb::FloatTree *scalars[5] = {&density->tree(),
+                                      &temperature->tree(),
+                                      &pressure->tree(),
+                                      &fuel->tree(),
+                                      &flame->tree()};
+    fast_export(scalars, velocity->tree());
+  }
+  else {
+    const auto start = std::chrono::steady_clock::now();
     openvdb::FloatGrid::Accessor density_access = density->getAccessor();
     openvdb::FloatGrid::Accessor temperature_access = temperature->getAccessor();
     openvdb::FloatGrid::Accessor pressure_access = pressure->getAccessor();
@@ -859,7 +1333,7 @@ static Volume *export_sparse_state(const sparse::State &state,
         if (fire && state.flame[i] != 0.0f) {
           flame_access.setValue(c, state.flame[i]);
         }
-        if (state.u[i] != 0.0f || state.v[i] != 0.0f || state.w[i] != 0.0f) {
+        if (with_velocity && (state.u[i] != 0.0f || state.v[i] != 0.0f || state.w[i] != 0.0f)) {
           velocity_access.setValue(c,
                                    openvdb::Vec3f(state.u[i] * voxel_size,
                                                   state.v[i] * voxel_size,
@@ -867,10 +1341,36 @@ static Volume *export_sparse_state(const sparse::State &state,
         }
       }
     }
+    if (mode == 2) {
+      const double reference_ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - start)
+                                      .count();
+      openvdb::FloatTree check[5];
+      openvdb::Vec3STree check_velocity(openvdb::Vec3f::zero());
+      openvdb::FloatTree *scalars[5] = {&check[0], &check[1], &check[2], &check[3], &check[4]};
+      const auto fast_start = std::chrono::steady_clock::now();
+      fast_export(scalars, check_velocity);
+      const double fast_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - fast_start)
+                                 .count();
+      const bool identical = same_tree(density->tree(), check[0]) &&
+                             same_tree(temperature->tree(), check[1]) &&
+                             same_tree(pressure->tree(), check[2]) &&
+                             same_tree(fuel->tree(), check[3]) &&
+                             same_tree(flame->tree(), check[4]) &&
+                             same_tree(velocity->tree(), check_velocity);
+      std::fprintf(stderr,
+                   "MANTA_GAS_FAST_VDB export: %zu bricks, original %.2f ms, fast %.2f ms, "
+                   "identical %d\n",
+                   state.topology.brick_count(),
+                   reference_ms,
+                   fast_ms,
+                   int(identical));
+    }
   }
   trees = {&density->tree(),
            &temperature->tree(),
-           &velocity->tree(),
+           with_velocity ? &velocity->tree() : nullptr,
            with_pressure ? &pressure->tree() : nullptr,
            fire ? &fuel->tree() : nullptr,
            fire ? &flame->tree() : nullptr};
@@ -878,7 +1378,9 @@ static Volume *export_sparse_state(const sparse::State &state,
   /* The volume must own each grid alone. */
   BKE_volume_grid_add_vdb(*volume, "density", std::move(density));
   BKE_volume_grid_add_vdb(*volume, "temperature", std::move(temperature));
-  BKE_volume_grid_add_vdb(*volume, "velocity", std::move(velocity));
+  if (with_velocity) {
+    BKE_volume_grid_add_vdb(*volume, "velocity", std::move(velocity));
+  }
   if (with_pressure) {
     BKE_volume_grid_add_vdb(*volume, "pressure", std::move(pressure));
   }
@@ -976,6 +1478,12 @@ static std::vector<sparse::Turbulence> make_turbulence_layers(const GeometrySet 
  * The Sparse GPU path. The state crosses OpenVDB only where it has bricks, and a solver that
  * wrote this node's input last frame continues from its own device state.
  */
+template<typename GridT>
+static openvdb::GridBase::Ptr fit_grid(const GridT &grid,
+                                       const char *name,
+                                       const openvdb::math::Transform &transform,
+                                       const int3 &resolution);
+
 static void exec_sparse(GeoNodeExecParams &params,
                         GeometrySet &state,
                         const int3 &resolution,
@@ -1000,6 +1508,23 @@ static void exec_sparse(GeoNodeExecParams &params,
   settings.heat_buoyancy = params.extract_input<float>("Heat Buoyancy"_ustr);
   settings.pressure_solver = sparse::PressureSolver::Multigrid;
   settings.pressure_iterations = 6;
+  settings.pressure_iterations = std::clamp(
+      params.extract_input<int>("Pressure Cycles"_ustr), 1, 16);
+  settings.open_borders = params.extract_input<bool>("Open Borders"_ustr);
+  settings.density_fade = std::max(0.0f, params.extract_input<float>("Smoke Fade"_ustr));
+  settings.temperature_fade = std::max(0.0f, params.extract_input<float>("Heat Fade"_ustr));
+  settings.thresholds.scalar = std::max(0.0f, params.extract_input<float>("Smoke Threshold"_ustr));
+  settings.directional_dilation = params.extract_input<bool>("Directional Margin"_ustr);
+  settings.turbulence_once = params.extract_input<bool>("Fast Turbulence"_ustr);
+  settings.half_precision = params.extract_input<bool>("Half Precision"_ustr) ? 1 : 0;
+  settings.command_batch = params.extract_input<bool>("Batch GPU Work"_ustr) ? 64 : 0;
+  const bool store_velocity = params.extract_input<bool>("Store Velocity"_ustr);
+  if (!std::isfinite(settings.density_fade) || !std::isfinite(settings.temperature_fade) ||
+      !std::isfinite(settings.thresholds.scalar))
+  {
+    fail(params, state, "Smoke Fade, Heat Fade and Smoke Threshold must be finite.");
+    return;
+  }
   settings.time = params.extract_input<float>("Time"_ustr);
   sparse::Turbulence &turbulence = settings.turbulence;
   turbulence.strength = params.extract_input<float>("Turbulence"_ustr) / voxel_size;
@@ -1111,13 +1636,16 @@ static void exec_sparse(GeoNodeExecParams &params,
       import_ms += milliseconds_since(start);
       return result;
     };
-    const auto finish = [&](const sparse::State &result, const sparse::FrameInfo &frame) {
+    const auto finish = [&](const sparse::State &result,
+                            const sparse::FrameInfo &frame,
+                            const bool with_velocity) {
       run.substeps = frame.substeps;
       run.max_speed = frame.max_speed;
       run.active_bricks = static_cast<int>(result.topology.brick_count());
       const auto start = std::chrono::steady_clock::now();
       output_volume = export_sparse_state(
-          result, resolution, transform, voxel_size, output_id, fire.enabled, output_trees);
+          result, resolution, transform, voxel_size, output_id, fire.enabled, with_velocity,
+          output_trees);
       export_ms = milliseconds_since(start);
     };
     bool done = false;
@@ -1179,6 +1707,44 @@ static void exec_sparse(GeoNodeExecParams &params,
               });
         }
         slot->last_used = ++device.clock;
+        openvdb::GridBase::Ptr resumed_velocity;
+        /* A change of precision drops the device state: start again from this input. */
+        const bool was_half = slot->gpu->half_precision();
+        if (slot->gpu->set_half_precision(settings.half_precision != 0) != was_half) {
+          continued = false;
+        }
+        if (!store_velocity && !continued) {
+          /* The slot's state is about to be dropped: keep its velocity, which its cached frame
+           * does not have, in case its simulation comes back. */
+          if (slot->state_id != 0 && slot->transform && !slot->shown.u.empty()) {
+            sparse::State &old = slot->shown;
+            std::array<const void *, 6> unused;
+            const int3 old_resolution(slot->resolution[0], slot->resolution[1], slot->resolution[2]);
+            Volume *held = export_sparse_state(
+                old, old_resolution, *slot->transform, slot->voxel_size, 0, false, true, unused);
+            bke::VolumeTreeAccessToken held_token;
+            const openvdb::GridBase &held_grid =
+                BKE_volume_grid_find(held, "velocity")->grid(held_token);
+            device.held.emplace_back(slot->state_id, held_grid.deepCopyGrid());
+            BKE_id_free(nullptr, held);
+            if (device.held.size() > 2 * sparse_slot_limit) {
+              device.held.erase(device.held.begin());
+            }
+          }
+          /* A lean input continued elsewhere than on its own solver: its velocity from above. */
+          if (!grids.velocity && input_id != 0) {
+            for (const auto &[id, grid] : device.held) {
+              if (id == input_id) {
+                const auto &held = static_cast<const openvdb::Vec3SGrid &>(*grid);
+                resumed_velocity = fit_grid(held, "velocity", transform, resolution);
+              }
+            }
+            if (resumed_velocity) {
+              grids.velocity = static_cast<const openvdb::Vec3SGrid *>(resumed_velocity.get());
+              staggered = true;
+            }
+          }
+        }
         /* Until this evaluation finishes, the slot holds no state anyone may continue. */
         slot->state_id = 0;
         sparse::State fresh;
@@ -1200,7 +1766,9 @@ static void exec_sparse(GeoNodeExecParams &params,
         sparse::State &result = slot->shown;
         slot->gpu->download_shown(result, fire.enabled, false);
         solve_ms = milliseconds_since(solve_start);
-        finish(result, frame);
+        finish(result, frame, store_velocity);
+        slot->transform = transform.copy();
+        slot->voxel_size = voxel_size;
         slot->state_id = output_id;
         slot->trees = output_trees;
         slot->resolution = {resolution.x, resolution.y, resolution.z};
@@ -1219,7 +1787,7 @@ static void exec_sparse(GeoNodeExecParams &params,
       const auto solve_start = std::chrono::steady_clock::now();
       const sparse::FrameInfo frame = sparse::advance(result, settings, delta_time, &sources);
       solve_ms = milliseconds_since(solve_start);
-      finish(result, frame);
+      finish(result, frame, true);
     }
   }
   catch (const std::exception &exception) {

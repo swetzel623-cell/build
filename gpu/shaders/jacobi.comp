@@ -14,7 +14,7 @@ void main()
     return;
   }
   if (cell_type[index] != CELL_FLUID) {
-    RESULT[index] = 0.0;
+    RESULT[index] = QP(0.0);
     return;
   }
   ivec3 c = coords_of(index);
@@ -35,8 +35,8 @@ void main()
     }
     ++diagonal;
     if (type == CELL_FLUID) {
-      sum += PRESSURE[neighbor_index];
+      sum += float(PRESSURE[neighbor_index]);
     }
   }
-  RESULT[index] = diagonal > 0 ? (RHS[index] + sum) / float(diagonal) : 0.0;
+  RESULT[index] = QP(diagonal > 0 ? (float(RHS[index]) + sum) / float(diagonal) : 0.0);
 }

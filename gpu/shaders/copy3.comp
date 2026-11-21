@@ -10,7 +10,7 @@ void main()
   if (!voxel_in_range(index)) {
     return;
   }
-  b7[index] = b4[index];
-  b8[index] = b5[index];
-  b9[index] = b6[index];
+  b7[index] = QV(float(b4[index]));
+  b8[index] = QV(float(b5[index]));
+  b9[index] = QV(float(b6[index]));
 }

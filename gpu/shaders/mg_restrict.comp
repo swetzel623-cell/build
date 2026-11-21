@@ -20,6 +20,6 @@ void main()
     int i = level_index(P.la, 2 * c + ivec3(child & 1, (child >> 1) & 1, (child >> 2) & 1));
     sum += i < 0 ? 0.0 : fine_residual[i];
   }
-  coarse_rhs[index] = sum;
-  coarse_x[index] = 0.0;
+  coarse_rhs[index] = QPC(sum);
+  coarse_x[index] = QPC(0.0);
 }

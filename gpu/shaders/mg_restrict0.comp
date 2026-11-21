@@ -6,8 +6,8 @@
 #extension GL_GOOGLE_include_directive : enable
 #include "mg_common.glsl"
 layout(std430, binding = 3) readonly buffer Links { uint links[]; };
-layout(std430, binding = 4) readonly buffer Rhs { float rhs[]; };
-layout(std430, binding = 5) readonly buffer Values { float x[]; };
+layout(std430, binding = 4) readonly buffer Rhs { CH_T rhs[]; };
+layout(std430, binding = 5) readonly buffer Values { CH_T x[]; };
 layout(std430, binding = 6) writeonly buffer CoarseRhs { float coarse_rhs[]; };
 layout(std430, binding = 7) writeonly buffer CoarseValues { float coarse_x[]; };
 
@@ -20,13 +20,13 @@ float fine_residual(int index, ivec3 c)
   float sum = 0.0;
   for (int axis = 0; axis < 3; ++axis) {
     if (fine_linked(packed, 2 * axis)) {
-      sum += x[level_index(P.la, c - AXES[axis])];
+      sum += float(x[level_index(P.la, c - AXES[axis])]);
     }
     if (fine_linked(packed, 2 * axis + 1)) {
-      sum += x[level_index(P.la, c + AXES[axis])];
+      sum += float(x[level_index(P.la, c + AXES[axis])]);
     }
   }
-  return rhs[index] - (fine_diagonal(packed) * x[index] - sum);
+  return float(rhs[index]) - (fine_diagonal(packed) * float(x[index]) - sum);
 }
 
 void main()
@@ -42,6 +42,6 @@ void main()
     int i = level_index(P.la, fine);
     sum += i < 0 ? 0.0 : fine_residual(i, fine);
   }
-  coarse_rhs[index] = sum;
-  coarse_x[index] = 0.0;
+  coarse_rhs[index] = QPC(sum);
+  coarse_x[index] = QPC(0.0);
 }

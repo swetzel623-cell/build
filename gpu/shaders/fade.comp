@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: MIT
+// Smoke and heat fading: density *= a.x, temperature *= a.y (factors exp(-rate * dt) from the
+// host, as the CPU reference's fade()). Bindings: 4 density, 5 temperature.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index)) {
+    return;
+  }
+  if (P.a.x != 1.0) {
+    b4[index] = STORE(float(b4[index]) * P.a.x);
+  }
+  if (P.a.y != 1.0) {
+    b5[index] = STORE(float(b5[index]) * P.a.y);
+  }
+}

@@ -578,7 +578,41 @@ SOLVER_USER_ITEMS = (
     ("Max Substeps", "INT", 64, "", 1),
     ("Turbulence Layers", "GEOMETRY", None, "More turbulence layers, from Turbulence Layer "
                                             "nodes, applied after the others", None),
+    # Speed: what is simulated and how precisely. GPU only.
+    ("Open Borders", "BOOLEAN", False, "Let smoke and heat out through the sides and top of the "
+                                       "domain; the floor stays solid. Closed, smoke gathers "
+                                       "until it fills the box, which gets slower and slower",
+     None),
+    ("Smoke Fade", "FLOAT", 0.0, "Fraction of the smoke lost per second, so thin smoke "
+                                 "disappears and stops costing time. 0 keeps it all", 0.0),
+    ("Heat Fade", "FLOAT", 0.0, "Fraction of the heat lost per second, so hot gas cools and "
+                                "stops speeding up. 0 keeps it all", 0.0),
+    ("Pressure Quality", "INT", 6, "How exactly the gas is kept from compressing. Medium is "
+                                   "about a quarter faster with differences of under 1%; Low "
+                                   "is faster still but starts to show", 1),
+    ("Smoke Threshold", "FLOAT", 1.0e-5, "Smoke, heat, fuel and flame below this count as "
+                                         "empty and stop being simulated. 0.001 is hardly "
+                                         "visible; 0.01 loses the faintest wisps", 0.0),
+    ("Directional Margin", "BOOLEAN", False, "Pad the simulated region only where the smoke is "
+                                             "heading: 10-20% less work while it grows. The "
+                                             "fine swirls differ slightly", None),
+    ("Fast Turbulence", "BOOLEAN", False, "Apply the turbulence once per step instead of twice: "
+                                          "half its cost; the fine detail changes", None),
+    ("Half Precision", "BOOLEAN", False, "Store the simulation on the GPU in 16-bit numbers: "
+                                         "half the GPU memory and faster on large "
+                                         "simulations, looking the same. Use Pressure Quality "
+                                         "Medium or Low with it", None),
+    ("Store Velocity", "BOOLEAN", True, "Keep the velocity in every frame. Off halves the memory "
+                                        "the frame cache needs, but render motion blur of the "
+                                        "smoke has no velocity", None),
+    ("Batch GPU Work", "BOOLEAN", True, "Start the GPU on work while the rest is still being "
+                                        "prepared. Same results; off only to compare timings",
+     None),
 )
+PRESSURE_QUALITY = (("High", 6), ("Medium", 4), ("Low", 3))
+SPEED_SETTINGS = ["Open Borders", "Smoke Fade", "Heat Fade", "Pressure Quality",
+                  "Smoke Threshold", "Directional Margin", "Fast Turbulence", "Half Precision",
+                  "Store Velocity", "Batch GPU Work"]
 SOLVER_PRESETS = {
     "Smoke": {"Heat Buoyancy": 0.5, "Burn Rate": 0.75, "Flame Heat": 4.0, "Flame Smoke": 1.0,
               "Flame Cooling": 4.0, "Gas Release": 0.0, "Turbulence": 2.0,
@@ -631,7 +665,7 @@ def preset_block(name, description, table, user_table, presets, strength=(), spe
     for item, _options in menus:
         socket(tree, item, "NodeSocketMenu")
     add_inputs(tree, table, skip=menu_items)
-    add_inputs(tree, user_table)
+    add_inputs(tree, user_table, skip=menu_items)
     settings_socket(tree, "OUTPUT")
     b = Builder(tree)
     group_in = b.new("NodeGroupInput")
@@ -655,7 +689,8 @@ def preset_block(name, description, table, user_table, presets, strength=(), spe
         values[name] = (b.vmath("SCALE", values[name], scale=inp["Speed"]) if kind == "VECTOR"
                         else b.math("MULTIPLY", values[name], inp["Speed"]))
     for name, *_ in user_table:
-        values[name] = inp[name]
+        values[name] = (menu_switch(b, "INT", inp[name], menu_items[name]) if name in menu_items
+                        else inp[name])
     if extra:
         extra(b, inp, values)
     b.link(combine(b, items_of(table) + items_of(user_table), values),
@@ -758,6 +793,19 @@ def bursting(b, s, frame):
                   b.math("LESS_THAN", frame, b.math("ADD", last, duration)))
 
 
+def burst_window(b, s, frame):
+    """First burst that can be live at `frame`, and how many from there (a superset)."""
+    duration = switch(b, "FLOAT", b.math("GREATER_THAN", s["Duration"], 0.0), 8.0, s["Duration"])
+    delay = b.math("MAXIMUM", s["Burst Delay"], 1.0e-6)
+    since = b.math("SUBTRACT", frame, s["Start Frame"])
+    k_lo = b.math("MAXIMUM", b.math("FLOOR", b.math("DIVIDE", b.math(
+        "SUBTRACT", since, duration), delay)), 0.0)
+    k_hi = b.math("MINIMUM", b.math("FLOOR", b.math("ADD", b.math("DIVIDE", b.math(
+        "ADD", since, 1.0e-4), delay), 1.0e-3)), b.math("SUBTRACT", s["Bursts"], 1.0))
+    k_lo = b.math("MINIMUM", k_lo, b.math("MAXIMUM", b.math("SUBTRACT", s["Bursts"], 1.0), 0.0))
+    return k_lo, b.math("MAXIMUM", b.math("ADD", b.math("SUBTRACT", k_hi, k_lo), 1.0), 0.0)
+
+
 def build_burst():
     tree = new_group(
         "Pyro Burst",
@@ -789,27 +837,64 @@ def build_burst():
     # No points at all before the first burst or after the last one ends.
     emitting = bursting(b, s, inp["Frame"])
     points = b.new("GeometryNodePoints")
-    b.link(b.math("MULTIPLY", b.math("MINIMUM", b.math("MULTIPLY", per_burst, s["Bursts"]),
-                                      300000.0), emitting), points.inputs["Count"])
-    index = b.new("GeometryNodeInputIndex").outputs[0]
+    # Only the bursts that can be live now (the live test below still drops the rest), with
+    # their global index: the same points, ids, random values and order as all bursts.
+    k_lo, n_win = burst_window(b, s, inp["Frame"])
+    first = b.math("MULTIPLY", k_lo, per_burst)
+    b.link(b.math("MULTIPLY", b.math("MAXIMUM", b.math("MINIMUM", b.math(
+        "MULTIPLY", per_burst, n_win), b.math("SUBTRACT", 300000.0, first)), 0.0), emitting),
+        points.inputs["Count"])
+    index = b.math("ADD", b.new("GeometryNodeInputIndex").outputs[0], first)
     burst = b.math("FLOOR", b.math("DIVIDE", index, per_burst))
     spike_id = b.math("FLOOR", b.math("DIVIDE", index, per_spike))
     along = b.math("SUBTRACT", index, b.math("MULTIPLY", spike_id, per_spike))
     live, remaining, radius_now, rate, centre = burst_timing(b, s, inp, burst)
-    direction = cone_direction(b, spike_id, seed, s["Direction"], s["Spread"])
 
-    # How far: Roundness is the shortest spike; Long Spikes above 1 makes most spikes short
-    # and a few long. Shape noise varies them smoothly over the directions, giving lobes.
-    ragged = random(b, "FLOAT", 0.0, 1.0, spike_id, b.math("ADD", seed, 37.0))
-    ragged = b.math("POWER", ragged, s["Long Spikes"])
-    length = mix(b, s["Roundness"], 1.0, ragged)
-    noise = b.new("ShaderNodeTexNoise", noise_dimensions="4D")
-    b.link(b.vmath("SCALE", direction, scale=1.7), noise.inputs["Vector"])
-    b.link(b.math("ADD", b.math("MULTIPLY", seed, 7.31), burst), noise.inputs["W"])
-    noise.inputs["Detail"].default_value = 2.0
-    lumps = b.math("MULTIPLY", b.math("SUBTRACT", noise.outputs["Fac"], 0.5), 2.0)
-    length = b.math("MAXIMUM", b.math("ADD", length, b.math("MULTIPLY", lumps, s["Shape Noise"])),
-                    0.1)
+    def spike_fields(spike_id, burst):
+        direction = cone_direction(b, spike_id, seed, s["Direction"], s["Spread"])
+        # How far: Roundness is the shortest spike; Long Spikes above 1 makes most spikes
+        # short and a few long. Shape noise varies them smoothly over the directions.
+        ragged = random(b, "FLOAT", 0.0, 1.0, spike_id, b.math("ADD", seed, 37.0))
+        ragged = b.math("POWER", ragged, s["Long Spikes"])
+        length = mix(b, s["Roundness"], 1.0, ragged)
+        noise = b.new("ShaderNodeTexNoise", noise_dimensions="4D")
+        b.link(b.vmath("SCALE", direction, scale=1.7), noise.inputs["Vector"])
+        b.link(b.math("ADD", b.math("MULTIPLY", seed, 7.31), burst), noise.inputs["W"])
+        noise.inputs["Detail"].default_value = 2.0
+        lumps = b.math("MULTIPLY", b.math("SUBTRACT", noise.outputs["Fac"], 0.5), 2.0)
+        length = b.math("MAXIMUM", b.math("ADD", length, b.math("MULTIPLY", lumps,
+                                                                 s["Shape Noise"])), 0.1)
+        side = random(b, "FLOAT_VECTOR", (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0), spike_id,
+                      b.math("ADD", seed, 41.0))
+        side = b.vmath("NORMALIZE", b.vmath("SUBTRACT", side, b.vmath(
+            "SCALE", direction, scale=b.vmath("DOT_PRODUCT", side, direction))))
+        vary = random(b, "FLOAT", -1.0, 1.0, spike_id, b.math("ADD", seed, 43.0))
+        return direction, length, side, vary
+
+    # Per-spike values once per spike, on a point per spike, then looked up by each of
+    # its points (they depend only on the spike): the same values, per_spike times fewer
+    # evaluations of the noise and the random directions.
+    spikes = b.new("GeometryNodePoints")
+    first_spike = b.math("MULTIPLY", k_lo, s["Spikes"])
+    b.link(b.math("MULTIPLY", b.math("MULTIPLY", s["Spikes"], n_win), emitting),
+           spikes.inputs["Count"])
+    sid = b.math("ADD", b.new("GeometryNodeInputIndex").outputs[0], first_spike)
+    sburst = b.math("FLOOR", b.math("DIVIDE", sid, s["Spikes"]))
+    values = spike_fields(sid, sburst)
+    cloud = spikes.outputs[0]
+    names = (("p_dir", "FLOAT_VECTOR"), ("p_len", "FLOAT"), ("p_side", "FLOAT_VECTOR"),
+             ("p_vary", "FLOAT"))
+    for (name, kind), value in zip(names, values):
+        cloud = store_attribute(b, cloud, name, value, kind)
+    local = b.math("SUBTRACT", spike_id, first_spike)
+    looked = []
+    for name, kind in names:
+        look = b.new("GeometryNodeSampleIndex", data_type=kind, domain="POINT")
+        b.link(cloud, look.inputs["Geometry"])
+        b.link(named_attribute(b, name, kind), look.inputs["Value"])
+        b.link(local, look.inputs["Index"])
+        looked.append(look.outputs[0])
+    direction, length, side, vary = looked
     # Along the spike: t = 1 at the tip, 0 at its inner end, Spike Length in from the tip.
     t = b.math("SUBTRACT", 1.0, b.math("DIVIDE", along, b.math("MAXIMUM", b.math(
         "SUBTRACT", per_spike, 1.0), 1.0)))
@@ -817,15 +902,10 @@ def build_burst():
                                               s["Spike Length"]))
     reach = b.math("MULTIPLY", b.math("MULTIPLY", length, fraction), radius_now)
     # Bend: the spike curves sideways, more towards the tip.
-    side = random(b, "FLOAT_VECTOR", (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0), spike_id,
-                  b.math("ADD", seed, 41.0))
-    side = b.vmath("NORMALIZE", b.vmath("SUBTRACT", side, b.vmath(
-        "SCALE", direction, scale=b.vmath("DOT_PRODUCT", side, direction))))
     bend = b.math("MULTIPLY", b.math("MULTIPLY", s["Spike Bend"], b.math("MULTIPLY", t, t)),
                   b.math("MULTIPLY", length, radius_now))
     # Thickness: Thickness × the burst's radius at the base, tapering to Tip Thickness of that
     # at the tip; each spike a little thicker or thinner by Thickness Variation.
-    vary = random(b, "FLOAT", -1.0, 1.0, spike_id, b.math("ADD", seed, 43.0))
     base = b.math("MULTIPLY", b.math("MULTIPLY", s["Thickness"], radius_now), b.math(
         "ADD", 1.0, b.math("MULTIPLY", vary, b.math("MULTIPLY", s["Thickness Variation"], 0.6))))
     thick = b.math("MULTIPLY", base, mix(b, 1.0, s["Tip Thickness"], t))
@@ -851,9 +931,10 @@ def build_burst():
         "DIVIDE", b.math("MULTIPLY", biggest, s["Core Size"]), spacing), 3.0)))
     per_core = b.math("MINIMUM", per_core, 40000.0)
     core_points = b.new("GeometryNodePoints")
-    b.link(b.math("MULTIPLY", b.math("MULTIPLY", per_core, s["Bursts"]), emitting),
+    b.link(b.math("MULTIPLY", b.math("MULTIPLY", per_core, n_win), emitting),
            core_points.inputs["Count"])
-    core_index = b.new("GeometryNodeInputIndex").outputs[0]
+    core_index = b.math("ADD", b.new("GeometryNodeInputIndex").outputs[0],
+                        b.math("MULTIPLY", k_lo, per_core))
     core_burst = b.math("FLOOR", b.math("DIVIDE", core_index, b.math("MAXIMUM", per_core, 1.0)))
     core_live, core_remaining, core_radius, core_rate, core_centre = burst_timing(
         b, s, inp, core_burst)
@@ -1573,7 +1654,7 @@ def build_solver_preset(layer):
         "or the Custom values below, scaled by Strength and Speed",
         SOLVER_ITEMS, SOLVER_USER_ITEMS, SOLVER_PRESETS,
         strength=("Turbulence", "Fine Turbulence", "Disturbance", "Gas Release"),
-        extra=add_layers)
+        menus=(("Pressure Quality", PRESSURE_QUALITY),), extra=add_layers)
 
 
 def build_emitter_preset():
@@ -1722,7 +1803,8 @@ def build_solver():
     names = ["Gravity", "Heat Buoyancy", "Density Buoyancy", "CFL", "Max Substeps",
              "Sparse GPU", "Turbulence", "Turbulence Scale", "Turbulence Speed",
              "Turbulence Seed", "Turbulence Mask", "Turbulence Layers", "Burn Rate",
-             "Flame Heat", "Flame Smoke", "Flame Cooling", "Gas Release", "Add Emission"]
+             "Flame Heat", "Flame Smoke", "Flame Cooling", "Gas Release",
+             "Add Emission"] + SPEED_SETTINGS
     kinds = dict(items_of(SOLVER_ITEMS) + items_of(SOLVER_USER_ITEMS))
     s = separate(b, inp["Settings"], [(name, kinds[name]) for name in names])
     gas = b.new(GAS_NODE)
@@ -1736,7 +1818,8 @@ def build_solver():
     b.link(inp["Colliders"], gas.inputs["Colliders"])
     b.link(b.new("GeometryNodeInputSceneTime").outputs["Seconds"], gas.inputs["Time"])
     for name in names:
-        b.link(s[name], gas.inputs["Add Sources" if name == "Add Emission" else name])
+        target = {"Add Emission": "Add Sources", "Pressure Quality": "Pressure Cycles"}
+        b.link(s[name], gas.inputs[target.get(name, name)])
     b.link(gas.outputs["State"], group_out.inputs["State"])
     arrange(tree)
     return tree
@@ -1964,6 +2047,7 @@ def build_simulation_modifier(blocks, materials):
                         "Turbulence Mask", "Fine Turbulence", "Fine Scale", "Disturbance",
                         "Disturbance Scale"]),
         ("Solver", ["Sparse GPU", "CFL", "Max Substeps"]),
+        ("Speed", SPEED_SETTINGS),
         ("Display", ["Show Mesh", "Smoke Density", "Viewport Density", "Flame Brightness",
                      "Flame In Solid View"]),
     )

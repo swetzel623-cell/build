@@ -1008,6 +1008,75 @@ after: memory growth per frame 3.9 → 3.1 MB (voxel 0.06) and 10.4 → 7.4 MB (
 after the burst 30 → 20 ms outside the node; Pyro Point Source 116 → 77 ms at 30,000 points
 and 246 → 144 ms at 100,000.
 
+**Speed, phase 2.** Ten agents each investigated one area, argued over a shared board, and
+prototyped their changes against this repository; their reports were kept outside it. Counts,
+byte totals and CPU times carry over to a real GPU; llvmpipe kernel times do not.
+
+Always on, with results identical to before (bit for bit, checked per frame or per test):
+
+- Export and source import work leaf by leaf on all cores: an 8³ brick is one OpenVDB leaf.
+  Export 9–29 → 4–7 ms per frame at about 1,000 bricks; sources at 0.6M voxels 16–18 → 4–6 ms
+  (microbenchmark at 3.1M voxels: export 56 → 14–24 ms). `MANTA_GAS_FAST_VDB=0` selects the
+  old code and `=2` runs both and reports whether the grids are identical.
+- Fused advection: density, temperature, fuel and flame share one backtrace and one set of
+  corner lookups (`advect4`, `maccormack4`, `conserve_*4`), and the three velocity components
+  advect in one dispatch per pass (`advect3`, `maccormack3`). Advection dispatches per substep
+  44 → 12, about a third fewer bytes per voxel; 1.7–2.7× faster advection on llvmpipe.
+  `MANTA_FUSED_ADVECT=0` selects the per-channel kernels.
+- The activity and speed readback of the next substep is recorded at the end of the step's own
+  submission: blocking submits per frame 2S+2 → S+1 for S substeps.
+- Recorded work is submitted every 64 dispatches without waiting (Batch GPU Work), so the
+  device starts while the rest is recorded; it was idle 0.6–1.1 ms per substep here.
+- The Pyro Emitter generates points only for bursts that can be live and evaluates per-spike
+  values once per spike: 19–20 → 8–13.6 ms CPU per emitting frame, every attribute identical.
+- Bakes store the state grids as 16-bit floats: 51% smaller files, faster writes, differences of
+  about 5e-4 relative (`MANTA_BAKE_HALF=0` writes full precision).
+
+Settings in the Pyro Simulation modifier's Speed panel (and inputs of the node), off or at the
+old value by default:
+
+- **Open Borders** (`Extent::open`, `Settings::open_borders`): only the floor is a wall. A closed
+  domain made the Explosion fill every brick of its box by frame 120 at 0.06 (216 bricks at
+  frame 10, 1,573 from frame 120; 96% of them held less than a tenth of the peak), because
+  nothing leaves and nothing fades.
+- **Smoke Fade / Heat Fade** (`density_fade`, `temperature_fade`): exponential loss per second,
+  once per (half) step in both solvers. Without cooling, buoyancy keeps accelerating the
+  Explosion, which needed 2 substeps from about frame 25.
+- **Pressure Quality** (High 6, Medium 4, Low 3 cycles). Against a converged solve, mean density
+  difference after 16 frames: 6 cycles 0.04%, 4 cycles 0.37%, 3 cycles 1.2%; 2 cycles 6.9%
+  (visible). Dispatches per substep 759 → 535 at 4. Warm start, early exit and fewer cycles on
+  the first projection only were measured and dropped (the first projection needs more cycles,
+  not fewer).
+- **Smoke Threshold**: 1e-3 removed 7% of brick-substeps at about twice the difference of a
+  no-op change; 1e-2 removed 14%.
+- **Directional Margin** (`directional_dilation`): activity records, per brick face, how close
+  content is; a neighbour is activated only within ceil(speed·dt)+2 voxels of the content, using
+  the fastest brick around. −20% brick-substeps on a fire ball, mass +0.2%, plume height within
+  0.4 voxel; the fine swirls differ 3–5× more than a no-op change. GPU only.
+- **Fast Turbulence** (`turbulence_once`): a reflection step stirs once, for the whole step, in
+  its second half. Half the turbulence work; density difference 0.19 summed / 0.06 blurred.
+- **Half Precision** (`half_precision`): every channel buffer holds fp16
+  (`storageBuffer16BitAccess`, enabled only where the device has it; arithmetic stays fp32).
+  Each kernel is compiled twice (`CHANNEL_HALF=0/1`); the half set is created on first use.
+  Bytes per voxel per substep −34%, channel memory 80 → 40 bytes per voxel. After 20 frames:
+  density max difference 0.028, relative L2 0.0105, mass +0.11%, like one multigrid cycle
+  fewer. With fp16 pressure the divergence stops falling after about 4 cycles. Changing it
+  restarts the simulation from the cached frame.
+- **Store Velocity**: off, the GPU path leaves velocity out of the cached frames (54% of the
+  cache in the Explosion at 0.06) and keeps the newest velocity of a simulation whose solver is
+  handed to another one, to give back if it returns. No render motion blur of the smoke.
+
+Measured but not adopted: dependency-tracked barriers (1030 → 1010 per substep, not worth the
+risk), advecting the scalars once per reflection step (moves the result further from a
+2-substep run than the baseline), reflection off by default (half the cost but a lower plume
+with a third less swirl), unorm16 storage (clamped the expansion source), bounding-box coarse
+levels (only while the active region is small).
+
+Found along the way: a disk bake does not bound memory in this Blender, because playing a bake
+loads each frame and keeps it; and an earlier profile labelled "Explosion" had run the Custom
+defaults, because it set the Preset menu without loading its values.
+
+
 ## Not verified, and known gaps
 
 - **One real GPU, one scene.** Only the RTX 3070 runs above. No AMD, Intel, or Apple device.
@@ -1047,5 +1116,7 @@ and 246 → 144 ms at 100,000.
 1. Time the whole frame inside Blender on the RTX 3070, with the modifier.
 2. Stage 5: detail (upres) noise. Stage 6: compare with Mantaflow, defaults, a user guide and a
    GitHub Release.
-3. Advect density and temperature in one pass: they share their departure points.
-4. Measure multigrid at larger sizes, where dispatch overhead should matter less.
+3. Time phase 2 on the RTX 3070 (`blender/tests/pyro_benchmark.py`), each Speed setting against
+   its default, to calibrate the cost model and pick defaults.
+4. Splat Pyro Point Source points into the solver's sources in C++ (prototyped: identical
+   voxels), and build only live trails in Pyro Trails as Pyro Burst now does.

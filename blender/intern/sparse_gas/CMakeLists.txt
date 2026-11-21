@@ -26,7 +26,9 @@ set(LIB
 set(SPARSE_GAS_KERNELS
   advect maccormack buoyancy walls divergence jacobi gradient activity remap classify
   classify_links mask_pressure mg_smooth0 mg_restrict0 mg_smooth mg_residual mg_restrict copy3
-  reflect conserve_reduce conserve_apply inject turbulence combust speed mg_prolong0 mg_prolong mg_build0 mg_build mg_dense_cycle
+  reflect conserve_reduce conserve_apply advect4 maccormack4 conserve_reduce4 conserve_apply4
+  advect3 maccormack3 inject turbulence combust speed mg_prolong0 mg_prolong mg_build0 mg_build
+  mg_dense_cycle fade
 )
 
 if(VULKAN_INCLUDE_DIRS)
@@ -47,18 +49,32 @@ if(SPARSE_GAS_VULKAN_INCLUDE AND SPARSE_GAS_GLSLANG)
   file(MAKE_DIRECTORY "${SPARSE_GAS_SHADER_DIR}")
   foreach(KERNEL ${SPARSE_GAS_KERNELS})
     set(SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/${KERNEL}.comp")
-    set(SHADER_HEADER "${SPARSE_GAS_SHADER_DIR}/${KERNEL}.comp.h")
-    add_custom_command(
-      OUTPUT "${SHADER_HEADER}"
-      COMMAND "${SPARSE_GAS_GLSLANG}" -V "-I${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders"
-              --vn "${KERNEL}_spv" -o "${SHADER_HEADER}" "${SHADER_SOURCE}"
-      DEPENDS "${SHADER_SOURCE}"
-              "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/common.glsl"
-              "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/mg_common.glsl"
-              "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/mg_coarse.glsl"
-      VERBATIM
-    )
-    list(APPEND SRC "${SHADER_HEADER}")
+    # Each kernel twice: 32-bit channels, and 16-bit channels (the Half Precision input).
+    foreach(PRECISION full half)
+      if(PRECISION STREQUAL "half")
+        set(VARIANT "_half")
+        set(SHADER_DEFINES "-DCHANNEL_HALF=1")
+      else()
+        set(VARIANT "")
+        set(SHADER_DEFINES "-DCHANNEL_HALF=0")
+      endif()
+      set(SHADER_HEADER "${SPARSE_GAS_SHADER_DIR}/${KERNEL}${VARIANT}.comp.h")
+      add_custom_command(
+        OUTPUT "${SHADER_HEADER}"
+        COMMAND "${SPARSE_GAS_GLSLANG}" -V "-I${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders"
+                ${SHADER_DEFINES} --vn "${KERNEL}${VARIANT}_spv" -o "${SHADER_HEADER}"
+                "${SHADER_SOURCE}"
+        DEPENDS "${SHADER_SOURCE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/common.glsl"
+                "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/mg_common.glsl"
+                "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/mg_coarse.glsl"
+                "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/advect_trace.glsl"
+                "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/quant.glsl"
+                "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shaders/quant_config.glsl"
+        VERBATIM
+      )
+      list(APPEND SRC "${SHADER_HEADER}")
+    endforeach()
   endforeach()
   list(APPEND SRC
     gpu/vulkan_compute.cpp

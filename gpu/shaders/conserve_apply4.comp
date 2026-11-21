@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: MIT
+// conserve_apply for the fused scalar pass. Bindings 7-10 corrected (in place), 11-14 forward,
+// 16 partials; P.flags.z channel count.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#define NO_FLOAT_CHANNELS
+#include "common.glsl"
+layout(std430, binding = 7) buffer S0 { CH_T s0[]; };
+layout(std430, binding = 8) buffer S1 { CH_T s1[]; };
+layout(std430, binding = 9) buffer S2 { CH_T s2[]; };
+layout(std430, binding = 10) buffer S3 { CH_T s3[]; };
+layout(std430, binding = 11) readonly buffer F0 { CH_T f0[]; };
+layout(std430, binding = 12) readonly buffer F1 { CH_T f1[]; };
+layout(std430, binding = 13) readonly buffer F2 { CH_T f2[]; };
+layout(std430, binding = 14) readonly buffer F3 { CH_T f3[]; };
+layout(std430, binding = 16) readonly buffer Partials { float partials[]; };
+
+#define APPLY(k, s, f) \
+  if (k < P.flags.z) { \
+    float keep = partials[2 * k]; \
+    if (keep != 1.0) { \
+      float forward = float(f[index]); \
+      float correction = float(s[index]) - forward; \
+      if (partials[2 * k + 1] > 0.0 ? correction > 0.0 : correction < 0.0) { \
+        s[index] = STORE(forward + keep * correction); \
+      } \
+    } \
+  }
+
+void main()
+{
+  int index;
+  if (!voxel_in_range(index)) {
+    return;
+  }
+  APPLY(0, s0, f0)
+  APPLY(1, s1, f1)
+  APPLY(2, s2, f2)
+  APPLY(3, s3, f3)
+}
